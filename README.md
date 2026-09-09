@@ -2,6 +2,8 @@
 
 A Discord music bot and web song request portal, deployed together as one Render service. Requests from the website and `/play` share a persistent queue for each Discord server.
 
+[Open the portal](https://discord-bap-bot.onrender.com) · [Render service](https://dashboard.render.com/web/srv-dagu1tpt0dsc73fqe4ug). This service was created directly through the CLI; its settings are managed in Render's Dashboard. Its Discord OAuth redirect is `https://discord-bap-bot.onrender.com/auth/discord/callback`.
+
 ## What works
 
 - Discord sign-in and server selection; only members of a server can see or change its queue.

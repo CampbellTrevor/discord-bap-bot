@@ -24,6 +24,17 @@ function saveGuild(id) {
   try { localStorage.setItem('turntable.guild', id); } catch { /* Storage is optional. */ }
 }
 
+function setTheme(value, save = true) {
+  const theme = value === 'winamp' ? 'winamp' : 'cassette';
+  document.documentElement.dataset.theme = theme;
+  for (const button of document.querySelectorAll('[data-theme-choice]')) {
+    button.setAttribute('aria-pressed', String(button.dataset.themeChoice === theme));
+  }
+  const color = document.querySelector('meta[name="theme-color"]');
+  if (color) color.content = theme === 'winamp' ? '#354149' : '#eee7d8';
+  if (save) try { localStorage.setItem('turntable-theme', theme); } catch { /* Storage is optional. */ }
+}
+
 function safeUrl(value, allowedHosts) {
   if (typeof value !== 'string' || !value) return null;
   try {
@@ -40,6 +51,7 @@ function imageUrl(value) {
 }
 
 function duration(value) {
+  if (value == null || !Number.isFinite(Number(value))) return '--:--';
   const seconds = Math.max(0, Math.floor(Number(value) || 0));
   const minutes = Math.floor(seconds / 60);
   const remainder = String(seconds % 60).padStart(2, '0');
@@ -58,6 +70,7 @@ async function api(path, options = {}) {
   const response = await fetch(path, {
     credentials: 'same-origin',
     cache: 'no-store',
+    signal: AbortSignal.timeout(120000),
     ...options,
     headers: {
       Accept: 'application/json',
@@ -127,10 +140,10 @@ function renderAuth() {
     profile.append(profileText);
     container.append(profile);
   } else if (session?.configured) {
-    const login = appendText(container, 'a', 'button button-discord button-small', 'Connect Discord ↗');
+    const login = appendText(container, 'a', 'small-button button-discord', 'Connect Discord ↗');
     login.href = '/auth/discord';
   } else {
-    const login = appendText(container, 'button', 'button button-discord button-small', 'Connect Discord ↗');
+    const login = appendText(container, 'button', 'small-button button-discord', 'Connect Discord ↗');
     login.type = 'button';
     login.disabled = true;
     login.title = 'Discord sign-in is available after server configuration.';
@@ -141,30 +154,31 @@ function renderSession() {
   const session = state.session;
   $('demo-badge').hidden = !session?.demo;
   const invite = safeUrl(session?.inviteUrl, ['discord.com']);
-  $('invite-link').hidden = !invite;
+  $('invite-link').hidden = !invite || !session?.configured;
   if (invite) $('invite-link').href = invite;
   const dot = $('status-dot');
   const connected = session?.botReady && !state.offline;
   dot.classList.toggle('online', Boolean(connected));
   dot.classList.toggle('offline', Boolean(state.offline || (session?.configured && !connected)));
-  $('connection-status').textContent = state.offline ? 'CONNECTION INTERRUPTED · RETRYING' : session?.demo ? 'YOUR PRACTICE LISTENING ROOM' : connected ? 'BOT ONLINE · READY TO LISTEN' : session?.configured ? 'BOT OFFLINE' : 'YOUR NEXT LISTENING ROOM';
+  $('connection-status').textContent = state.offline ? 'CONNECTION INTERRUPTED · RETRYING' : session?.demo ? 'LOCAL DEMO · NO AUDIO' : connected ? 'DISCORD CONNECTED' : session?.configured ? 'BOT OFFLINE' : 'SETUP IN PROGRESS';
 
   const notice = $('setup-notice');
   notice.hidden = true;
   if (session && !session.configured && !session.demo) {
     notice.hidden = false;
-    $('notice-title').textContent = 'Your listening room is almost ready.';
-    $('notice-description').textContent = 'Add your Discord credentials to the server environment, then restart Turntable to enable sign-in and song requests.';
+    $('notice-title').textContent = 'The bot owner is finishing setup.';
+    $('notice-description').textContent = 'Discord sign-in and song requests are disabled. You can switch player styles while setup is completed.';
   } else if (session?.configured && !session.botReady && !session.demo) {
     notice.hidden = false;
     $('notice-title').textContent = 'The bot is currently offline.';
     $('notice-description').textContent = 'Song requests and playback controls will become available when the Discord connection is ready. This page checks automatically.';
   } else if (session?.user && state.guilds.length === 0) {
     notice.hidden = false;
-    $('notice-title').textContent = 'Every soundtrack needs a room.';
+    $('notice-title').textContent = 'No shared servers found.';
     $('notice-description').textContent = 'Add Turntable to a Discord server you belong to, then refresh this page to find it here.';
   }
-  $('request-hint').textContent = session?.demo ? 'Demo mode: requests do not play audio.' : session && !session.spotifyEnabled ? 'YouTube ready · Spotify needs server setup.' : 'Your next favorite is one request away.';
+  $('request-hint').textContent = session?.demo ? 'Local demo: requests do not play audio.' : session && !session.configured ? 'Song and playlist requests will be available after setup.' : session && !session.spotifyEnabled ? 'YouTube songs and playlists supported. Spotify requires server credentials.' : 'Spotify and YouTube songs or playlists. Imports join the end of the queue.';
+  renderPlayer();
   renderEnabled();
 }
 
@@ -172,7 +186,7 @@ function renderGuildSelect() {
   const select = $('guild-select');
   select.replaceChildren();
   if (!state.guilds.length) {
-    select.append(new Option(state.session?.user ? 'No shared servers yet' : 'Your listening room', ''));
+    select.append(new Option(state.session?.user ? 'No shared servers yet' : 'Select a server', ''));
   } else {
     for (const guild of state.guilds) select.append(new Option(guild.name, guild.id));
     select.value = state.guildId;
@@ -203,29 +217,30 @@ function renderChannels() {
 }
 
 function renderEnabled() {
-  const ready = Boolean(state.session?.user && state.session.botReady && state.guildId && state.detail && !state.busy && !state.offline);
+  const connected = Boolean(state.session?.user && (state.session.configured || state.session.demo) && state.session.botReady && !state.busy && !state.offline);
+  const ready = Boolean(connected && state.guildId && state.detail);
   const queue = state.detail?.queue;
   const canControl = ready && Boolean(state.detail?.member?.canControl);
   $('request-query').disabled = !ready;
   $('request-button').disabled = !ready;
-  $('guild-select').disabled = state.guilds.length < 1 || state.busy;
+  $('guild-select').disabled = !connected || state.guilds.length < 1;
   $('channel-select').disabled = !ready || !(state.detail?.voiceChannels?.length);
   $('join-button').disabled = !ready || !$('channel-select').value || queue?.channelId === $('channel-select').value;
   $('leave-button').disabled = !canControl;
   $('pause-button').disabled = !canControl || !queue?.nowPlaying;
   $('skip-button').disabled = !canControl || !queue?.nowPlaying;
   $('stop-button').disabled = !canControl || (!queue?.nowPlaying && !queue?.tracks?.length);
+  $('shuffle-button').disabled = !canControl || (queue?.tracks?.length || 0) < 2;
   for (const button of $('queue-list').querySelectorAll('button')) button.disabled = !ready;
 }
 
 function renderPlayer() {
   const queue = state.detail?.queue;
   const track = queue?.nowPlaying;
-  $('now-title').textContent = track?.title || 'Nothing spinning. Yet.';
-  $('now-artist').textContent = track?.artist || (track ? 'Unknown artist' : 'Your soundtrack starts with a request.');
-  $('now-requester').hidden = !track?.requestedBy?.username;
-  $('now-requester').textContent = track?.requestedBy?.username ? `In the mix thanks to ${track.requestedBy.username}` : '';
-  const sourceUrl = safeUrl(track?.sourceUrl);
+  $('now-title').textContent = track?.title || 'No track loaded';
+  $('now-artist').textContent = track?.artist || (track ? 'Unknown artist' : 'Request a song to get started.');
+  $('now-requester').textContent = track?.requestedBy?.username ? `REQUESTED BY ${track.requestedBy.username}` : 'AUTO QUEUE / ON';
+  const sourceUrl = safeUrl(track?.sourceUrl, ['youtube.com', 'youtu.be', 'open.spotify.com']);
   $('now-link').hidden = !sourceUrl;
   if (sourceUrl) $('now-link').href = sourceUrl;
   const thumbnail = imageUrl(track?.thumbnail);
@@ -240,14 +255,20 @@ function renderPlayer() {
     art.dataset.source = '';
   }
   $('record-scene').hidden = Boolean(thumbnail && !art.hidden);
-  $('player-status').textContent = track ? queue.paused ? 'PAUSED' : queue.playing ? 'NOW PLAYING' : 'LOADING' : 'STANDING BY';
-  $('player-status').classList.toggle('active', Boolean(track && !queue.paused));
-  $('artwork-badge-text').textContent = track ? `${track.source === 'spotify' ? 'SPOTIFY REQUEST' : 'YOUTUBE'} · ${queue.paused ? 'ON PAUSE' : 'IN THE MIX'}` : 'WAITING FOR THE FIRST TRACK';
+  const status = state.offline || (state.session?.configured && !state.session.botReady) ? 'OFFLINE' : track ? queue.paused ? 'PAUSED' : queue.playing ? 'PLAYING' : 'LOADING' : 'STANDBY';
+  $('player-status').textContent = status;
+  $('screen-status').textContent = status;
+  $('screen-source').textContent = track ? track.source === 'spotify' ? 'SPOTIFY' : 'YOUTUBE' : 'DISCORD VOICE';
+  $('output-status').textContent = queue?.channelId && !state.offline && state.session?.botReady ? 'CONNECTED' : 'DISCONNECTED';
+  document.body.classList.toggle('is-paused', Boolean(queue?.paused));
+  document.body.classList.toggle('is-idle', !queue?.playing || state.offline || !state.session?.botReady);
+  $('player-status').classList.toggle('active', Boolean(track && !queue.paused && !state.offline && state.session?.botReady));
   const pauseLabel = queue?.paused ? 'Resume playback' : 'Pause playback';
   $('pause-button').setAttribute('aria-label', pauseLabel);
   $('pause-button').title = pauseLabel;
-  $('pause-icon').classList.toggle('resume', Boolean(queue?.paused));
-  $('controls-help').textContent = state.session?.demo ? 'Demo controls · audio plays only in a real Discord room.' : !state.session?.user ? 'Connect Discord to join the listening room.' : !queue?.channelId ? 'Join a voice channel to get the room going.' : !state.detail?.member?.canControl ? 'Join the bot’s voice channel to control playback.' : 'You have the aux. Keep the good songs coming.';
+  $('pause-icon').textContent = queue?.paused ? '▶' : 'Ⅱ';
+  $('pause-label').textContent = queue?.paused ? 'PLAY' : 'PAUSE';
+  $('controls-help').textContent = state.session?.demo ? 'Demo controls only. No audio is playing.' : !state.session?.user ? 'Connect Discord to use playback controls.' : !queue?.channelId ? 'Join a voice channel to start playback.' : !state.detail?.member?.canControl ? 'Join the bot’s voice channel to control playback, or ask a DJ.' : 'Controls affect everyone listening in this voice channel.';
   renderProgress();
 }
 
@@ -260,21 +281,25 @@ function renderProgress() {
   const boundedElapsed = total > 0 ? Math.min(elapsed, total) : elapsed;
   const percent = total > 0 ? Math.min(100, boundedElapsed / total * 100) : 0;
   $('elapsed-time').textContent = duration(boundedElapsed);
-  $('total-time').textContent = duration(total);
+  $('screen-elapsed').textContent = duration(boundedElapsed);
+  const totalText = duration(track ? track.durationSec : 0);
+  $('total-time').textContent = totalText;
+  $('cassette-total').textContent = totalText;
   $('progress-fill').style.width = `${percent}%`;
   $('progress-track').setAttribute('aria-valuenow', String(Math.round(percent)));
-  $('progress-track').setAttribute('aria-valuetext', `${duration(boundedElapsed)} of ${duration(total)}`);
+  $('progress-track').setAttribute('aria-valuetext', `${duration(boundedElapsed)} elapsed${totalText === '--:--' ? '; duration unknown' : ` of ${totalText}`}`);
 }
 
 function renderQueue() {
   const tracks = state.detail?.queue?.tracks || [];
-  $('queue-count').textContent = String(tracks.length);
+  $('queue-count').textContent = String(tracks.length).padStart(2, '0');
   const seconds = tracks.reduce((sum, track) => sum + (Number(track.durationSec) || 0), 0);
-  $('queue-duration').textContent = tracks.length ? `${tracks.length} ${tracks.length === 1 ? 'song' : 'songs'}${seconds ? ` · ${Math.ceil(seconds / 60)} min` : ''}` : 'A little room for good music';
+  $('queue-duration').textContent = tracks.some(track => track.durationSec == null) ? '--:--' : duration(seconds);
+  $('queue-duration').title = tracks.some(track => track.durationSec == null) ? 'Some track durations will be checked before playback.' : 'Total duration of upcoming tracks';
   $('queue-empty').hidden = tracks.length > 0;
   $('queue-list').hidden = !tracks.length;
   $('queue-note').hidden = !tracks.length;
-  $('queue-empty-copy').textContent = !state.session?.user ? 'Connect your Discord account to find your server and start a queue worth sticking around for.' : !state.guildId ? 'Add Turntable to your Discord server to get everyone listening together.' : state.detail?.queue?.nowPlaying ? 'Enjoy this one, then keep the good music coming. Add the next song above.' : 'Drop a YouTube or Spotify link above, or search for a song. Your friends will thank you.';
+  $('queue-empty-copy').textContent = !state.session?.user ? 'Connect Discord, select your server, and add a song.' : !state.guildId ? 'Add Turntable to a Discord server you belong to.' : state.detail?.queue?.nowPlaying ? 'No tracks waiting. Request the next song above.' : 'Paste a song or playlist link above, or search by name.';
   const signature = JSON.stringify([tracks, state.session?.user?.id, state.detail?.member?.canManage]);
   if (signature === state.queueSignature) return;
   state.queueSignature = signature;
@@ -284,41 +309,17 @@ function renderQueue() {
     const item = document.createElement('li');
     item.className = 'queue-item';
     appendText(item, 'span', 'queue-index', String(index + 1).padStart(2, '0'));
-    const thumbnail = imageUrl(track.thumbnail);
-    if (thumbnail) {
-      const cover = document.createElement('img');
-      cover.className = 'queue-cover';
-      cover.src = thumbnail;
-      cover.alt = '';
-      cover.loading = 'lazy';
-      cover.referrerPolicy = 'no-referrer';
-      cover.addEventListener('error', () => {
-        const fallback = document.createElement('div');
-        fallback.className = 'queue-cover queue-cover-placeholder';
-        fallback.setAttribute('aria-hidden', 'true');
-        cover.replaceWith(fallback);
-      }, { once: true });
-      item.append(cover);
-    } else {
-      const cover = appendText(item, 'div', 'queue-cover queue-cover-placeholder', '');
-      cover.setAttribute('aria-hidden', 'true');
-    }
     const copy = document.createElement('div');
     copy.className = 'queue-item-copy';
     const title = appendText(copy, 'p', 'queue-item-title', track.title || 'Untitled track');
     title.title = track.title || 'Untitled track';
-    const meta = document.createElement('div');
-    meta.className = 'queue-item-meta';
-    appendText(meta, 'span', 'source-pill', track.source === 'spotify' ? 'Spotify' : 'YouTube');
-    appendText(meta, 'span', '', track.artist || 'Unknown artist');
-    if (track.requestedBy?.username) {
-      appendText(meta, 'span', '', '·');
-      const requester = appendText(meta, 'span', '', track.requestedBy.username);
-      requester.title = `Requested by ${track.requestedBy.username}`;
-    }
-    copy.append(meta);
+    appendText(copy, 'span', 'queue-item-artist', track.artist || 'Unknown artist');
     item.append(copy);
-    appendText(item, 'span', 'queue-item-duration', track.durationSec ? duration(track.durationSec) : '—');
+    const requester = appendText(item, 'div', 'queue-item-requester', '');
+    const person = appendText(requester, 'span', 'queue-item-person', track.requestedBy?.username || 'Listener');
+    person.title = `Requested by ${track.requestedBy?.username || 'a listener'}`;
+    appendText(requester, 'span', 'queue-item-source', track.source === 'spotify' ? 'Spotify' : 'YouTube');
+    appendText(item, 'span', 'queue-item-duration', duration(track.durationSec));
     if (state.detail?.member?.canManage || track.requestedBy?.id === state.session?.user?.id) {
       const remove = appendText(item, 'button', 'queue-remove', '×');
       remove.type = 'button';
@@ -383,7 +384,7 @@ async function initialize() {
 }
 
 async function mutate(endpoint, body, successMessage) {
-  if (state.busy || !state.guildId || !state.session?.user) return false;
+  if (state.busy || state.offline || !state.guildId || !state.session?.user || !state.session.botReady || (!state.session.configured && !state.session.demo)) return false;
   state.busy = true;
   state.detailRevision += 1;
   renderEnabled();
@@ -394,7 +395,7 @@ async function mutate(endpoint, body, successMessage) {
       state.sampleTime = Date.now();
       renderDetail();
     }
-    showFeedback(successMessage);
+    showFeedback(typeof successMessage === 'function' ? successMessage(result) : successMessage);
     await loadDetail({ silent: true }).catch(() => { /* The normal polling loop retries an updated snapshot. */ });
     return true;
   } catch (error) {
@@ -407,17 +408,33 @@ async function mutate(endpoint, body, successMessage) {
   }
 }
 
+function requestMessage(result) {
+  const count = Array.isArray(result.added) ? result.added.length : result.import?.accepted;
+  const messages = [count == null ? 'Request added to the queue.' : `Added ${count} ${count === 1 ? 'track' : 'tracks'} to ${state.session?.demo ? 'the demo' : 'the'} queue.`];
+  const details = result.import;
+  const warnings = [...new Set((result.warnings || details?.warnings || []).filter(value => typeof value === 'string'))];
+  if (details?.skipped && !warnings.some(value => /skipp/i.test(value))) messages.push(`${details.skipped} playlist entries were skipped.`);
+  if (details?.limitReached && !warnings.some(value => /first|limit|remaining/i.test(value))) messages.push(`Only the first ${details.inspected} playlist entries were inspected.`);
+  messages.push(...warnings);
+  if (state.session?.demo) messages.push('No audio will play.');
+  return messages.join(' ');
+}
+
 $('request-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const query = $('request-query').value.trim();
   if (!query || state.busy) return;
+  if (!state.session?.demo && !state.session?.spotifyEnabled && /^(?:spotify:|(?:https?:\/\/)?(?:open\.)?spotify\.com\/)/i.test(query)) {
+    showFeedback('Spotify requests need Spotify credentials on the bot server. You can request a YouTube song or playlist now.', true);
+    return;
+  }
   const label = $('request-button').querySelector('span');
-  label.textContent = 'Finding song…';
+  label.textContent = 'IMPORTING…';
   $('request-form').setAttribute('aria-busy', 'true');
   const channelId = state.detail?.queue?.channelId || $('channel-select').value;
-  const success = await mutate('requests', { query, ...(channelId ? { channelId } : {}) }, state.session?.demo ? 'Added to your demo queue. No audio will play.' : 'Good choice. Your request is in the mix.');
+  const success = await mutate('requests', { query, ...(channelId ? { channelId } : {}) }, requestMessage);
   if (success) $('request-query').value = '';
-  label.textContent = 'Add to queue';
+  label.textContent = '+ REQUEST';
   $('request-form').setAttribute('aria-busy', 'false');
   if (success) $('request-query').focus();
 });
@@ -436,10 +453,11 @@ $('join-button').addEventListener('click', () => mutate('join', { channelId: $('
 $('leave-button').addEventListener('click', () => mutate('control', { action: 'leave' }, 'Disconnected from the voice channel.'));
 $('pause-button').addEventListener('click', () => {
   const action = state.detail?.queue?.paused ? 'resume' : 'pause';
-  return mutate('control', { action }, action === 'resume' ? 'Back in the groove.' : 'Playback paused.');
+  return mutate('control', { action }, action === 'resume' ? 'Playback resumed.' : 'Playback paused.');
 });
-$('skip-button').addEventListener('click', () => mutate('control', { action: 'skip' }, 'On to the next one.'));
+$('skip-button').addEventListener('click', () => mutate('control', { action: 'skip' }, 'Skipped the current track.'));
 $('stop-button').addEventListener('click', () => mutate('control', { action: 'stop' }, 'Playback stopped and the queue cleared.'));
+$('shuffle-button').addEventListener('click', () => mutate('control', { action: 'shuffle' }, 'Shuffled the upcoming tracks.'));
 $('now-art').referrerPolicy = 'no-referrer';
 $('now-art').addEventListener('error', () => {
   $('now-art').hidden = true;
@@ -468,6 +486,13 @@ async function poll() {
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 window.addEventListener('online', poll);
 window.addEventListener('offline', () => { state.offline = true; renderSession(); });
+
+for (const button of document.querySelectorAll('[data-theme-choice]')) {
+  button.addEventListener('click', () => setTheme(button.dataset.themeChoice));
+}
+let initialTheme = 'cassette';
+try { initialTheme = localStorage.getItem('turntable-theme') || 'cassette'; } catch { /* Storage is optional. */ }
+setTheme(initialTheme, false);
 
 const authError = new URL(window.location.href).searchParams.has('error');
 if (authError) {
