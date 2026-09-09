@@ -1,0 +1,18 @@
+# Optional locked preview while credentials or Render billing are being added.
+# Use render.yaml for the always-on bot with persistent queues.
+services:
+  - type: web
+    name: discord-bap-bot
+    runtime: docker
+    plan: free
+    numInstances: 1
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SETUP_MODE
+        value: 'true'
+      - key: DATA_DIR
+        value: /tmp/turntable-data
+      - key: SESSION_SECRET
+        generateValue: true

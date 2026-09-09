@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: discord-bap-bot
+    runtime: docker
+    plan: starter
+    numInstances: 1
+    healthCheckPath: /healthz
+    disk:
+      name: turntable-queues
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SETUP_MODE
+        value: 'false'
+      - key: DATA_DIR
+        value: /var/data
+      - key: MAX_PLAYLIST_TRACKS
+        value: '50'
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+# PUBLIC_URL defaults to RENDER_EXTERNAL_URL. For a custom domain, set it manually.
+# Add SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET for Spotify tracks.
+# Add SPOTIFY_REFRESH_TOKEN for playlists accessible to that Spotify account.
+# Optional: DISCORD_GUILD_ID for one server, DJ_ROLE_ID for designated DJs.

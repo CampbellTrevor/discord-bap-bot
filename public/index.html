@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#151713">
+    <meta name="description" content="A shared soundtrack for your Discord server. Request a song, build the queue, and listen together.">
+    <title>Turntable — Your shared soundtrack</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#request-query">Skip to song request</a>
+    <div class="page-shell">
+      <header class="site-header">
+        <a class="wordmark" href="/" aria-label="Turntable home"><span class="brand-record" aria-hidden="true"></span>turntable<span class="wordmark-dot">.</span></a>
+        <div class="header-right">
+          <label class="server-picker"><span class="server-icon" aria-hidden="true">#</span><span class="sr-only">Discord server</span><select id="guild-select" disabled><option>Your listening room</option></select></label>
+          <div class="header-divider" aria-hidden="true"></div>
+          <div id="auth-container"><a class="button button-discord button-small" id="login-link" href="/auth/discord">Connect Discord <span aria-hidden="true">↗</span></a></div>
+        </div>
+      </header>
+
+      <main>
+        <div class="status-line"><span class="room-label"><span class="status-dot" id="status-dot"></span><span id="connection-status">FINDING YOUR FREQUENCY</span></span><span class="demo-badge" id="demo-badge" hidden>DEMO ROOM · NO AUDIO</span><a class="quiet-link" id="invite-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Add to your server <span aria-hidden="true">↗</span></a></div>
+        <div class="notice" id="setup-notice" hidden><strong id="notice-title"></strong><p id="notice-description"></p></div>
+        <div class="feedback" id="feedback" role="status" aria-live="polite" hidden></div>
+
+        <div class="main-grid">
+          <section class="request-section" aria-labelledby="page-heading">
+            <div class="eyebrow"><span class="eyebrow-line" aria-hidden="true"></span>YOUR SHARED SOUNDTRACK</div>
+            <h1 id="page-heading">Good company.<br>Great queue<span class="lime-text">.</span></h1>
+            <p class="intro-copy">For the late-night hangs and one-more-game crews.<br class="desktop-break"> Pick a song. Pass the aux. Make it a good one.</p>
+
+            <form id="request-form" class="request-form">
+              <label for="request-query" class="field-label">WHAT ARE WE LISTENING TO?</label>
+              <div class="request-input-wrap"><span class="search-icon" aria-hidden="true"></span><input id="request-query" name="query" type="text" placeholder="Paste a link or search for a song…" maxlength="500" autocomplete="off" required disabled><button class="button button-lime" id="request-button" type="submit" disabled><span>Add to queue</span><span class="plus-icon" aria-hidden="true">+</span></button></div>
+              <div class="request-meta"><span class="sources"><span class="source-label"><span class="youtube-mark" aria-hidden="true">▶</span>YouTube</span><span class="source-separator" aria-hidden="true">/</span><span class="source-label"><span class="spotify-mark" aria-hidden="true">≋</span>Spotify</span></span><span id="request-hint">Your next favorite is one request away.</span></div>
+            </form>
+
+            <section class="queue-section" aria-labelledby="queue-heading">
+              <div class="section-heading"><div class="section-title"><h2 id="queue-heading">Up next</h2><span class="count-pill" id="queue-count">0</span></div><span id="queue-duration" class="muted">A little room for good music</span></div>
+              <div id="queue-empty" class="queue-empty"><div class="empty-icon" aria-hidden="true"><span></span><span></span><span></span><span></span></div><h3>The floor is yours.</h3><p id="queue-empty-copy">Connect your Discord account to find your server<br>and start a queue worth sticking around for.</p><span class="empty-caption">GOOD TASTE IS BETTER SHARED</span></div>
+              <ol id="queue-list" class="queue-list" aria-label="Upcoming tracks" hidden></ol>
+              <p class="queue-note" id="queue-note" hidden>Everyone gets a turn. Songs play in the order they're added.</p>
+            </section>
+          </section>
+
+          <aside class="player-column" aria-label="Playback and voice channel">
+            <section class="player-card" aria-labelledby="player-heading">
+              <div class="player-card-header"><h2 id="player-heading">ON THE TURNTABLE</h2><span id="player-status" class="player-status">STANDING BY</span></div>
+              <div class="artwork" id="artwork"><img id="now-art" class="now-art" alt="" hidden><div class="record-scene" id="record-scene" aria-hidden="true"><div class="record-sticker">SIDE A<br><span>GOOD VIBES ONLY</span></div><div class="vinyl"><div class="vinyl-label"><span>turntable.</span><i></i><small>33⅓ RPM · STEREO</small></div></div><div class="record-corner">TT—001</div><div class="art-caption">LISTEN TOGETHER.</div></div><div class="artwork-badge"><span class="tiny-record" aria-hidden="true"></span><span id="artwork-badge-text">WAITING FOR THE FIRST TRACK</span></div></div>
+              <div class="track-details"><div class="track-title-row"><h3 id="now-title">Nothing spinning. Yet.</h3><a id="now-link" class="external-track" href="#" target="_blank" rel="noopener noreferrer" aria-label="Open current track at its source" hidden>↗</a></div><p id="now-artist">Your soundtrack starts with a request.</p><p id="now-requester" class="now-requester" hidden></p></div>
+              <div class="progress-track" role="progressbar" id="progress-track" aria-label="Playback position" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-fill"></div></div><div class="time-labels"><span id="elapsed-time">0:00</span><span id="total-time">0:00</span></div>
+              <div class="player-controls"><button class="icon-button stop-button" id="stop-button" type="button" aria-label="Stop playback and clear queue" title="Stop and clear queue" disabled><span class="stop-icon" aria-hidden="true"></span></button><button class="play-button" id="pause-button" type="button" aria-label="Pause playback" title="Pause playback" disabled><span class="pause-icon" id="pause-icon" aria-hidden="true"></span></button><button class="icon-button skip-button" id="skip-button" type="button" aria-label="Skip current track" title="Skip track" disabled><span class="skip-icon" aria-hidden="true"></span></button></div>
+              <p class="controls-help" id="controls-help">Join a voice channel to get the room going.</p>
+            </section>
+
+            <section class="voice-card" aria-labelledby="voice-heading"><div class="voice-heading-row"><span class="voice-wave" aria-hidden="true">◖))</span><div><h2 id="voice-heading">Bring the room together</h2><p id="voice-status">Choose where to listen.</p></div><span id="voice-connected-dot" class="voice-connected-dot" hidden></span></div><div class="channel-controls"><label class="sr-only" for="channel-select">Voice channel</label><select id="channel-select" disabled><option value="">Select a voice channel</option></select><button class="button button-outline button-small" id="join-button" type="button" disabled>Join</button></div><button class="text-button leave-button" id="leave-button" type="button" hidden>Disconnect from voice</button></section>
+            <div class="little-note"><span class="note-star" aria-hidden="true">✳</span><p>A good queue is a group project.<br>Bring your favorites. Find something new.</p></div>
+          </aside>
+        </div>
+
+        <footer class="site-footer"><span>LESS DJ DUTY. MORE HANGING OUT.</span><p>Already in Discord? Try <code>/play</code> <span class="footer-query">your favorite song</span></p><span class="footer-tag">Made for listening together <span aria-hidden="true">↗</span></span></footer>
+      </main>
+    </div>
+  </body>
+</html>
