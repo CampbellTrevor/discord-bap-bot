@@ -14,7 +14,157 @@ const state = {
   detailRevision: 0,
   pollCount: 0,
   feedbackTimer: null,
+  search: { query: '', source: 'youtube', results: [], pending: false, revision: 0, controller: null, cache: new Map(), added: new Set(), context: '' },
 };
+
+function directRequest(query) {
+  return /^(?:spotify:|[a-z][a-z0-9+.-]*:\/|\/\/|(?:(?:www\.|m\.|music\.)?youtube\.com|(?:www\.)?youtu\.be|open\.spotify\.com)(?:\/|$))/i.test(query);
+}
+
+function searchContext() {
+  return JSON.stringify([state.session?.user?.id || '', state.guildId]);
+}
+
+function cancelSearch(close = true) {
+  state.search.revision += 1;
+  state.search.controller?.abort();
+  state.search.controller = null;
+  state.search.pending = false;
+  $('search-results-panel').setAttribute('aria-busy', 'false');
+  if (close) {
+    $('search-results').hidden = true;
+    state.search.results = [];
+    state.search.query = '';
+    $('search-results-list').replaceChildren();
+  }
+}
+
+function updateRequestLabel() {
+  $('request-button').querySelector('span').textContent = state.search.pending ? 'SEARCHING...' : directRequest($('request-query').value.trim()) ? '+ REQUEST' : 'SEARCH';
+  $('request-form').setAttribute('aria-busy', String(state.search.pending || state.busy));
+}
+
+function canonicalSearchUrl(track) {
+  try {
+    const url = new URL(track.sourceUrl);
+    if (url.protocol !== 'https:' || url.username || url.password || url.port) return null;
+    if (track.source === 'youtube' && ['youtube.com', 'www.youtube.com'].includes(url.hostname) && url.pathname === '/watch' && /^[A-Za-z0-9_-]{11}$/.test(url.searchParams.get('v') || '')) return `https://www.youtube.com/watch?v=${url.searchParams.get('v')}`;
+    if (track.source === 'spotify' && url.hostname === 'open.spotify.com' && /^\/track\/[A-Za-z0-9]{22}$/.test(url.pathname)) return `https://open.spotify.com${url.pathname}`;
+  } catch { /* Ignore malformed catalog results. */ }
+  return null;
+}
+
+function renderSearchResults() {
+  const list = $('search-results-list');
+  list.replaceChildren();
+  const revision = state.search.revision;
+  const context = state.search.context;
+  for (const track of state.search.results) {
+    const url = canonicalSearchUrl(track);
+    if (!url) continue;
+    const item = document.createElement('li');
+    item.className = 'search-result';
+    const thumbnail = imageUrl(track.thumbnail);
+    if (thumbnail) {
+      const image = document.createElement('img');
+      image.className = 'search-result-art';
+      image.alt = '';
+      image.src = thumbnail;
+      image.loading = 'lazy';
+      image.referrerPolicy = 'no-referrer';
+      image.addEventListener('error', () => {
+        const placeholder = document.createElement('span');
+        placeholder.className = 'search-result-art';
+        placeholder.setAttribute('aria-hidden', 'true');
+        image.replaceWith(placeholder);
+      }, { once: true });
+      item.append(image);
+    } else appendText(item, 'span', 'search-result-art', 'TT').setAttribute('aria-hidden', 'true');
+    const copy = appendText(item, 'div', 'search-result-copy', '');
+    appendText(copy, 'p', 'search-result-title', track.title || 'Untitled track');
+    appendText(copy, 'span', 'search-result-artist', track.artist || 'Unknown artist');
+    const meta = appendText(copy, 'div', 'search-result-meta', '');
+    appendText(meta, 'span', 'search-result-source', track.source === 'spotify' ? 'Spotify' : 'YouTube');
+    appendText(meta, 'span', 'search-result-duration', duration(track.durationSec));
+    const add = appendText(item, 'button', 'search-result-add', state.search.added.has(url) ? 'ADDED' : '+ ADD');
+    add.type = 'button';
+    add.dataset.sourceUrl = url;
+    add.setAttribute('aria-label', `Add ${track.title || 'track'} to the queue`);
+    add.addEventListener('click', async () => {
+      if (state.search.pending || state.busy || revision !== state.search.revision || context !== searchContext() || state.search.added.has(url) || $('search-results').hidden) return;
+      const channelId = state.detail?.queue?.channelId || $('channel-select').value;
+      add.textContent = 'ADDING...';
+      const success = await mutate('requests', { query: url, ...(channelId ? { channelId } : {}) }, requestMessage);
+      if (revision !== state.search.revision || context !== searchContext()) return;
+      if (success) state.search.added.add(url);
+      add.textContent = success ? 'ADDED' : '+ ADD';
+      renderEnabled();
+    });
+    list.append(item);
+  }
+  renderEnabled();
+}
+
+async function searchSongs(query, source = state.search.source) {
+  if (!state.session?.user || !state.session.botReady || state.offline || state.busy || !state.guildId || !state.detail || (!state.session.configured && !state.session.demo)) return;
+  if (source === 'spotify' && !state.session.demo && !state.session.spotifyEnabled) {
+    showFeedback('Spotify search needs Spotify credentials on the bot server.', true);
+    return;
+  }
+  cancelSearch(false);
+  const search = state.search;
+  const revision = search.revision;
+  const context = searchContext();
+  const guildId = state.guildId;
+  search.query = query;
+  search.source = source;
+  search.context = context;
+  search.results = [];
+  search.added = new Set();
+  search.pending = true;
+  search.controller = new AbortController();
+  const controller = search.controller;
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 45000);
+  const key = JSON.stringify([context, source, query]);
+  const current = () => revision === search.revision && context === searchContext() && !$('search-results').hidden;
+  $('search-results').hidden = false;
+  $('search-results-heading').textContent = `RESULTS FOR "${query}"`;
+  $('search-results-panel').setAttribute('aria-labelledby', `search-tab-${source}`);
+  $('search-results-panel').setAttribute('aria-busy', 'true');
+  for (const tab of document.querySelectorAll('[data-search-source]')) {
+    const selected = tab.dataset.searchSource === source;
+    tab.setAttribute('aria-selected', String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
+  $('search-results-status').classList.remove('error');
+  $('search-results-status').textContent = `Searching ${source === 'spotify' ? 'Spotify' : 'YouTube'}...`;
+  renderSearchResults();
+  try {
+    const cached = search.cache.get(key);
+    const payload = cached && Date.now() - cached.at < 60000 ? { results: cached.results } : await api(`/api/guilds/${encodeURIComponent(guildId)}/search`, { method: 'POST', body: JSON.stringify({ query, source }), signal: controller.signal });
+    if (!current()) return;
+    if (!Array.isArray(payload.results)) throw new Error('Search returned an invalid response. Please try again.');
+    search.results = payload.results.slice(0, 5).filter(track => track?.source === source && canonicalSearchUrl(track));
+    if (search.cache.size >= 20) search.cache.delete(search.cache.keys().next().value);
+    search.cache.set(key, { at: Date.now(), results: search.results });
+    $('search-results-status').textContent = search.results.length ? `${search.results.length} ${search.results.length === 1 ? 'result' : 'results'}. ${source === 'spotify' ? 'Audio via YouTube. ' : ''}Choose a recording to add.` : 'No matching recordings found. Try a different song or artist.';
+    renderSearchResults();
+  } catch (error) {
+    if (!current()) return;
+    $('search-results-status').classList.add('error');
+    $('search-results-status').textContent = timedOut ? 'Search took too long. Please try again.' : error.message || 'Search failed. Please try again.';
+    if (error.status === 401) await initialize();
+  } finally {
+    clearTimeout(timer);
+    if (current()) {
+      search.pending = false;
+      search.controller = null;
+      $('search-results-panel').setAttribute('aria-busy', 'false');
+      renderEnabled();
+    }
+  }
+}
 
 function savedGuild() {
   try { return localStorage.getItem('turntable.guild') || ''; } catch { return ''; }
@@ -235,7 +385,7 @@ function renderEnabled() {
   const queue = state.detail?.queue;
   const canControl = ready && Boolean(state.detail?.member?.canControl);
   $('request-query').disabled = !ready;
-  $('request-button').disabled = !ready;
+  $('request-button').disabled = !ready || state.search.pending;
   $('guild-select').disabled = !connected || state.guilds.length < 1;
   $('channel-select').disabled = !ready || !(state.detail?.voiceChannels?.length);
   $('join-button').disabled = !ready || !$('channel-select').value || queue?.channelId === $('channel-select').value;
@@ -245,6 +395,13 @@ function renderEnabled() {
   $('stop-button').disabled = !canControl || (!queue?.nowPlaying && !queue?.tracks?.length);
   $('shuffle-button').disabled = !canControl || (queue?.tracks?.length || 0) < 2;
   for (const button of $('queue-list').querySelectorAll('button')) button.disabled = !ready;
+  if (state.search.pending && (state.offline || !state.session?.botReady || !state.session?.user)) {
+    cancelSearch(false);
+    $('search-results-status').textContent = 'Search interrupted. Reconnect and try again.';
+  }
+  for (const tab of document.querySelectorAll('[data-search-source]')) tab.disabled = !ready || (tab.dataset.searchSource === 'spotify' && !state.session?.demo && !state.session?.spotifyEnabled);
+  for (const button of $('search-results-list').querySelectorAll('button')) button.disabled = !ready || state.search.pending || state.search.context !== searchContext() || state.search.added.has(button.dataset.sourceUrl);
+  updateRequestLabel();
 }
 
 function renderPlayer() {
@@ -370,6 +527,7 @@ async function initialize() {
   try {
     const session = await api('/api/session');
     const changedUser = state.session?.user?.id !== session.user?.id;
+    if (changedUser) { cancelSearch(); state.search.cache.clear(); }
     state.session = session;
     state.offline = false;
     renderAuth();
@@ -379,7 +537,7 @@ async function initialize() {
       const previousGuildId = state.guildId;
       const preferredGuild = state.guildId || savedGuild();
       state.guildId = state.guilds.some((guild) => guild.id === preferredGuild) ? preferredGuild : state.guilds[0]?.id || '';
-      if (changedUser || state.guildId !== previousGuildId) state.detail = null;
+      if (changedUser || state.guildId !== previousGuildId) { state.detail = null; cancelSearch(); }
     } else if (!session.user) {
       state.guilds = [];
       state.guildId = '';
@@ -399,10 +557,13 @@ async function initialize() {
 async function mutate(endpoint, body, successMessage) {
   if (state.busy || state.offline || !state.guildId || !state.session?.user || !state.session.botReady || (!state.session.configured && !state.session.demo)) return false;
   state.busy = true;
+  const guildId = state.guildId;
+  const userId = state.session.user.id;
   state.detailRevision += 1;
   renderEnabled();
   try {
-    const result = await api(`/api/guilds/${encodeURIComponent(state.guildId)}/${endpoint}`, { method: 'POST', body: JSON.stringify(body) });
+    const result = await api(`/api/guilds/${encodeURIComponent(guildId)}/${endpoint}`, { method: 'POST', body: JSON.stringify(body) });
+    if (guildId !== state.guildId || userId !== state.session?.user?.id) return false;
     if (result.queue && state.detail) {
       state.detail.queue = result.queue;
       state.sampleTime = Date.now();
@@ -412,6 +573,7 @@ async function mutate(endpoint, body, successMessage) {
     await loadDetail({ silent: true }).catch(() => { /* The normal polling loop retries an updated snapshot. */ });
     return true;
   } catch (error) {
+    if (guildId !== state.guildId || userId !== state.session?.user?.id) return false;
     showFeedback(error.message || 'That request did not go through. Please try again.', true);
     if (error.status === 401) await initialize();
     return false;
@@ -437,22 +599,21 @@ $('request-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const query = $('request-query').value.trim();
   if (!query || state.busy) return;
+  if (!directRequest(query)) { await searchSongs(query); return; }
   if (!state.session?.demo && !state.session?.spotifyEnabled && /^(?:spotify:|(?:https?:\/\/)?(?:open\.)?spotify\.com\/)/i.test(query)) {
     showFeedback('Spotify requests need Spotify credentials on the bot server. You can request a YouTube song or playlist now.', true);
     return;
   }
-  const label = $('request-button').querySelector('span');
-  label.textContent = 'IMPORTING…';
-  $('request-form').setAttribute('aria-busy', 'true');
+  cancelSearch();
   const channelId = state.detail?.queue?.channelId || $('channel-select').value;
   const success = await mutate('requests', { query, ...(channelId ? { channelId } : {}) }, requestMessage);
-  if (success) $('request-query').value = '';
-  label.textContent = '+ REQUEST';
-  $('request-form').setAttribute('aria-busy', 'false');
+  if (success && $('request-query').value.trim() === query) $('request-query').value = '';
+  updateRequestLabel();
   if (success) $('request-query').focus();
 });
 
 $('guild-select').addEventListener('change', async () => {
+  cancelSearch();
   state.guildId = $('guild-select').value;
   saveGuild(state.guildId);
   state.detailRevision += 1;
@@ -461,6 +622,29 @@ $('guild-select').addEventListener('change', async () => {
   renderDetail();
   try { await loadDetail(); } catch (error) { showFeedback(error.message, true); }
 });
+$('request-query').addEventListener('input', () => {
+  if ($('request-query').value.trim() !== state.search.query) cancelSearch();
+  renderEnabled();
+});
+$('search-close').addEventListener('click', () => {
+  cancelSearch();
+  renderEnabled();
+  $('request-query').focus();
+});
+for (const tab of document.querySelectorAll('[data-search-source]')) {
+  tab.addEventListener('click', () => {
+    if (state.search.query) searchSongs(state.search.query, tab.dataset.searchSource);
+  });
+  tab.addEventListener('keydown', event => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const tabs = [...document.querySelectorAll('[data-search-source]')].filter(button => !button.disabled);
+    const index = tabs.indexOf(tab);
+    const next = event.key === 'Home' ? tabs[0] : event.key === 'End' ? tabs.at(-1) : tabs[(index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length];
+    next?.focus();
+    next?.click();
+  });
+}
 $('channel-select').addEventListener('change', renderChannels);
 $('join-button').addEventListener('click', () => mutate('join', { channelId: $('channel-select').value }, 'Connected to voice.'));
 $('leave-button').addEventListener('click', () => mutate('control', { action: 'leave' }, 'Disconnected from the voice channel.'));

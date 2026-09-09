@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#eee7d8">
   <meta name="description" content="Request songs and playlists from Spotify or YouTube for your Discord voice channel.">
   <title>Turntable — Discord music queue</title>
-  <link rel="stylesheet" href="/styles.css?v=cassette-dark-1">
-  <script src="/app.js?v=cassette-dark-1" defer></script>
+  <link rel="stylesheet" href="/styles.css?v=provider-search-1">
+  <script src="/app.js?v=provider-search-1" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to player</a>
@@ -49,8 +49,13 @@
       </div>
       <section class="request-panel" aria-label="Add a song or playlist">
         <div class="request-heading"><label for="request-query"><span class="label-block cassette-only" aria-hidden="true">B</span>REQUEST INPUT</label><span class="input-sources">SPOTIFY / YOUTUBE</span></div>
-        <form id="request-form" class="request-form"><input id="request-query" name="query" type="text" placeholder="Song, playlist link, or search" aria-label="Song title, Spotify or YouTube song or playlist link" aria-describedby="request-hint" maxlength="500" autocomplete="off" required disabled><button id="request-button" type="submit" disabled><span>+ REQUEST</span></button></form>
-        <p class="request-hint" id="request-hint">Song and playlist requests join the end of the queue.</p>
+        <form id="request-form" class="request-form"><input id="request-query" name="query" type="text" placeholder="Search a song or paste a link" aria-label="Search song titles or paste a Spotify or YouTube song or playlist link" aria-describedby="request-hint" maxlength="500" autocomplete="off" required disabled><button id="request-button" type="submit" disabled><span>SEARCH</span></button></form>
+        <p class="request-hint" id="request-hint">Search by title, or paste a song or playlist link.</p>
+        <section class="search-results" id="search-results" aria-labelledby="search-results-heading" hidden>
+          <header class="search-results-header"><h3 id="search-results-heading">SEARCH RESULTS</h3><button id="search-close" class="search-close" type="button" aria-label="Close search results">Close ×</button></header>
+          <div class="search-source-tabs" role="tablist" aria-label="Search source"><button id="search-tab-youtube" type="button" data-search-source="youtube" role="tab" aria-controls="search-results-panel" aria-selected="true" tabindex="0">YouTube</button><button id="search-tab-spotify" type="button" data-search-source="spotify" role="tab" aria-controls="search-results-panel" aria-selected="false" tabindex="-1">Spotify</button></div>
+          <div class="search-results-panel" id="search-results-panel" role="tabpanel" aria-labelledby="search-tab-youtube" tabindex="0"><p class="search-results-status" id="search-results-status" role="status" aria-live="polite"></p><ol class="search-results-list" id="search-results-list" aria-label="Song search results"></ol></div>
+        </section>
       </section>
     </section>
 

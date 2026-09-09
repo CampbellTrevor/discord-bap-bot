@@ -11,6 +11,7 @@ The current service uses a public-repository connection. Push changes to GitHub,
 - Discord sign-in and server selection; only members of a server can see or change its queue.
 - Switch between **Cassette** (orange hardware, with light and dark modes) and **Winamp** (silver player and green display). The browser remembers both your theme and Cassette mode; switching never changes playback or signs you out.
 - Request a **YouTube video or playlist**, **Spotify track or accessible playlist**, or **song title** from the website or `/play`.
+- Website song searches show up to five results in YouTube and Spotify tabs. Choose **Add** on a result to queue that recording; searching alone never queues a song. Direct track and playlist links still import immediately. Spotify selections use YouTube for audio.
 - Discord voice playback, now playing, live queue updates, pause/resume, skip, shuffle, stop, and remove your own requests.
 - Server managers and the optional DJ role can control playback remotely. Other members control playback from the bot's voice channel.
 - Pending songs and the interrupted song survive restarts with a persistent disk. `/join` reconnects and resumes the saved queue, restarting the interrupted song from the beginning.
