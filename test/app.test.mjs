@@ -174,3 +174,103 @@ test('explicit setup mode locks Discord login even if partial credentials are pr
   assert.throws(() => loadConfig({ MAX_PLAYLIST_TRACKS: '101' }), /MAX_PLAYLIST_TRACKS/);
   assert.throws(() => loadConfig({ SPOTIFY_REFRESH_TOKEN: 'missing-app' }), /both Spotify/);
 });
+
+test('search requires authentication, CSRF, and the portal origin before calling the provider', async t => {
+  let searches = 0;
+  const bot = createDemoBot();
+  const search = bot.search;
+  bot.search = async (...args) => { ++searches; return search(...args); };
+  const anonymous = await fixture(t, { bot });
+  const endpoint = '/api/guilds/demo-guild/search';
+  const body = JSON.stringify({ query: 'Midnight City', source: 'youtube' });
+  assert.equal((await anonymous.request(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })).status, 401);
+  const { request } = await fixture(t, { demo: true, bot });
+  const { csrfToken } = await (await request('/api/session')).json();
+  assert.equal((await request(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })).status, 403);
+  assert.equal((await request(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken, Origin: 'https://another.example' }, body })).status, 403);
+  assert.equal(searches, 0);
+});
+
+test('search returns five selectable results without changing playback, then queues the selected result', async t => {
+  const bot = createDemoBot();
+  const originalSearch = bot.search;
+  const calls = [];
+  bot.search = async (...args) => { calls.push(args); return originalSearch(...args); };
+  const { request, config } = await fixture(t, { demo: true, bot });
+  const { csrfToken } = await (await request('/api/session')).json();
+  const headers = { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken, Origin: config.publicUrl };
+  const before = (await (await request('/api/guilds/demo-guild')).json()).queue;
+  const response = await request('/api/guilds/demo-guild/search', { method: 'POST', headers, body: JSON.stringify({ query: '  Midnight City  ', source: 'spotify' }) });
+  assert.equal(response.status, 200);
+  const { results } = await response.json();
+  assert.deepEqual(calls, [['demo-guild', 'demo-user', 'Midnight City', 'spotify']]);
+  assert.equal(results.length, 5);
+  assert.equal(new Set(results.map(track => track.sourceUrl)).size, 5);
+  assert.ok(results.every(track => track.source === 'spotify' && track.title.includes('demo result') && track.artist.includes('no audio')));
+  const after = (await (await request('/api/guilds/demo-guild')).json()).queue;
+  assert.equal(after.nowPlaying.id, before.nowPlaying.id);
+  assert.equal(after.playing, before.playing);
+  assert.deepEqual(after.tracks, before.tracks);
+  const selected = results[3];
+  const queued = await request('/api/guilds/demo-guild/requests', { method: 'POST', headers, body: JSON.stringify({ query: selected.sourceUrl }) });
+  assert.equal(queued.status, 200);
+  const result = await queued.json();
+  assert.equal(result.added[0].title, selected.title);
+  assert.equal(result.added[0].durationSec, selected.durationSec);
+  assert.equal(result.added[0].sourceUrl, selected.sourceUrl);
+  assert.notEqual(result.added[0].title, results[0].title);
+});
+
+test('search validates query bounds and provider before bot dispatch', async t => {
+  let searches = 0;
+  const bot = createDemoBot();
+  bot.search = async () => { ++searches; return { results: [] }; };
+  const { request } = await fixture(t, { demo: true, bot });
+  const { csrfToken } = await (await request('/api/session')).json();
+  const headers = { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken };
+  for (const body of [{ query: '' }, { query: '   ' }, { query: 'x'.repeat(501) }, { query: ['song'] }, { query: 'song', source: 'other' }, { query: 'song', source: ['youtube'] }]) {
+    assert.equal((await request('/api/guilds/demo-guild/search', { method: 'POST', headers, body: JSON.stringify(body) })).status, 400);
+  }
+  assert.equal(searches, 0);
+});
+
+test('search propagates guild membership denial without exposing search data', async t => {
+  const guildId = '123456789012345680';
+  const bot = {
+    isReady: () => true,
+    search: async (id, userId) => {
+      assert.equal(id, guildId);
+      assert.equal(userId, 'demo-user');
+      throw Object.assign(new Error('You must be a member of that server.'), { status: 403 });
+    },
+  };
+  const { request } = await fixture(t, { demo: true, bot });
+  const { csrfToken } = await (await request('/api/session')).json();
+  const response = await request(`/api/guilds/${guildId}/search`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ query: 'song', source: 'youtube' }) });
+  assert.equal(response.status, 403);
+  const payload = await response.json();
+  assert.match(payload.error, /member/);
+  assert.equal('results' in payload, false);
+});
+
+test('setup mode blocks search even when a supplied bot reports ready', async t => {
+  const bot = createDemoBot();
+  bot.search = async () => { throw new Error('Search must stay disabled during setup'); };
+  const { request } = await fixture(t, { demo: true, setup: true, bot });
+  const { csrfToken } = await (await request('/api/session')).json();
+  const response = await request('/api/guilds/demo-guild/search', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ query: 'song', source: 'youtube' }) });
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).error, /finishing setup/);
+});
+
+test('search rate limit caps provider calls independently of queue requests', async t => {
+  let searches = 0;
+  const bot = createDemoBot();
+  bot.search = async () => { ++searches; return { results: [] }; };
+  const { request } = await fixture(t, { demo: true, bot });
+  const { csrfToken } = await (await request('/api/session')).json();
+  const options = { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ query: 'song', source: 'youtube' }) };
+  for (let index = 0; index < 20; ++index) assert.equal((await request('/api/guilds/demo-guild/search', options)).status, 200);
+  assert.equal((await request('/api/guilds/demo-guild/search', options)).status, 429);
+  assert.equal(searches, 20);
+});

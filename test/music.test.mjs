@@ -4,7 +4,9 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
+import { AudioPlayerError } from '@discordjs/voice';
 import { MusicManager } from '../src/music.mjs';
+import { MediaError } from '../src/media.mjs';
 import { authorizeControl, authorizeJoin, createBot, formatRequestReply } from '../src/discord.mjs';
 
 const requester = { id: 'user-a', username: 'Listener' };
@@ -381,4 +383,87 @@ test('playlist slash replies include actual accepted counts, skipped entries, li
   assert.match(message, /Some everyone tracks require validation/);
   assert.doesNotMatch(message, /@everyone/);
   assert.equal(formatRequestReply({ added: [track('Single')], warnings: [] }), 'Added **Single** to the queue.');
+});
+
+test('trusted media-open failures retain actionable message and code while advancing the queue', async t => {
+  const logs = [];
+  const message = 'The bot host could not run the YouTube extractor correctly. The owner needs to check yt-dlp and its JavaScript dependencies.';
+  const media = { open: async item => {
+    if (item.title === 'Lovesick Girls') throw new MediaError(message, 'EXTRACTOR_RUNTIME_UNAVAILABLE');
+    return openedAudio();
+  } };
+  const { manager } = await fixture(t, media, { logger: { warn: (...args) => logs.push(args), error() {} } });
+  await manager.enqueue('guild', [track('Lovesick Girls'), track('Next')], requester);
+  manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
+  for (let index = 0; index < 5; ++index) await turn();
+  const snapshot = manager.snapshot('guild');
+  assert.equal(snapshot.nowPlaying.title, 'Next');
+  assert.ok(snapshot.lastError.includes(message));
+  assert.match(snapshot.lastError, /\[EXTRACTOR_RUNTIME_UNAVAILABLE\]/);
+  assert.deepEqual(logs, [['Music operation failed.', { operation: 'media-open', code: 'EXTRACTOR_RUNTIME_UNAVAILABLE', type: 'MediaError' }]]);
+});
+
+test('original media stream errors survive Discord wrappers and an Idle event arriving first', async t => {
+  for (const completion of ['wrapped-error', 'idle']) {
+    const logs = [];
+    const { manager } = await fixture(t, undefined, { logger: { warn: (...args) => logs.push(args), error() {} } });
+    const voice = fakeTransport();
+    await manager.enqueue('guild', [track('Current')], requester);
+    manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+    await turn();
+    const playing = voice.plays[0];
+    const failure = new MediaError('YouTube is rate limiting this bot. Please wait before trying again.', 'YOUTUBE_RATE_LIMITED');
+    const wrapped = new AudioPlayerError(failure, {});
+    assert.equal(wrapped.code, undefined);
+    assert.equal(wrapped instanceof MediaError, false);
+    playing.opened.stream.emit('error', failure);
+    if (completion === 'wrapped-error') playing.error(wrapped);
+    else playing.end();
+    assert.match(manager.snapshot('guild').lastError, /YouTube is rate limiting this bot/);
+    assert.match(manager.snapshot('guild').lastError, /\[YOUTUBE_RATE_LIMITED\]/);
+    assert.equal(playing.opened.cleanupCount, 1);
+    assert.deepEqual(logs, [['Music operation failed.', { operation: 'audio-playback', code: 'YOUTUBE_RATE_LIMITED', type: 'MediaError' }]]);
+  }
+});
+
+test('untrusted errors cannot impersonate MediaError or leak process messages, URLs, and secrets', async t => {
+  const logs = [];
+  const sensitive = 'https://provider.invalid/audio?token=private-value stderr /private/process/path';
+  const failure = Object.assign(new Error(sensitive), { name: 'MediaError', code: 'YOUTUBE_REQUEST_BLOCKED' });
+  const { manager } = await fixture(t, { open: async () => { throw failure; } }, { logger: { warn: (...args) => logs.push(args), error() {} } });
+  await manager.enqueue('guild', [track('Song')], requester);
+  manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
+  await turn();
+  const displayed = manager.snapshot('guild').lastError;
+  assert.match(displayed, /\[AUDIO_SOURCE_FAILED\]/);
+  assert.doesNotMatch(displayed, /provider\.invalid|private-value|process\/path|YOUTUBE_REQUEST_BLOCKED/);
+  assert.deepEqual(logs, [['Music operation failed.', { operation: 'media-open', code: 'AUDIO_SOURCE_FAILED', type: 'Error' }]]);
+});
+
+test('missing FFmpeg is reported as an audio-start failure rather than a provider failure', async t => {
+  const logs = [];
+  const opened = openedAudio();
+  const { manager } = await fixture(t, { open: async () => opened }, { logger: { warn: (...args) => logs.push(args), error() {} } });
+  const voice = fakeTransport();
+  voice.play = () => { throw new Error('FFmpeg/avconv not found!'); };
+  await manager.enqueue('guild', [track('Song')], requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await turn();
+  assert.match(manager.snapshot('guild').lastError, /FFmpeg is missing from the bot host/);
+  assert.match(manager.snapshot('guild').lastError, /\[FFMPEG_UNAVAILABLE\]/);
+  assert.equal(opened.cleanupCount, 1);
+  assert.deepEqual(logs, [['Music operation failed.', { operation: 'audio-start', code: 'FFMPEG_UNAVAILABLE', type: 'Error' }]]);
+});
+
+test('cleanup diagnostics exclude raw exception messages', async t => {
+  const logs = [];
+  const opened = openedAudio();
+  opened.cleanup = () => { throw new Error('https://provider.invalid/?secret=private-token'); };
+  const { manager } = await fixture(t, { open: async () => opened }, { logger: { warn: (...args) => logs.push(args), error() {} } });
+  await manager.enqueue('guild', [track('Song')], requester);
+  manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
+  await turn();
+  await manager.control('guild', 'stop');
+  assert.deepEqual(logs, [['Music operation failed.', { operation: 'media-cleanup', code: 'MEDIA_CLEANUP_FAILED', type: 'Error' }]]);
+  assert.doesNotMatch(JSON.stringify(logs), /private-token|provider\.invalid/);
 });

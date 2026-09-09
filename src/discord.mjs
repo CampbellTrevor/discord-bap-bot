@@ -251,6 +251,14 @@ export function createBot({ config, media, logger = console }) {
     async join(guildId, userId, channelId) {
       return locked(guildId, async () => joinAs(await membership(guildId, userId), channelId));
     },
+    async search(guildId, userId, query, source = 'youtube') {
+      await membership(guildId, userId);
+      if (typeof query !== 'string' || !query.trim() || query.length > 500) throw musicError('Enter a song or artist to search, up to 500 characters.');
+      if (!['youtube', 'spotify'].includes(source)) throw musicError('Choose YouTube or Spotify for search.');
+      // Searching never joins voice, reserves queue slots, or starts playback.
+      const results = await media.search(query.trim(), source);
+      return { results: results.slice(0, 5) };
+    },
     async request(guildId, userId, query, channelId) {
       await membership(guildId, userId);
       if (typeof query !== 'string' || !query.trim() || query.length > 500) throw musicError('Enter a song name or a Spotify/YouTube track or playlist URL (up to 500 characters).');

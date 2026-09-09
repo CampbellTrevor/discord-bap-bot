@@ -9,6 +9,8 @@ const SPOTIFY_ID = /^[A-Za-z0-9]{22}$/;
 const YOUTUBE_HOSTS = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be', 'www.youtu.be']);
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_PROCESSES = 4;
+const SEARCH_LIMIT = 5;
+const EXTRACTOR_FAILURE_CODES = new Set(['YOUTUBE_REQUEST_BLOCKED', 'YOUTUBE_RATE_LIMITED', 'YOUTUBE_RESTRICTED', 'YOUTUBE_FORMAT_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'EXTRACTOR_UNAVAILABLE']);
 
 export class MediaError extends Error {
   constructor(message, code = 'MEDIA_UNAVAILABLE') {
@@ -42,7 +44,7 @@ async function withDeadline(signal, milliseconds, callback) {
 }
 
 function youtubeUrl(id) {
-  if (!VIDEO_ID.test(id ?? '')) throw new MediaError('YouTube did not return a valid video.', 'INVALID_MEDIA');
+  if (typeof id !== 'string' || !VIDEO_ID.test(id)) throw new MediaError('YouTube did not return a valid video.', 'INVALID_MEDIA');
   return `https://www.youtube.com/watch?v=${id}`;
 }
 
@@ -99,8 +101,28 @@ function durationSeconds(value, maximum) {
 }
 
 function youtubeFailure(stderr) {
-  if (/sign in|login|private|unavailable|not available|403|429|bot|age.restrict|members.only|drm/i.test(stderr)) {
-    return new MediaError('YouTube blocked this request or the video is unavailable. Try another public video; this bot cannot access sign-in-only content.', 'YOUTUBE_UNAVAILABLE');
+  // Classify diagnostic text, not words that happen to occur inside a URL.
+  stderr = stderr.replace(/https?:\/\/[^\s"'<>]+/gi, '');
+  if (/confirm (?:that )?you(?:'|\u2019)?re not a bot|confirm you are not a bot|unusual traffic|automated (?:queries|requests)/i.test(stderr)) {
+    return new MediaError('YouTube is refusing requests from the bot host. Playback is unavailable while that restriction remains.', 'YOUTUBE_REQUEST_BLOCKED');
+  }
+  if (/\b429\b|too many requests|rate.?limit|This content isn(?:'|\u2019)t available,? try again later/i.test(stderr)) {
+    return new MediaError('YouTube is rate limiting this bot. Please wait before trying again.', 'YOUTUBE_RATE_LIMITED');
+  }
+  if (/no supported JavaScript runtime|JavaScript runtime[^\n]*(?:not found|unavailable|unsupported)|(?:yt-dlp-ejs|challenge solver)[^\n]*(?:not installed|missing|unavailable|unsupported)|n?sig(?:nature)? extraction failed/i.test(stderr)) {
+    return new MediaError('The bot host could not run the YouTube extractor correctly. The owner needs to check yt-dlp and its JavaScript dependencies.', 'EXTRACTOR_RUNTIME_UNAVAILABLE');
+  }
+  if (/sign in|log ?in|private video|video (?:is )?private|age.restrict|members.only|drm/i.test(stderr)) {
+    return new MediaError('This YouTube recording requires sign-in or is restricted. Choose a public, unrestricted recording.', 'YOUTUBE_RESTRICTED');
+  }
+  if (/\b403\b|Forbidden/i.test(stderr)) {
+    return new MediaError('YouTube refused access to the recording from this bot host (HTTP 403). Playback is currently unavailable.', 'YOUTUBE_REQUEST_BLOCKED');
+  }
+  if (/requested format is not available|no (?:video|audio|playable) formats|only images are available/i.test(stderr)) {
+    return new MediaError('YouTube did not offer a playable audio format. The owner should check the extractor version; this recording may be unavailable.', 'YOUTUBE_FORMAT_UNAVAILABLE');
+  }
+  if (/unavailable|not available|removed|deleted|copyright/i.test(stderr)) {
+    return new MediaError('This YouTube recording is unavailable or has been removed. Choose another public recording.', 'YOUTUBE_UNAVAILABLE');
   }
   return new MediaError('YouTube could not provide this track. Try another link or check that yt-dlp is up to date.', 'YOUTUBE_UNAVAILABLE');
 }
@@ -132,6 +154,7 @@ export function createMedia(config = {}, dependencies = {}) {
   const spawn = dependencies.spawn ?? nodeSpawn;
   const fetch = dependencies.fetch ?? globalThis.fetch;
   const terminate = dependencies.terminate ?? terminateProcess;
+  const logger = dependencies.logger ?? console;
   const resolveTimeoutMs = dependencies.resolveTimeoutMs ?? 30_000;
   const startupTimeoutMs = dependencies.startupTimeoutMs ?? 45_000;
   const playlistTimeoutMs = dependencies.playlistTimeoutMs ?? 90_000;
@@ -154,9 +177,16 @@ export function createMedia(config = {}, dependencies = {}) {
   let spotifyRefreshLoaded;
   const spotifyCache = new Map();
 
+  function logExtractorFailure(error, operation) {
+    if (!EXTRACTOR_FAILURE_CODES.has(error.code)) return;
+    // Provider stderr can contain URLs and other private diagnostics. Log only
+    // fixed, classified codes and the operation, never the original error.
+    try { logger.warn?.('YouTube extractor failed.', { operation, code: error.code }); } catch {}
+  }
+
   function startExtractor(extraArgs, target, { playlist = false } = {}) {
     if (activeProcesses >= MAX_PROCESSES) throw new MediaError('The music provider is busy. Try again in a moment.', 'MEDIA_BUSY');
-    const args = ['--ignore-config', '--no-cache-dir', playlist ? '--yes-playlist' : '--no-playlist', '--no-warnings', '--no-progress', '--no-colors', '--js-runtimes', 'node', '--socket-timeout', '10', '--retries', '1', '--extractor-retries', '1', ...extraArgs, '--', target];
+    const args = ['--ignore-config', '--no-cache-dir', playlist ? '--yes-playlist' : '--no-playlist', '--no-progress', '--no-colors', '--js-runtimes', 'node', '--socket-timeout', '10', '--retries', '1', '--extractor-retries', '1', ...extraArgs, '--', target];
     let child;
     try {
       child = spawn(config.ytDlpPath || 'yt-dlp', args, { shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -176,13 +206,15 @@ export function createMedia(config = {}, dependencies = {}) {
     if (runningProcesses.has(child)) terminate(child);
   }
 
-  function extractMetadata(target, signal, { playlist = false } = {}) {
+  function extractMetadata(target, signal, { playlist = false, search = false } = {}) {
     signal.throwIfAborted();
     const extraArgs = ['--dump-single-json', '--skip-download'];
     // Flat, lazy extraction fetches only bounded playlist metadata, never one
     // full extraction per video. One extra entry detects a truncated playlist.
     if (playlist) extraArgs.push('--flat-playlist', '--lazy-playlist', '--playlist-items', `1:${maxPlaylistTracks + 1}`);
-    const child = startExtractor(extraArgs, target, { playlist });
+    // Search lists catalog metadata without resolving audio for every candidate.
+    if (search) extraArgs.push('--flat-playlist', '--lazy-playlist', '--playlist-items', `1:${SEARCH_LIMIT}`);
+    const child = startExtractor(extraArgs, target, { playlist: playlist || search });
     return new Promise((resolve, reject) => {
       const stdout = [];
       let stderr = '';
@@ -192,7 +224,7 @@ export function createMedia(config = {}, dependencies = {}) {
         if (done) return;
         done = true;
         signal.removeEventListener('abort', abort);
-        if (error) { stopExtractor(child); reject(error); }
+        if (error) { logExtractorFailure(error, search ? 'search' : playlist ? 'playlist' : 'metadata'); stopExtractor(child); reject(error); }
         else resolve(value);
       };
       const abort = () => finish(abortReason(signal));
@@ -490,6 +522,42 @@ export function createMedia(config = {}, dependencies = {}) {
     } finally { activeResolutions -= 1; }
   }
 
+  async function search(query, source = 'youtube', { signal } = {}) {
+    if (!['youtube', 'spotify'].includes(source)) throw new MediaError('Choose YouTube or Spotify to search.', 'UNSUPPORTED_MEDIA');
+    const parsed = parseQuery(query);
+    if (parsed.source !== 'search') throw new MediaError('Search by song or artist name. Use Request to queue a track or playlist link directly.', 'INVALID_QUERY');
+    if (activeResolutions >= MAX_PROCESSES) throw new MediaError('The music provider is busy. Try again in a moment.', 'MEDIA_BUSY');
+    activeResolutions += 1;
+    try {
+      return await withDeadline(signal, resolveTimeoutMs, async deadline => {
+        let entries;
+        if (source === 'youtube') {
+          const result = await extractMetadata(`ytsearch${SEARCH_LIMIT}:${parsed.query}`, deadline, { search: true });
+          entries = result?.entries;
+        } else {
+          const params = new URLSearchParams({ q: parsed.query, type: 'track', limit: String(SEARCH_LIMIT), offset: '0', market: spotifyMarket });
+          const result = await spotifyRequest(`search?${params}`, deadline, Boolean(config.spotifyRefreshToken));
+          entries = result?.tracks?.items;
+        }
+        if (!Array.isArray(entries)) throw new MediaError('The music provider returned invalid search results.', 'INVALID_MEDIA');
+        const tracks = [];
+        const seen = new Set();
+        // Never follow search pagination or resolve extra tracks to backfill
+        // unavailable entries. Canonical URLs are queued through resolve later.
+        for (const entry of entries.slice(0, SEARCH_LIMIT)) {
+          if (!entry || source === 'spotify' && (entry.is_playable === false || entry.restrictions?.reason)) continue;
+          try {
+            const track = source === 'youtube' ? youtubeTrack(entry, { flat: true }) : spotifyTrack(entry, entry.id);
+            if (seen.has(track.sourceUrl)) continue;
+            seen.add(track.sourceUrl);
+            tracks.push({ ...track, providerId: entry.id });
+          } catch (error) { if (!(error instanceof MediaError)) throw error; }
+        }
+        return tracks;
+      });
+    } finally { activeResolutions -= 1; }
+  }
+
   function streamYoutube(track, startupSignal, externalSignal) {
     startupSignal.throwIfAborted();
     const child = startExtractor(['--format', 'bestaudio/best', '--output', '-'], track.playbackUrl);
@@ -508,6 +576,7 @@ export function createMedia(config = {}, dependencies = {}) {
       };
       const fail = error => {
         if (stopped) return;
+        logExtractorFailure(error, 'playback');
         if (ready) child.stdout.destroy(error);
         else reject(error);
         cleanup();
@@ -561,5 +630,5 @@ export function createMedia(config = {}, dependencies = {}) {
     });
   }
 
-  return { resolve, open };
+  return { resolve, search, open };
 }

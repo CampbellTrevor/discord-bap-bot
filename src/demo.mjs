@@ -6,6 +6,7 @@ export function createDemoBot() {
   const channel = { id: 'demo-channel', name: 'Late night lounge' };
   const user = { id: 'demo-user', username: 'You' };
   const makeTrack = (title, artist, source) => ({ id: randomUUID(), title, artist, source, durationSec: 240, thumbnail: null, sourceUrl: '', requestedBy: user });
+  const searchFixtures = new Map();
   const queue = { guildId: guild.id, channelId: channel.id, channelName: channel.name, nowPlaying: makeTrack('After hours', 'Demo track · no audio', 'youtube'),
     tracks: [makeTrack('Somewhere slow', 'Demo track · no audio', 'spotify'), makeTrack('Meet me on the rooftop', 'Demo track · no audio', 'youtube')], paused: false, playing: true, lastError: null, elapsedSec: 32 };
   let sampledAt = Date.now();
@@ -30,10 +31,31 @@ export function createDemoBot() {
     context: async id => { validate(id); return { guild, member: { canControl: true, canManage: true, voiceChannelId: channel.id }, voiceChannels: [channel] }; },
     snapshot: id => { validate(id); tick(); return structuredClone(queue); },
     join: async id => { validate(id); queue.channelId = channel.id; queue.channelName = channel.name; if (!queue.nowPlaying) advance(); return bot.snapshot(id); },
+    search: async (id, _userId, query, source = 'youtube') => {
+      validate(id);
+      if (typeof query !== 'string' || !query.trim() || query.length > 500) throw failure('Enter a song or artist to search, up to 500 characters.');
+      if (!['youtube', 'spotify'].includes(source)) throw failure('Choose YouTube or Spotify for search.');
+      const results = Array.from({ length: 5 }, (_, index) => {
+        // These URLs are selection keys only: the demo never resolves or opens them.
+        const sourceUrl = source === 'youtube' ? `https://www.youtube.com/watch?v=dEmO000000${index + 1}` : `https://open.spotify.com/track/${'0'.repeat(21)}${index + 1}`;
+        const track = {
+          title: `${query.trim().slice(0, 100)} — demo result ${index + 1}`,
+          artist: 'Demo fixture · no audio', source, sourceUrl,
+          durationSec: [243, 257, 326, 251, 193][index], thumbnail: null,
+        };
+        // Five fixed keys per provider keep the local fixture cache bounded.
+        searchFixtures.set(sourceUrl, track);
+        return track;
+      });
+      return { results: structuredClone(results) };
+    },
     request: async (id, _userId, query) => {
       validate(id); tick();
       if (queue.tracks.length >= 100) throw failure('The demo queue is full.', 409);
-      const track = makeTrack(query, 'Your demo request · no audio', /spotify/i.test(query) ? 'spotify' : 'youtube');
+      const selected = searchFixtures.get(query);
+      const track = selected
+        ? { ...structuredClone(selected), id: randomUUID(), requestedBy: user }
+        : makeTrack(query, 'Your demo request · no audio', /spotify/i.test(query) ? 'spotify' : 'youtube');
       queue.tracks.push(track);
       if (!queue.nowPlaying && queue.channelId) advance();
       return { added: [track], queue: bot.snapshot(id) };

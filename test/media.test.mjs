@@ -33,7 +33,7 @@ function extractor(scenarios = []) {
     child.stderr.destroy();
     child.emit('close', null);
   };
-  return { spawn, terminate, calls, stopped };
+  return { spawn, terminate, calls, stopped, logger: { warn() {} } };
 }
 
 const metadata = value => child => {
@@ -124,7 +124,7 @@ test('reports missing yt-dlp and provider restrictions without exposing stderr',
   const missing = extractor([child => child.emit('error', new Error('ENOENT'))]);
   await assert.rejects(createMedia({}, missing).resolve('song'), { code: 'EXTRACTOR_UNAVAILABLE' });
   const denied = extractor([child => { child.stderr.write('Sign in to confirm you are not a bot; diagnostic text'); child.emit('close', 1); }]);
-  await assert.rejects(createMedia({}, denied).resolve('song'), error => error.code === 'YOUTUBE_UNAVAILABLE' && !error.message.includes('diagnostic text'));
+  await assert.rejects(createMedia({}, denied).resolve('song'), error => error.code === 'YOUTUBE_REQUEST_BLOCKED' && !error.message.includes('diagnostic text'));
 });
 
 test('Spotify uses client credentials, preserves source metadata and caches tracks', async () => {
@@ -446,4 +446,180 @@ test('rotated Spotify refresh tokens persist privately and a changed configured 
   if (process.platform !== 'win32') assert.equal((await stat(authFile)).mode & 0o777, 0o600);
   await createMedia(config, { fetch: fetchFor('rotated-test-refresh') }).resolve(`spotify:playlist:${TRACK}`);
   await createMedia({ ...config, spotifyRefreshToken: 'operator-replacement-token' }, { fetch: fetchFor('operator-replacement-token') }).resolve(`spotify:playlist:${TRACK}`);
+});
+
+test('YouTube search returns at most five ordered canonical choices without resolving their audio', async () => {
+  const entries = Array.from({ length: 7 }, (_, index) => video(index + 1));
+  const fake = extractor([metadata({ entries }), metadata(entries[1])]);
+  const media = createMedia({}, fake);
+  const results = await media.search('  song & artist  ');
+  assert.deepEqual(results.map(track => track.title), ['Song 1', 'Song 2', 'Song 3', 'Song 4', 'Song 5']);
+  assert.equal(results[0].providerId, entries[0].id);
+  assert.equal(results[0].source, 'youtube');
+  assert.equal(results[0].artist, 'An artist');
+  assert.equal(results[0].durationSec, 120);
+  assert.equal(results[0].needsValidation, true);
+  assert.equal(results[0].sourceUrl, `https://www.youtube.com/watch?v=${entries[0].id}`);
+  assert.equal(results[0].thumbnail, `https://i.ytimg.com/vi/${entries[0].id}/hqdefault.jpg`);
+  assert.equal(fake.calls.length, 1);
+  const args = fake.calls[0].args;
+  assert.equal(args.at(-1), 'ytsearch5:song & artist');
+  assert.equal(args.at(-2), '--');
+  assert.equal(fake.calls[0].options.shell, false);
+  assert.ok(args.includes('--flat-playlist'));
+  assert.ok(args.includes('--skip-download'));
+  assert.equal(args[args.indexOf('--playlist-items') + 1], '1:5');
+  const [selected] = await media.resolve(results[1].sourceUrl);
+  assert.equal(selected.title, 'Song 2');
+  assert.equal(fake.calls[1].args.at(-1), results[1].sourceUrl);
+});
+
+test('YouTube search omits restricted, live and over-limit results while allowing deferred duration checks', async () => {
+  const entries = [video(1, { availability: 'private' }), video(2, { is_live: true }), video(3, { duration: 601 }), video(4, { duration: null }), video(5)];
+  const fake = extractor([metadata({ entries })]);
+  const tracks = await createMedia({ maxTrackDurationSec: 600 }, fake).search('song');
+  assert.deepEqual(tracks.map(track => track.title), ['Song 4', 'Song 5']);
+  assert.equal(tracks[0].durationSec, null);
+  assert.equal(tracks[0].needsValidation, true);
+  assert.equal(fake.calls.length, 1);
+});
+
+test('search removes duplicates and invalid provider IDs and does not trust returned URLs', async () => {
+  const entries = [video(1, { url: 'https://example.invalid/ignored' }), video(1), video(3, { id: 'bad' }), video(4, { id: 12345678901 }), video(5, { ie_key: 'Other' })];
+  const tracks = await createMedia({}, extractor([metadata({ entries })])).search('song');
+  assert.equal(tracks.length, 1);
+  assert.equal(tracks[0].sourceUrl, 'https://www.youtube.com/watch?v=00000000001');
+});
+
+test('search rejects invalid queries, direct links and unsupported sources before provider calls', async () => {
+  const fake = extractor();
+  const media = createMedia({}, { ...fake, fetch: () => assert.fail('No provider call expected') });
+  for (const query of ['', '  ', null, 'x'.repeat(501), 'song\nname', `https://youtu.be/${VIDEO}`, `spotify:track:${TRACK}`]) {
+    await assert.rejects(media.search(query), { code: 'INVALID_QUERY' });
+  }
+  await assert.rejects(media.search('song', 'other'), { code: 'UNSUPPORTED_MEDIA' });
+  assert.equal(fake.calls.length, 0);
+});
+
+test('search returns empty catalog results but rejects malformed response shapes', async () => {
+  const fake = extractor([metadata({ entries: [] }), metadata({ title: 'not a result list' })]);
+  const media = createMedia({}, fake);
+  assert.deepEqual(await media.search('song'), []);
+  await assert.rejects(media.search('song'), { code: 'INVALID_MEDIA' });
+  for (const data of [{ tracks: { items: [] } }, { tracks: null }]) {
+    const spotifyMedia = createMedia(spotifyConfig, { fetch: async url => url.includes('/api/token') ? json({ access_token: 'test-token', expires_in: 3600 }) : json(data) });
+    if (data.tracks) assert.deepEqual(await spotifyMedia.search('song', 'spotify'), []);
+    else await assert.rejects(spotifyMedia.search('song', 'spotify'), { code: 'INVALID_MEDIA' });
+  }
+});
+
+test('Spotify search uses one official bounded catalog request and normalizes selectable tracks', async () => {
+  const calls = [];
+  const media = createMedia({ ...spotifyConfig, spotifyMarket: 'GB' }, { fetch: async (url, options) => {
+    calls.push({ url, options });
+    return url.includes('/api/token') ? json({ access_token: 'test-token', expires_in: 3600 }) : json({ tracks: { items: Array.from({ length: 8 }, (_, index) => spotifyItem(index + 1)), next: 'https://example.invalid/do-not-follow' } });
+  } });
+  const results = await media.search('Artist & track:Song', 'spotify');
+  assert.equal(calls.length, 2);
+  const url = new URL(calls[1].url);
+  assert.equal(url.origin, 'https://api.spotify.com');
+  assert.equal(url.pathname, '/v1/search');
+  assert.equal(url.searchParams.get('q'), 'Artist & track:Song');
+  assert.equal(url.searchParams.get('type'), 'track');
+  assert.equal(url.searchParams.get('limit'), '5');
+  assert.equal(url.searchParams.get('offset'), '0');
+  assert.equal(url.searchParams.get('market'), 'GB');
+  assert.equal(calls[1].options.redirect, 'error');
+  assert.equal(results.length, 5);
+  assert.deepEqual(results.map(track => track.title), ['Track 1', 'Track 2', 'Track 3', 'Track 4', 'Track 5']);
+  assert.equal(results[0].providerId, '0000000000000000000001');
+  assert.equal(results[0].sourceUrl, 'https://open.spotify.com/track/0000000000000000000001');
+  assert.equal(results[0].durationSec, 120);
+  assert.equal(results[0].artist, 'An artist');
+  assert.equal(results[0].thumbnail, 'https://i.scdn.co/image/example');
+});
+
+test('Spotify search uses configured user authorization and skips unplayable catalog results', async () => {
+  const entries = [spotifyItem(1, { is_local: true }), spotifyItem(2, { is_playable: false }), spotifyItem(3, { restrictions: { reason: 'market' } }), spotifyItem(4, { type: 'episode' }), spotifyItem(5)];
+  const media = createMedia({ ...spotifyConfig, spotifyRefreshToken: 'test-refresh' }, { fetch: async (url, options) => {
+    if (url.includes('/api/token')) {
+      const body = new URLSearchParams(options.body);
+      assert.equal(body.get('grant_type'), 'refresh_token');
+      assert.equal(body.get('client_id'), 'test-client');
+      assert.equal(body.get('refresh_token'), 'test-refresh');
+      return json({ access_token: 'user-token', expires_in: 3600 });
+    }
+    assert.equal(options.headers.Authorization, 'Bearer user-token');
+    return json({ tracks: { items: entries } });
+  } });
+  const results = await media.search('song', 'spotify');
+  assert.deepEqual(results.map(track => track.title), ['Track 5']);
+});
+
+test('Spotify search reports credential, quota and access failures without falling back to another provider', async () => {
+  const missing = createMedia({}, { fetch: () => assert.fail('No provider call expected') });
+  await assert.rejects(missing.search('song', 'spotify'), { code: 'SPOTIFY_NOT_CONFIGURED' });
+  for (const [status, code] of [[403, 'SPOTIFY_FORBIDDEN'], [429, 'SPOTIFY_RATE_LIMITED']]) {
+    let calls = 0;
+    const media = createMedia(spotifyConfig, { spawn: () => assert.fail('No fallback expected'), fetch: async url => {
+      calls += 1;
+      return url.includes('/api/token') ? json({ access_token: 'test-token', expires_in: 3600 }) : json({ error: { status } }, status);
+    } });
+    await assert.rejects(media.search('song', 'spotify'), { code });
+    assert.equal(calls, 2);
+  }
+});
+
+test('search shares request concurrency limits and cancellation frees provider capacity', async () => {
+  const fake = extractor();
+  const media = createMedia({}, fake);
+  const controllers = Array.from({ length: 4 }, () => new AbortController());
+  const pending = controllers.map(controller => assert.rejects(media.search('song', 'youtube', { signal: controller.signal }), /cancelled/));
+  await assert.rejects(media.search('fifth'), { code: 'MEDIA_BUSY' });
+  await assert.rejects(media.resolve('sixth'), { code: 'MEDIA_BUSY' });
+  for (const controller of controllers) controller.abort(new Error('cancelled'));
+  await Promise.all(pending);
+  assert.equal(fake.calls.length, 4);
+  assert.equal(fake.stopped.length, 4);
+  const controller = new AbortController();
+  controller.abort(new Error('cancelled before search'));
+  await assert.rejects(media.search('song', 'youtube', { signal: controller.signal }), /cancelled before search/);
+  assert.equal(fake.calls.length, 4);
+});
+
+test('search bounds metadata bytes and extraction time and terminates unfinished processes', async () => {
+  const oversized = extractor([child => child.stdout.write(Buffer.alloc(1024 * 1024 + 1))]);
+  await assert.rejects(createMedia({}, oversized).search('song'), { code: 'INVALID_MEDIA' });
+  assert.equal(oversized.stopped.length, 1);
+  const stalled = extractor();
+  await assert.rejects(createMedia({}, { ...stalled, resolveTimeoutMs: 15 }).search('song'), { code: 'MEDIA_TIMEOUT' });
+  assert.equal(stalled.stopped.length, 1);
+});
+
+test('YouTube failures distinguish host rejection, request limits, restricted content and runtime problems', async () => {
+  const cases = [
+    ["Sign in to confirm you're not a bot", 'YOUTUBE_REQUEST_BLOCKED', /bot host/],
+    ['HTTP Error 403: Forbidden', 'YOUTUBE_REQUEST_BLOCKED', /403/],
+    ['HTTP Error 429: Too Many Requests', 'YOUTUBE_RATE_LIMITED', /wait/i],
+    ["This content isn't available, try again later", 'YOUTUBE_RATE_LIMITED', /wait/i],
+    ['This is a private video. Sign in', 'YOUTUBE_RESTRICTED', /restricted/],
+    ['No supported JavaScript runtime could be found. Requested format is not available', 'EXTRACTOR_RUNTIME_UNAVAILABLE', /JavaScript dependencies/],
+    ['Requested format is not available', 'YOUTUBE_FORMAT_UNAVAILABLE', /audio format/],
+    ['Video unavailable', 'YOUTUBE_UNAVAILABLE', /unavailable/],
+  ];
+  for (const [diagnostic, code, message] of cases) {
+    const logs = [];
+    const fake = extractor([child => { child.stderr.end(`${diagnostic}\nhttps://example.invalid/private?token=never-log-this`); child.emit('close', 1); }]);
+    const media = createMedia({}, { ...fake, logger: { warn: (...args) => logs.push(args) } });
+    await assert.rejects(media.search('private query'), error => error.code === code && error.status === 503 && message.test(error.message) && !error.message.includes('never-log-this'));
+    assert.deepEqual(logs, [['YouTube extractor failed.', { operation: 'search', code }]]);
+  }
+});
+
+test('playback failure logs only its operation and safe classification', async () => {
+  const logs = [];
+  const fake = extractor([child => { child.stderr.end('HTTP Error 403: Forbidden; https://example.invalid/private'); child.emit('close', 1); }]);
+  const media = createMedia({}, { ...fake, logger: { warn: (...args) => logs.push(args) } });
+  await assert.rejects(media.open({ source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`, durationSec: 120 }), { code: 'YOUTUBE_REQUEST_BLOCKED' });
+  assert.deepEqual(logs, [['YouTube extractor failed.', { operation: 'playback', code: 'YOUTUBE_REQUEST_BLOCKED' }]]);
 });

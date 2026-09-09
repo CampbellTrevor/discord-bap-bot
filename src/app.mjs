@@ -100,6 +100,12 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     next();
   });
   app.get('/api/guilds/:guildId', async (req, res) => res.json({ ...await bot.context(req.params.guildId, req.session.user.id), queue: bot.snapshot(req.params.guildId) }));
+  app.post('/api/guilds/:guildId/search', csrf, limiter(20, 60000), async (req, res) => {
+    const { query, source = 'youtube' } = req.body || {};
+    if (typeof query !== 'string' || !query.trim() || query.length > 500) throw httpError('Enter a song or artist to search, up to 500 characters.', 400);
+    if (!['youtube', 'spotify'].includes(source)) throw httpError('Choose YouTube or Spotify for search.', 400);
+    res.json(await bot.search(req.params.guildId, req.session.user.id, query.trim(), source));
+  });
   const requestLimit = limiter(10, 60000);
   app.post('/api/guilds/:guildId/requests', csrf, requestLimit, async (req, res) => {
     const { query, channelId } = req.body || {};

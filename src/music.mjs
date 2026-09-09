@@ -2,6 +2,28 @@ import { EventEmitter } from 'node:events';
 import { randomInt, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { MediaError } from './media.mjs';
+
+const SAFE_RUNTIME_CODES = new Set(['ENOENT', 'EPIPE', 'ECONNRESET', 'ETIMEDOUT', 'ABORT_ERR', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END', 'ERR_MODULE_NOT_FOUND', 'ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_OUT_OF_RANGE']);
+const SAFE_ERROR_TYPES = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError', 'TimeoutError', 'AudioPlayerError']);
+
+function failureDetails(error, fallbackCode) {
+  const media = error instanceof MediaError ? error : error?.cause instanceof MediaError ? error.cause : null;
+  if (media) return {
+    code: /^[A-Z][A-Z0-9_]{0,63}$/.test(media.code) ? media.code : 'MEDIA_UNAVAILABLE',
+    type: 'MediaError',
+    // MediaError messages are authored by our adapter, never copied from stderr.
+    message: media.message,
+  };
+  if (typeof error?.message === 'string' && /FFmpeg\/avconv not found/i.test(error.message)) {
+    return { code: 'FFMPEG_UNAVAILABLE', type: 'Error', message: 'FFmpeg is missing from the bot host. The owner needs to install the audio runtime.' };
+  }
+  return {
+    code: SAFE_RUNTIME_CODES.has(error?.code) ? error.code : fallbackCode,
+    type: SAFE_ERROR_TYPES.has(error?.name) ? error.name : 'Error',
+    message: fallbackCode === 'AUDIO_SOURCE_FAILED' ? 'The audio source could not be opened.' : 'The audio stream could not be played.',
+  };
+}
 
 export function musicError(message, status = 400) {
   return Object.assign(new Error(message), { status });
@@ -124,7 +146,7 @@ export class MusicManager extends EventEmitter {
     state.channelName = null;
     this.clearIdle(state);
     if (error) state.lastError = 'The voice connection ended. Join a voice channel to continue the saved queue.';
-    try { transport?.destroy(); } catch (cause) { this.logger.warn('Voice cleanup failed:', cause.message); }
+    try { transport?.destroy(); } catch (cause) { this.logFailure('voice-cleanup', cause, 'VOICE_CLEANUP_FAILED'); }
     this.persistBackground(state);
     this.changed(state);
   }
@@ -214,6 +236,8 @@ export class MusicManager extends EventEmitter {
     this.changed(state);
     this.persistBackground(state);
     let opened;
+    let operation = 'media-open';
+    let streamFailure;
     try {
       opened = await this.media.open(track, { signal });
       if (state.generation !== generation || this.shuttingDown || state.transport !== transport) {
@@ -230,30 +254,46 @@ export class MusicManager extends EventEmitter {
       }
       state.opened = opened;
       state.opening = false;
+      // @discordjs/voice wraps stream failures and drops their original code/cause.
+      // Capture the adapter's typed error before that wrapper or an Idle event wins.
+      const captureStreamFailure = error => { streamFailure = error; };
+      opened.stream.once('error', captureStreamFailure);
+      opened.stream.once('close', () => opened.stream.off('error', captureStreamFailure));
       const finish = error => {
         if (state.generation !== generation) return;
-        if (error) {
-          state.lastError = `Could not play “${track.title}”. The next song will be tried.`;
-          this.logger.warn('Audio playback failed:', error.message);
-        }
+        const failure = streamFailure || error;
+        if (failure) this.playbackFailure(state, track, failure, 'audio-playback');
         this.cancelCurrent(state);
         this.persistBackground(state);
         this.changed(state);
         this.schedule(state);
       };
+      operation = 'audio-start';
       transport.play(opened, () => finish(), error => finish(error));
       if (state.paused) transport.pause();
       this.changed(state);
     } catch (error) {
       this.cleanup(opened);
       if (state.generation !== generation || this.shuttingDown) return;
-      state.lastError = `Could not play “${track.title}”. The next song will be tried.`;
-      this.logger.warn('Could not open song:', error.message);
+      this.playbackFailure(state, track, streamFailure || error, operation);
       this.cancelCurrent(state);
       this.persistBackground(state);
       this.changed(state);
       this.schedule(state);
     }
+  }
+
+  playbackFailure(state, track, error, operation) {
+    const fallbackCode = operation === 'media-open' ? 'AUDIO_SOURCE_FAILED' : 'AUDIO_PIPELINE_FAILED';
+    const details = failureDetails(error, fallbackCode);
+    state.lastError = `Could not play “${track.title}”. ${details.message} [${details.code}] ${state.tracks.length ? 'The next song will be tried.' : 'Request another song to try again.'}`;
+    this.logFailure(operation, error, fallbackCode);
+  }
+
+  logFailure(operation, error, fallbackCode, level = 'warn') {
+    const { code, type } = failureDetails(error, fallbackCode);
+    // Do not send exception messages, stacks, track URLs, or provider stderr to logs.
+    try { this.logger[level]?.('Music operation failed.', { operation, code, type }); } catch {}
   }
 
   cancelCurrent(state) {
@@ -266,7 +306,7 @@ export class MusicManager extends EventEmitter {
     state.nowPlaying = null;
     state.opening = false;
     state.paused = false;
-    try { state.transport?.stop(); } catch (error) { this.logger.warn('Audio stop failed:', error.message); }
+    try { state.transport?.stop(); } catch (error) { this.logFailure('audio-stop', error, 'AUDIO_STOP_FAILED'); }
     this.cleanup(opened);
   }
 
@@ -274,9 +314,9 @@ export class MusicManager extends EventEmitter {
     if (!opened || this.cleaned.has(opened)) return;
     this.cleaned.add(opened);
     try {
-      Promise.resolve(opened.cleanup?.()).catch(error => this.logger.warn('Media cleanup failed:', error.message));
+      Promise.resolve(opened.cleanup?.()).catch(error => this.logFailure('media-cleanup', error, 'MEDIA_CLEANUP_FAILED'));
       opened.stream?.destroy?.();
-    } catch (error) { this.logger.warn('Media cleanup failed:', error.message); }
+    } catch (error) { this.logFailure('media-cleanup', error, 'MEDIA_CLEANUP_FAILED'); }
   }
 
   changed(state) {
@@ -303,7 +343,7 @@ export class MusicManager extends EventEmitter {
   persistBackground(state) {
     void this.persist().catch(error => {
       state.lastError = 'The queue could not be saved. Check the server storage before restarting.';
-      this.logger.error('Queue persistence failed:', error.message);
+      this.logFailure('queue-save', error, 'QUEUE_SAVE_FAILED', 'error');
       this.changed(state);
     });
   }
@@ -318,7 +358,7 @@ export class MusicManager extends EventEmitter {
       state.channelId = null;
       state.channelName = null;
       this.clearIdle(state);
-      try { transport?.destroy(); } catch (error) { this.logger.warn('Voice cleanup failed:', error.message); }
+      try { transport?.destroy(); } catch (error) { this.logFailure('voice-cleanup', error, 'VOICE_CLEANUP_FAILED'); }
     }
     await this.persist();
   }
