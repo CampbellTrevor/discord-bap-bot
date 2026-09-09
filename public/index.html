@@ -1,20 +1,20 @@
 <!doctype html>
-<html lang="en" data-theme="cassette">
+<html lang="en" data-theme="cassette" data-cassette-mode="light">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#eee7d8">
   <meta name="description" content="Request songs and playlists from Spotify or YouTube for your Discord voice channel.">
   <title>Turntable — Discord music queue</title>
-  <link rel="stylesheet" href="/styles.css?v=cassette-winamp-1">
-  <script src="/app.js?v=cassette-winamp-1" defer></script>
+  <link rel="stylesheet" href="/styles.css?v=cassette-dark-1">
+  <script src="/app.js?v=cassette-dark-1" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to player</a>
 <div class="page">
   <header class="mast">
     <a class="brand" href="/" aria-label="Turntable home"><span class="brand-mark" aria-hidden="true">TT</span><span>Turntable</span></a>
-    <div class="theme-controls"><span class="theme-label">PLAYER STYLE</span><div class="theme-switch" role="group" aria-label="Player appearance"><button type="button" data-theme-choice="cassette" aria-pressed="true">Cassette</button><button type="button" data-theme-choice="winamp" aria-pressed="false">Winamp</button></div></div>
+    <div class="theme-controls"><span class="theme-label">PLAYER STYLE</span><div class="theme-switch" role="group" aria-label="Player appearance"><button type="button" data-theme-choice="cassette" aria-pressed="true">Cassette</button><button type="button" data-theme-choice="winamp" aria-pressed="false">Winamp</button></div><button id="cassette-mode-toggle" class="cassette-mode-toggle" type="button" aria-pressed="false">Dark mode</button></div>
   </header>
   <div class="status-strip"><span class="connection"><i id="status-dot" class="status-dot" aria-hidden="true"></i><span id="connection-status">CONNECTING</span></span><span id="demo-badge" class="demo-badge" hidden>DEMO · NO AUDIO</span><a id="invite-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Add to server ↗</a></div>
   <div class="notice" id="setup-notice" hidden><strong id="notice-title"></strong><p id="notice-description"></p></div>

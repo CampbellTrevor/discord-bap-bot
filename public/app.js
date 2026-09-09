@@ -24,14 +24,27 @@ function saveGuild(id) {
   try { localStorage.setItem('turntable.guild', id); } catch { /* Storage is optional. */ }
 }
 
+function updateThemeColor() {
+  const root = document.documentElement;
+  const color = document.querySelector('meta[name="theme-color"]');
+  if (color) color.content = root.dataset.theme === 'winamp' ? '#354149' : root.dataset.cassetteMode === 'dark' ? '#1f201d' : '#eee7d8';
+}
+
+function setCassetteMode(value, save = true) {
+  const mode = value === 'dark' ? 'dark' : 'light';
+  document.documentElement.dataset.cassetteMode = mode;
+  $('cassette-mode-toggle')?.setAttribute('aria-pressed', String(mode === 'dark'));
+  updateThemeColor();
+  if (save) try { localStorage.setItem('turntable-cassette-mode', mode); } catch { /* Storage is optional. */ }
+}
+
 function setTheme(value, save = true) {
   const theme = value === 'winamp' ? 'winamp' : 'cassette';
   document.documentElement.dataset.theme = theme;
   for (const button of document.querySelectorAll('[data-theme-choice]')) {
     button.setAttribute('aria-pressed', String(button.dataset.themeChoice === theme));
   }
-  const color = document.querySelector('meta[name="theme-color"]');
-  if (color) color.content = theme === 'winamp' ? '#354149' : '#eee7d8';
+  updateThemeColor();
   if (save) try { localStorage.setItem('turntable-theme', theme); } catch { /* Storage is optional. */ }
 }
 
@@ -490,8 +503,14 @@ window.addEventListener('offline', () => { state.offline = true; renderSession()
 for (const button of document.querySelectorAll('[data-theme-choice]')) {
   button.addEventListener('click', () => setTheme(button.dataset.themeChoice));
 }
+$('cassette-mode-toggle')?.addEventListener('click', () => {
+  setCassetteMode(document.documentElement.dataset.cassetteMode === 'dark' ? 'light' : 'dark');
+});
 let initialTheme = 'cassette';
+let initialCassetteMode = 'light';
 try { initialTheme = localStorage.getItem('turntable-theme') || 'cassette'; } catch { /* Storage is optional. */ }
+try { initialCassetteMode = localStorage.getItem('turntable-cassette-mode') || 'light'; } catch { /* Storage is optional. */ }
+setCassetteMode(initialCassetteMode, false);
 setTheme(initialTheme, false);
 
 const authError = new URL(window.location.href).searchParams.has('error');
