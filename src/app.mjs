@@ -120,7 +120,10 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     res.json({ queue: await bot.control(req.params.guildId, req.session.user.id, action, trackId) });
   });
   app.use('/api', (_req, _res, next) => next(httpError('API route not found.', 404)));
-  app.use(express.static(fileURLToPath(new URL('../public', import.meta.url)), { maxAge: config.production ? '5m' : 0 }));
+  app.use(express.static(fileURLToPath(new URL('../public', import.meta.url)), {
+    maxAge: config.production ? '5m' : 0,
+    setHeaders: (res, file) => { if (file.endsWith('.html')) res.set('Cache-Control', 'no-cache'); },
+  }));
   app.use((error, _req, res, _next) => {
     const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600 ? error.status : 500;
     if (status === 500) console.error('Request failed:', error.name);
