@@ -203,7 +203,9 @@ test('search returns five selectable results without changing playback, then que
   const response = await request('/api/guilds/demo-guild/search', { method: 'POST', headers, body: JSON.stringify({ query: '  Midnight City  ', source: 'spotify' }) });
   assert.equal(response.status, 200);
   const { results } = await response.json();
-  assert.deepEqual(calls, [['demo-guild', 'demo-user', 'Midnight City', 'spotify']]);
+  assert.deepEqual(calls.map(args => args.slice(0, 4)), [['demo-guild', 'demo-user', 'Midnight City', 'spotify']]);
+  assert.ok(calls[0][4].signal instanceof AbortSignal);
+  assert.equal(calls[0][4].signal.aborted, false);
   assert.equal(results.length, 5);
   assert.equal(new Set(results.map(track => track.sourceUrl)).size, 5);
   assert.ok(results.every(track => track.source === 'spotify' && track.title.includes('demo result') && track.artist.includes('no audio')));
@@ -274,3 +276,32 @@ test('search rate limit caps provider calls independently of queue requests', as
   assert.equal((await request('/api/guilds/demo-guild/search', options)).status, 429);
   assert.equal(searches, 20);
 });
+
+for (const [route, method] of [['search', 'search'], ['requests', 'request']]) {
+  test(`closing an HTTP ${route} request cancels provider work`, { timeout: 5000 }, async t => {
+    const started = Promise.withResolvers();
+    const stopped = Promise.withResolvers();
+    const bot = createDemoBot();
+    bot[method] = async (...args) => {
+      const { signal } = args.at(-1);
+      started.resolve();
+      await new Promise((resolve, reject) => signal.addEventListener('abort', () => {
+        stopped.resolve();
+        reject(Object.assign(new Error('Cancelled'), { status: 400 }));
+      }, { once: true }));
+    };
+    const { request } = await fixture(t, { demo: true, bot });
+    const { csrfToken } = await (await request('/api/session')).json();
+    const controller = new AbortController();
+    const response = request(`/api/guilds/demo-guild/${route}`, {
+      method: 'POST', signal: controller.signal,
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+      body: JSON.stringify({ query: 'A requested song', source: 'youtube' }),
+    });
+    const rejected = assert.rejects(response, { name: 'AbortError' });
+    await started.promise;
+    controller.abort();
+    await rejected;
+    await stopped.promise;
+  });
+}

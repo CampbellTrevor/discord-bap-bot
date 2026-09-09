@@ -16,6 +16,16 @@ const save = req => new Promise((resolve, reject) => req.session.save(err => err
 const regenerate = req => new Promise((resolve, reject) => req.session.regenerate(err => err ? reject(err) : resolve()));
 const httpError = (message, status) => Object.assign(new Error(message), { status });
 
+async function withClientCancellation(req, res, operation) {
+  const controller = new AbortController();
+  const abort = () => { if (!res.writableEnded) controller.abort(); };
+  req.once('aborted', abort);
+  res.once('close', abort);
+  if (req.aborted || res.destroyed) abort();
+  try { return await operation(controller.signal); }
+  finally { req.removeListener('aborted', abort); res.removeListener('close', abort); }
+}
+
 export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedSessionStore() }) {
   const app = express();
   app.disable('x-powered-by');
@@ -33,7 +43,7 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
   app.use(['/api', '/auth'], limiter(300, 60000));
   app.use(session({ name: 'turntable.sid', secret: config.sessionSecret, store, resave: false, saveUninitialized: false,
     cookie: { httpOnly: true, sameSite: 'lax', secure: config.production, maxAge: 8 * 3600000 } }));
-  const configured = !config.setupMode && Boolean(config.discordToken && config.discordClientId && config.discordClientSecret);
+  const configured = !config.setupMode && Boolean(config.discordClientId && config.discordClientSecret && (config.botRole === 'portal' || config.discordToken));
   const csrf = (req, _res, next) => {
     if (req.get('origin') && req.get('origin') !== config.publicUrl) return next(httpError('Request origin did not match this portal.', 403));
     if (!equal(req.session.csrfToken, req.get('x-csrf-token'))) return next(httpError('Your session changed. Refresh the page and try again.', 403));
@@ -43,7 +53,7 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     req.session.csrfToken ||= randomBytes(32).toString('hex');
     if (config.demo) req.session.user ||= { id: 'demo-user', username: 'You', avatar: null };
     res.json({ user: req.session.user || null, csrfToken: req.session.csrfToken, configured, botReady: !config.setupMode && bot.isReady(), demo: config.demo,
-      spotifyEnabled: Boolean(config.spotifyClientId && config.spotifyClientSecret),
+      spotifyEnabled: config.botRole === 'portal' ? Boolean(bot.isReady() && bot.capabilities?.().spotifyEnabled) : Boolean(config.spotifyClientId && config.spotifyClientSecret),
       inviteUrl: config.discordClientId ? `https://discord.com/oauth2/authorize?client_id=${config.discordClientId}&scope=bot%20applications.commands&permissions=36703232` : null });
   });
   app.use('/auth', limiter(20, 60000));
@@ -99,19 +109,24 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     if (!(config.demo && id === 'demo-guild') && !/^\d{17,20}$/.test(id)) return next(httpError('Invalid server.', 400));
     next();
   });
-  app.get('/api/guilds/:guildId', async (req, res) => res.json({ ...await bot.context(req.params.guildId, req.session.user.id), queue: bot.snapshot(req.params.guildId) }));
+  app.get('/api/guilds/:guildId', async (req, res) => {
+    const { guildId } = req.params;
+    const userId = req.session.user.id;
+    const detail = bot.detail ? await bot.detail(guildId, userId) : { ...await bot.context(guildId, userId), queue: await bot.snapshot(guildId) };
+    res.json(detail);
+  });
   app.post('/api/guilds/:guildId/search', csrf, limiter(20, 60000), async (req, res) => {
     const { query, source = 'youtube' } = req.body || {};
     if (typeof query !== 'string' || !query.trim() || query.length > 500) throw httpError('Enter a song or artist to search, up to 500 characters.', 400);
     if (!['youtube', 'spotify'].includes(source)) throw httpError('Choose YouTube or Spotify for search.', 400);
-    res.json(await bot.search(req.params.guildId, req.session.user.id, query.trim(), source));
+    res.json(await withClientCancellation(req, res, signal => bot.search(req.params.guildId, req.session.user.id, query.trim(), source, { signal })));
   });
   const requestLimit = limiter(10, 60000);
   app.post('/api/guilds/:guildId/requests', csrf, requestLimit, async (req, res) => {
     const { query, channelId } = req.body || {};
     if (typeof query !== 'string' || !query.trim() || query.length > 500) throw httpError('Enter a song title or link, up to 500 characters.', 400);
     if (channelId !== undefined && typeof channelId !== 'string') throw httpError('Choose a voice channel.', 400);
-    const result = await bot.request(req.params.guildId, req.session.user.id, query.trim(), channelId);
+    const result = await withClientCancellation(req, res, signal => bot.request(req.params.guildId, req.session.user.id, query.trim(), channelId, { signal }));
     res.json(result.queue ? result : { queue: result });
   });
   app.post('/api/guilds/:guildId/join', csrf, requestLimit, async (req, res) => {
@@ -131,6 +146,7 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     setHeaders: (res, file) => { if (file.endsWith('.html')) res.set('Cache-Control', 'no-cache'); },
   }));
   app.use((error, _req, res, _next) => {
+    if (res.destroyed) return;
     const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600 ? error.status : 500;
     if (status === 500) console.error('Request failed:', error.name);
     const message = error.type === 'entity.parse.failed' ? 'Invalid JSON request.' : status < 500 || error.status === 503 ? error.message : 'Something went wrong. Please try again.';

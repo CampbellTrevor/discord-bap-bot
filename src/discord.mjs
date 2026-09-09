@@ -52,9 +52,9 @@ export function authorizeJoin({ manager, voiceChannelId, targetChannelId, snapsh
   }
 }
 
-export function createBot({ config, media, logger = console }) {
-  const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
-  const music = new MusicManager({ media, dataDir: config.dataDir, maxQueueSize: config.maxQueueSize, idleDisconnectMs: config.idleDisconnectMs, logger });
+export function createBot({ config, media, logger = console }, dependencies = {}) {
+  const client = dependencies.client ?? new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
+  const music = dependencies.music ?? new MusicManager({ media, dataDir: config.dataDir, maxQueueSize: config.maxQueueSize, idleDisconnectMs: config.idleDisconnectMs, logger });
   const locks = new Map();
   let ready = false;
   let closing = false;
@@ -150,7 +150,8 @@ export function createBot({ config, media, logger = console }) {
     return transport;
   }
 
-  async function joinAs({ guild, member, manager }, channelId) {
+  async function joinAs({ guild, member, manager }, channelId, { signal } = {}) {
+    signal?.throwIfAborted();
     const snapshot = music.snapshot(guild.id);
     const targetChannelId = channelId || member.voice.channelId;
     authorizeJoin({ manager, voiceChannelId: member.voice.channelId, targetChannelId, snapshot });
@@ -162,11 +163,13 @@ export function createBot({ config, media, logger = console }) {
     if (snapshot.channelId) music.detach(guild.id, true);
     const transport = createTransport(guild, channel);
     try {
-      await entersState(transport.connection, VoiceConnectionStatus.Ready, 20_000);
+      await entersState(transport.connection, VoiceConnectionStatus.Ready, signal ? AbortSignal.any([signal, AbortSignal.timeout(20_000)]) : 20_000);
+      signal?.throwIfAborted();
       if (closing) throw musicError('The bot is restarting. Please try again shortly.', 503);
       return music.attach(guild.id, transport, channel);
     } catch (error) {
       transport.destroy();
+      if (signal?.aborted) signal.throwIfAborted();
       logger.warn('Could not join voice:', error.message);
       throw musicError('Could not connect to voice. Check the bot’s Connect/Speak permissions and the server’s outbound UDP access.', 503);
     }
@@ -191,7 +194,7 @@ export function createBot({ config, media, logger = console }) {
         await client.login(config.discordToken);
         await readyPromise;
         if (closing) throw musicError('Bot startup was cancelled.', 503);
-        const rest = new REST({ version: '10' }).setToken(config.discordToken);
+        const rest = dependencies.rest ?? new REST({ version: '10' }).setToken(config.discordToken);
         const route = config.discordGuildId
           ? Routes.applicationGuildCommands(config.discordClientId, config.discordGuildId)
           : Routes.applicationCommands(config.discordClientId);
@@ -248,28 +251,43 @@ export function createBot({ config, media, logger = console }) {
         voiceChannels: visibleChannels(guild, member),
       };
     },
+    async detail(guildId, userId) {
+      // Membership is checked before reading or returning any queue snapshot.
+      const context = await api.context(guildId, userId);
+      return { ...context, queue: music.snapshot(guildId) };
+    },
     async join(guildId, userId, channelId) {
       return locked(guildId, async () => joinAs(await membership(guildId, userId), channelId));
     },
-    async search(guildId, userId, query, source = 'youtube') {
+    async search(guildId, userId, query, source = 'youtube', { signal } = {}) {
+      signal?.throwIfAborted();
       await membership(guildId, userId);
+      signal?.throwIfAborted();
       if (typeof query !== 'string' || !query.trim() || query.length > 500) throw musicError('Enter a song or artist to search, up to 500 characters.');
       if (!['youtube', 'spotify'].includes(source)) throw musicError('Choose YouTube or Spotify for search.');
       // Searching never joins voice, reserves queue slots, or starts playback.
-      const results = await media.search(query.trim(), source);
+      const results = await media.search(query.trim(), source, { signal });
+      signal?.throwIfAborted();
       return { results: results.slice(0, 5) };
     },
-    async request(guildId, userId, query, channelId) {
+    async request(guildId, userId, query, channelId, { signal } = {}) {
+      signal?.throwIfAborted();
       await membership(guildId, userId);
+      signal?.throwIfAborted();
       if (typeof query !== 'string' || !query.trim() || query.length > 500) throw musicError('Enter a song name or a Spotify/YouTube track or playlist URL (up to 500 characters).');
       if (music.capacity(guildId) < 1) throw musicError('The queue is full. Wait for a song to finish or remove one.', 409);
-      const tracks = await media.resolve(query.trim());
+      const tracks = await media.resolve(query.trim(), { signal });
       return locked(guildId, async () => {
+        signal?.throwIfAborted();
         const identity = await membership(guildId, userId);
+        signal?.throwIfAborted();
         if (!tracks.length) throw musicError('No playable tracks were found.');
         music.assertCapacity(guildId, tracks.length);
         const snapshot = music.snapshot(guildId);
-        if (!snapshot.channelId || (channelId && channelId !== snapshot.channelId)) await joinAs(identity, channelId);
+        if (!snapshot.channelId || (channelId && channelId !== snapshot.channelId)) await joinAs(identity, channelId, { signal });
+        // Enqueue commits synchronously before awaiting persistence. A later
+        // cancellation must not remove a request that has already committed.
+        signal?.throwIfAborted();
         const added = await music.enqueue(guildId, tracks, { id: userId, username: identity.member.displayName });
         const details = tracks.import ? structuredClone(tracks.import) : null;
         return {

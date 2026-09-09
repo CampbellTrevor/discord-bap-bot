@@ -4,7 +4,23 @@ import { randomBytes } from 'node:crypto';
 export function loadConfig(env = process.env, { demo = false } = {}) {
   const production = env.NODE_ENV === 'production';
   const setupMode = env.SETUP_MODE === 'true';
+  const botRole = env.BOT_ROLE || 'combined';
+  if (!['combined', 'portal', 'worker'].includes(botRole)) throw new Error('BOT_ROLE must be combined, portal, or worker.');
   if (demo && (production || env.RENDER)) throw new Error('Demo is available only on a local development machine.');
+  if (demo && botRole !== 'combined') throw new Error('Demo requires the combined role.');
+  if (botRole !== 'combined' && !/^[\x21-\x7e]{32,256}$/.test(env.WORKER_SECRET || '')) throw new Error('WORKER_SECRET must contain 32 to 256 printable characters without spaces.');
+  let workerUrl = '';
+  if (botRole === 'worker') {
+    if (setupMode) throw new Error('Disable SETUP_MODE before starting an audio worker.');
+    if (!env.DISCORD_TOKEN || !env.DISCORD_CLIENT_ID) throw new Error('The worker requires DISCORD_TOKEN and DISCORD_CLIENT_ID.');
+    let remote;
+    try { remote = new URL(env.WORKER_URL); } catch { throw new Error('WORKER_URL must identify the Render portal.'); }
+    const local = ['localhost', '127.0.0.1', '[::1]'].includes(remote.hostname);
+    if (!['https:', 'wss:', ...(local ? ['http:', 'ws:'] : [])].includes(remote.protocol) || remote.username || remote.password || remote.search || remote.hash || !['/', '/internal/worker'].includes(remote.pathname)) {
+      throw new Error('WORKER_URL must use a secure portal origin or /internal/worker URL.');
+    }
+    workerUrl = remote.href;
+  }
   const integer = (key, fallback, min, max) => {
     if (!env[key]) return fallback;
     const value = Number(env[key]);
@@ -12,7 +28,8 @@ export function loadConfig(env = process.env, { demo = false } = {}) {
     return value;
   };
   const port = integer('PORT', 3000, 1, 65535);
-  const publicUrl = (env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || `http://localhost:${port}`).replace(/\/$/, '');
+  const workerOrigin = workerUrl ? new URL(workerUrl.replace(/^ws/, 'http')).origin : '';
+  const publicUrl = (env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || workerOrigin || `http://localhost:${port}`).replace(/\/$/, '');
   const parsed = new URL(publicUrl);
   if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
     throw new Error('PUBLIC_URL must be a plain http(s) origin without a path.');
@@ -21,8 +38,8 @@ export function loadConfig(env = process.env, { demo = false } = {}) {
   for (const key of ['DISCORD_CLIENT_ID', 'DISCORD_GUILD_ID', 'DJ_ROLE_ID']) {
     if (env[key] && !/^\d{17,20}$/.test(env[key])) throw new Error(`${key} must be a Discord ID.`);
   }
-  if (production) {
-    if (!setupMode) for (const key of ['DISCORD_TOKEN', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET']) {
+  if (production && botRole !== 'worker') {
+    if (!setupMode) for (const key of botRole === 'portal' ? ['DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET'] : ['DISCORD_TOKEN', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET']) {
       if (!env[key]) throw new Error(`${key} is required in production.`);
     }
     if ((env.SESSION_SECRET || '').length < 32) throw new Error('SESSION_SECRET must contain at least 32 characters in production.');
@@ -31,7 +48,7 @@ export function loadConfig(env = process.env, { demo = false } = {}) {
   if (env.SPOTIFY_REFRESH_TOKEN && !env.SPOTIFY_CLIENT_ID) throw new Error('Spotify playlist authorization also requires both Spotify app credentials.');
   if (env.SPOTIFY_MARKET && !/^[A-Z]{2}$/.test(env.SPOTIFY_MARKET)) throw new Error('SPOTIFY_MARKET must be a two-letter uppercase country code.');
   return {
-    production, demo, setupMode, port, publicUrl: parsed.origin, host: demo ? '127.0.0.1' : '0.0.0.0',
+    production, demo, setupMode, botRole, workerUrl, workerSecret: env.WORKER_SECRET || '', port, publicUrl: parsed.origin, host: demo ? '127.0.0.1' : '0.0.0.0',
     discordToken: env.DISCORD_TOKEN || '', discordClientId: env.DISCORD_CLIENT_ID || '',
     discordClientSecret: env.DISCORD_CLIENT_SECRET || '', discordGuildId: env.DISCORD_GUILD_ID || '',
     djRoleId: env.DJ_ROLE_ID || '', sessionSecret: env.SESSION_SECRET || randomBytes(32).toString('hex'),

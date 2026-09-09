@@ -1,10 +1,12 @@
 # Turntable
 
-A Discord music bot and web song request portal, deployed together as one Render service. Requests from the website and `/play` share a persistent queue for each Discord server.
+A Discord music bot and web song request portal. Run them together, or keep the portal on Render and run an audio worker on a VM. Requests from the website and `/play` share a persistent queue for each Discord server.
 
 [Open the portal](https://discord-bap-bot.onrender.com) · [Render service](https://dashboard.render.com/web/srv-dagu1tpt0dsc73fqe4ug). This service was created directly through the CLI; its settings are managed in Render's Dashboard. Its Discord OAuth redirect is `https://discord-bap-bot.onrender.com/auth/discord/callback`.
 
 The current service uses a public-repository connection. Push changes to GitHub, then deploy the latest commit from Render's Dashboard or CLI. For automatic deployments, connect the repository through Render's GitHub integration or configure a service-specific deploy hook. See [Render deployment options](https://render.com/docs/deploys).
+
+**Playback hosting:** YouTube currently rejects audio requests from our Render instance. A paid Render plan does not establish that playback will work. See [VM options, testing, and worker deployment](docs/vm-hosting.md). The worker support is prepared; a VM must pass a real audio and Discord voice test before migration is considered successful.
 
 ## What works
 

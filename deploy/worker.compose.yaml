@@ -1,0 +1,34 @@
+name: bap-bot
+services:
+  worker:
+    image: bap-bot-worker:local
+    build:
+      context: ..
+    restart: unless-stopped
+    env_file:
+      - /etc/bap-bot/worker.env
+    environment:
+      NODE_ENV: production
+      BOT_ROLE: worker
+      SETUP_MODE: "false"
+      DATA_DIR: /var/data
+    user: "1000:1000"
+    volumes:
+      - /var/lib/bap-bot/data:/var/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 40s
+    pids_limit: 256
+    mem_limit: 768m
+    memswap_limit: 1536m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Only outbound connections are needed. Do not publish a Docker port.

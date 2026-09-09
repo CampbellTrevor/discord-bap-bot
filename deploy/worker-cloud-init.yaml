@@ -1,0 +1,22 @@
+#cloud-config
+# Ubuntu 24.04, at least 1 GB RAM. Inject an SSH public key through the provider.
+# No bot credentials or cloud-account credentials belong in user-data.
+package_update: true
+packages:
+  - ca-certificates
+  - docker.io
+  - docker-compose-v2
+  - git
+  - unattended-upgrades
+ssh_pwauth: false
+disable_root: true
+swap:
+  filename: /swap.img
+  size: 2147483648
+  maxsize: 2147483648
+runcmd:
+  - [systemctl, enable, --now, docker]
+  - [install, -d, -m, "0700", /etc/bap-bot]
+  - [install, -d, -m, "0700", -o, "1000", -g, "1000", /var/lib/bap-bot/data]
+# Image building, the public-audio probe, and secret transfer happen over SSH.
+# The bot is deliberately not started during instance creation.
