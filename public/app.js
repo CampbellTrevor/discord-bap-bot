@@ -379,7 +379,7 @@ async function initialize() {
   } catch (error) {
     state.offline = true;
     renderSession();
-    showFeedback(error.status === 401 ? 'Your Discord session has expired. Connect Discord again to continue.' : 'We could not reach your listening room. Retrying automatically in a few seconds.', true, true);
+    showFeedback(error.status === 401 ? 'Session expired. Sign in again.' : 'Connection lost. Retrying…', true, true);
   }
 }
 
@@ -449,7 +449,7 @@ $('guild-select').addEventListener('change', async () => {
   try { await loadDetail(); } catch (error) { showFeedback(error.message, true); }
 });
 $('channel-select').addEventListener('change', renderChannels);
-$('join-button').addEventListener('click', () => mutate('join', { channelId: $('channel-select').value }, 'The listening room is connected.'));
+$('join-button').addEventListener('click', () => mutate('join', { channelId: $('channel-select').value }, 'Connected to voice.'));
 $('leave-button').addEventListener('click', () => mutate('control', { action: 'leave' }, 'Disconnected from the voice channel.'));
 $('pause-button').addEventListener('click', () => {
   const action = state.detail?.queue?.paused ? 'resume' : 'pause';
