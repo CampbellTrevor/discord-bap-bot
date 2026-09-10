@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createWorkerBridge, connectWorker } from '../src/worker-bridge.mjs';
 import { MediaError } from '../src/media.mjs';
-import { MusicManager } from '../src/music.mjs';
+import { MusicManager, publicTrack } from '../src/music.mjs';
 
 const SECRET = 'worker-test-secret-with-at-least-thirty-two-characters';
 const USER = '123456789012345678';
@@ -29,7 +29,8 @@ test('2,000 Unicode Spotify entries round trip without internal resolution metad
   assert.equal(detail.queue.tracks[0].searchQuery, undefined);
   assert.ok(Buffer.byteLength(JSON.stringify(detail)) > 1024 * 1024);
   assert.ok(Buffer.byteLength(JSON.stringify(detail)) < 8 * 1024 * 1024);
-  const request = { added: tracks.slice(0, 100), queue: detail.queue, import: { accepted: 100, inspected: 100, warnings: [] } };
+  const request = { added: tracks.map(publicTrack), queue: detail.queue, import: { accepted: 2000, inspected: 2000, warnings: [] } };
+  assert.ok(Buffer.byteLength(JSON.stringify({ ...request, added: tracks })) > 8 * 1024 * 1024);
   assert.ok(Buffer.byteLength(JSON.stringify(request)) < 8 * 1024 * 1024);
   const { bridge, connect } = await fixture(t);
   connect(fakeBot({ detail: async () => detail, request: async () => request }));
@@ -220,6 +221,7 @@ test('worker membership failures and trusted provider codes survive without leak
   const { bridge, connect } = await fixture(t, { logger });
   connect(fakeBot({
     detail: async () => { throw Object.assign(new Error('You must be a member of that server.'), { status: 403 }); },
+    request: async () => { throw Object.assign(new Error('The queue filled while the playlist was loading. Nothing was added; try again when there is room.'), { status: 409 }); },
     search: async (guildId, userId, query) => {
       if (query === 'no-match') throw new MediaError('No suitable studio recording was found.', 'NO_PLAYBACK_MATCH');
       if (query === 'removed') throw new MediaError('This YouTube recording has been removed.', 'YOUTUBE_VIDEO_UNAVAILABLE');
@@ -231,6 +233,7 @@ test('worker membership failures and trusted provider codes survive without leak
   }), { logger });
   await until(() => bridge.bot.isReady());
   await assert.rejects(bridge.bot.detail(GUILD, USER), { status: 403, message: 'You must be a member of that server.' });
+  await assert.rejects(bridge.bot.request(GUILD, USER, 'playlist'), { status: 409, message: 'The queue filled while the playlist was loading. Nothing was added; try again when there is room.' });
   await assert.rejects(bridge.bot.search(GUILD, USER, 'restricted', 'youtube'), { code: 'YOUTUBE_REQUEST_BLOCKED', status: 503 });
   await assert.rejects(bridge.bot.search(GUILD, USER, 'playlist', 'spotify'), { code: 'SPOTIFY_PLAYLIST_ACCESS', message: 'Spotify playlist access requires owner authorization.' });
   await assert.rejects(bridge.bot.search(GUILD, USER, 'no-match', 'spotify'), { code: 'NO_PLAYBACK_MATCH', status: 400, message: 'No suitable studio recording was found.' });

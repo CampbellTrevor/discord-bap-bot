@@ -23,7 +23,9 @@ test('queue defaults support 2,000 total songs and one-hour tracks across roles'
     const config = loadConfig(env);
     assert.equal(config.maxQueueSize, 2000);
     assert.equal(config.maxTrackDurationSec, 3600);
-    assert.equal(config.maxPlaylistTracks, 50);
+    assert.equal(config.maxPlaylistTracks, 2000);
+    assert.equal(loadConfig({ ...env, MAX_PLAYLIST_TRACKS: '2000' }).maxPlaylistTracks, 2000);
+    assert.throws(() => loadConfig({ ...env, MAX_PLAYLIST_TRACKS: '2001' }), /MAX_PLAYLIST_TRACKS/);
     assert.equal(loadConfig({ ...env, MAX_QUEUE_SIZE: '2000', MAX_TRACK_DURATION_SEC: '3600' }).maxQueueSize, 2000);
     assert.throws(() => loadConfig({ ...env, MAX_QUEUE_SIZE: '2001' }), /MAX_QUEUE_SIZE/);
   }

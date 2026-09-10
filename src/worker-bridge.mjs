@@ -48,6 +48,7 @@ const PUBLIC_MESSAGES = new Set([
   'Choose YouTube or Spotify for search.',
   'Enter a song name or a Spotify/YouTube track or playlist URL (up to 500 characters).',
   'The queue is full. Wait for a song to finish or remove one.',
+  'The queue filled while the playlist was loading. Nothing was added; try again when there is room.',
   'No playable tracks were found.',
   'Nothing is playing.',
   'At least two songs must be waiting in the queue to shuffle.',

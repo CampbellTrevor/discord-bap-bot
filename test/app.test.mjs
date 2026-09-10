@@ -200,8 +200,8 @@ test('explicit setup mode locks Discord login even if partial credentials are pr
   assert.equal(loadConfig(production).setupMode, true);
   assert.throws(() => loadConfig({ ...production, SETUP_MODE: 'false' }), /DISCORD_TOKEN/);
   assert.throws(() => loadConfig({ ...production, SESSION_SECRET: '' }), /SESSION_SECRET/);
-  assert.equal(loadConfig({}).maxPlaylistTracks, 50);
-  assert.throws(() => loadConfig({ MAX_PLAYLIST_TRACKS: '101' }), /MAX_PLAYLIST_TRACKS/);
+  assert.equal(loadConfig({}).maxPlaylistTracks, 2000);
+  assert.throws(() => loadConfig({ MAX_PLAYLIST_TRACKS: '2001' }), /MAX_PLAYLIST_TRACKS/);
   assert.throws(() => loadConfig({ SPOTIFY_REFRESH_TOKEN: 'missing-app' }), /both Spotify/);
 });
 

@@ -236,7 +236,7 @@ test('late cancellation never rolls back a request that already committed', asyn
 });
 
 test('single requests validate playback before admission and preserve the validated mapping', async t => {
-  const { bot, media, music, calls } = await fixture(t);
+  const { bot, media, music, calls, queue } = await fixture(t);
   let held = false;
   music.pausePreflight = () => { held = true; return () => { held = false; }; };
   const controller = new AbortController();
@@ -250,7 +250,8 @@ test('single requests validate playback before admission and preserve the valida
   const result = await bot.request('guild', 'listener', 'song', undefined, { signal: controller.signal });
   assert.equal(held, false);
   assert.equal(result.added[0].validation.status, 'ready');
-  assert.equal(result.added[0].playbackMapping.videoId, 'abcdefghijk');
+  assert.equal(result.added[0].playbackMapping, undefined);
+  assert.equal(queue.tracks[0].playbackMapping.videoId, 'abcdefghijk');
   assert.equal(calls.enqueues, 1);
 });
 
@@ -288,4 +289,59 @@ test('playlist requests enqueue pending checks without blocking on every playbac
   assert.equal(result.import.accepted, 2);
   assert.deepEqual(result.warnings, ['Playback matches are being checked in the background.']);
   assert.deepEqual(tracks.import.warnings, []);
+});
+
+test('playlist resolution uses available capacity and trims safely if another request fills slots', async t => {
+  const { bot, media, music, queue } = await fixture(t);
+  let remaining = 5;
+  music.capacity = () => remaining;
+  music.assertCapacity = (_guild, count) => assert.ok(count <= remaining);
+  const tracks = Array.from({ length: 5 }, (_, index) => ({ ...track, title: `Track ${index}` }));
+  const summary = { source: 'spotify', accepted: 5, inspected: 6, skipped: 1, limitReached: false, warnings: ['Skipped 1 unavailable playlist entry.'] };
+  Object.defineProperty(tracks, 'import', { value: summary });
+  media.resolve = async (_query, options) => {
+    assert.equal(options.maxTracks, 5);
+    remaining = 2;
+    return tracks;
+  };
+  const result = await bot.request('guild', 'listener', 'playlist');
+  assert.deepEqual(result.added.map(item => item.title), ['Track 0', 'Track 1']);
+  assert.equal(queue.tracks.length, 2);
+  assert.equal(result.import.accepted, 2);
+  assert.equal(result.import.skipped, 1);
+  assert.equal(result.import.notAddedForCapacity, 3);
+  assert.equal(result.import.limitReached, true);
+  assert.match(result.warnings.join(' '), /room for 2 tracks; 3 additional/);
+  assert.equal(tracks.length, 5);
+  assert.equal(summary.accepted, 5);
+  assert.equal(summary.warnings.length, 1);
+});
+
+test('a queue filled during playlist lookup rejects before voice changes or admission', async t => {
+  const { bot, media, music, calls } = await fixture(t);
+  let remaining = 2;
+  music.capacity = () => remaining;
+  media.resolve = async () => {
+    remaining = 0;
+    const tracks = [track];
+    Object.defineProperty(tracks, 'import', { value: { source: 'spotify', accepted: 1, warnings: [] } });
+    return tracks;
+  };
+  await assert.rejects(bot.request('guild', 'listener', 'playlist', 'other-voice'), error => error.status === 409 && /Nothing was added/.test(error.message));
+  assert.equal(calls.enqueues, 0);
+  assert.equal(calls.snapshots, 0);
+});
+
+test('a large playlist retains its order and reports the queue-capacity stop', async t => {
+  const { bot, media, music, queue } = await fixture(t);
+  music.capacity = () => 2000 - queue.tracks.length;
+  const tracks = Array.from({ length: 2000 }, (_, index) => ({ ...track, title: `Track ${index}`, searchQuery: 'internal lookup' }));
+  Object.defineProperty(tracks, 'import', { value: { source: 'spotify', accepted: 2000, inspected: 2000, skipped: 0, limitReached: true, warnings: [] } });
+  media.resolve = async (_query, options) => { assert.equal(options.maxTracks, 2000); return tracks; };
+  const result = await bot.request('guild', 'listener', 'playlist');
+  assert.equal(result.added.length, 2000);
+  assert.deepEqual(result.added.map(item => item.title), tracks.map(item => item.title));
+  assert.equal(result.added[0].searchQuery, undefined);
+  assert.equal(queue.tracks[0].searchQuery, 'internal lookup');
+  assert.match(result.warnings.join(' '), /room for 2000 tracks/);
 });

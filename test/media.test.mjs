@@ -360,7 +360,7 @@ test('rejects malformed playlist IDs before any provider access', async () => {
     await assert.rejects(media.resolve(query), error => ['INVALID_QUERY', 'UNSUPPORTED_MEDIA'].includes(error.code));
   }
   assert.equal(fake.calls.length, 0);
-  for (const value of [0, 101, 1.5]) assert.throws(() => createMedia({ maxPlaylistTracks: value }), /maxPlaylistTracks/);
+  for (const value of [0, 2001, 1.5]) assert.throws(() => createMedia({ maxPlaylistTracks: value }), /maxPlaylistTracks/);
 });
 
 test('skips unavailable, deleted, live, overlong and non-video YouTube entries', async () => {
@@ -392,7 +392,7 @@ test('playlist resolution has a bounded deadline and metadata output', async () 
   const fake = extractor();
   await assert.rejects(createMedia({}, { ...fake, playlistTimeoutMs: 15 }).resolve(`https://youtube.com/playlist?list=${PLAYLIST}`), { code: 'MEDIA_TIMEOUT' });
   assert.equal(fake.stopped.length, 1);
-  const oversized = extractor([child => child.stdout.write(Buffer.alloc(4 * 1024 * 1024 + 1))]);
+  const oversized = extractor([child => child.stdout.write(Buffer.alloc(16 * 1024 * 1024 + 1))]);
   await assert.rejects(createMedia({}, oversized).resolve(`https://youtube.com/playlist?list=${PLAYLIST}`), { code: 'INVALID_MEDIA' });
   assert.equal(oversized.stopped.length, 1);
 });
@@ -467,6 +467,133 @@ test('Spotify pagination imports up to100 entries with at most50 per API page', 
   assert.equal(calls.length, 4);
 });
 
+test('Spotify imports up to 2000 tracks in forty bounded pages while preserving order and duplicates', async () => {
+  for (const total of [2000, 2400]) {
+    const pages = [];
+    const media = createMedia(spotifyConfig, { spawn: () => assert.fail('Playlist import must not extract audio'), fetch: async url => {
+      if (url.includes('/api/token')) return json({ access_token: 'token', expires_in: 3600 });
+      if (url.includes('fields=name')) return json({ name: 'Large list' });
+      const target = new URL(url), offset = Number(target.searchParams.get('offset'));
+      assert.equal(target.origin, 'https://api.spotify.com');
+      assert.equal(target.pathname, `/v1/playlists/${TRACK}/items`);
+      assert.equal(target.searchParams.get('limit'), '50');
+      pages.push(offset);
+      return json({ offset, total, next: offset + 50 < total ? 'https://untrusted.example/ignored' : null,
+        items: Array.from({ length: 50 }, (_, index) => ({ item: spotifyItem(offset + index === 50 ? 49 : offset + index) })) });
+    } });
+    const tracks = await media.resolve(`spotify:playlist:${TRACK}`);
+    assert.equal(tracks.length, 2000);
+    assert.deepEqual(pages, Array.from({ length: 40 }, (_, index) => index * 50));
+    assert.equal(tracks[49].sourceUrl, tracks[50].sourceUrl, 'Repeated playlist entries are intentional queue requests.');
+    assert.equal(tracks[0].title, 'Track 0');
+    assert.equal(tracks[1999].title, 'Track 1999');
+    assert.deepEqual({ ...tracks.import, warnings: [] }, { source: 'spotify', title: 'Large list', total,
+      inspected: 2000, accepted: 2000, skipped: 0, limitReached: total > 2000, warnings: [] });
+  }
+});
+
+test('Spotify capacity caps accepted tracks and continues past skipped entries to fill available slots', async () => {
+  const pages = [];
+  const media = createMedia(spotifyConfig, { fetch: async url => {
+    if (url.includes('/api/token')) return json({ access_token: 'token', expires_in: 3600 });
+    if (url.includes('fields=name')) return json({ name: 'Mixed capacity list' });
+    const offset = Number(new URL(url).searchParams.get('offset'));
+    pages.push(offset);
+    return json({ offset, total: 500, next: 'more', items: Array.from({ length: 50 }, (_, index) => ({
+      item: spotifyItem(offset + index, { is_playable: offset + index >= 60 }),
+    })) });
+  } });
+  const tracks = await media.resolve(`spotify:playlist:${TRACK}`, { maxTracks: 80 });
+  assert.equal(tracks.length, 80);
+  assert.deepEqual(pages, [0, 50, 100]);
+  assert.equal(tracks[0].title, 'Track 60');
+  assert.equal(tracks[79].title, 'Track 139');
+  assert.equal(tracks.import.inspected, 140);
+  assert.equal(tracks.import.skipped, 60);
+  assert.equal(tracks.import.limitReached, true);
+  assert.match(tracks.import.warnings.join(' '), /first 140/);
+});
+
+test('a per-call playlist capacity does not change the next request and still honors the inspection ceiling', async () => {
+  const media = createMedia(spotifyConfig, { fetch: async url => {
+    if (url.includes('/api/token')) return json({ access_token: 'token', expires_in: 3600 });
+    if (url.includes('fields=name')) return json({ name: 'List' });
+    const params = new URL(url).searchParams, offset = Number(params.get('offset')), limit = Number(params.get('limit'));
+    return json({ offset, total: 75, next: offset + limit < 75 ? 'more' : null,
+      items: Array.from({ length: Math.min(limit, 75 - offset) }, (_, index) => ({ item: spotifyItem(offset + index) })) });
+  } });
+  assert.equal((await media.resolve(`spotify:playlist:${TRACK}`, { maxTracks: 2 })).length, 2);
+  assert.equal((await media.resolve(`spotify:playlist:${TRACK}`)).length, 75);
+  const capped = createMedia({ ...spotifyConfig, maxPlaylistTracks: 3 }, { fetch: async url => url.includes('/api/token')
+    ? json({ access_token: 'token', expires_in: 3600 }) : url.includes('fields=name') ? json({ name: 'Inspection cap' })
+      : json({ offset: 0, total: 5, next: 'more', items: [null, { item: null }, { item: spotifyItem(2) }, { item: spotifyItem(3) }] }) });
+  const limited = await capped.resolve(`spotify:playlist:${TRACK}`, { maxTracks: 2 });
+  assert.equal(limited.length, 1);
+  assert.equal(limited.import.inspected, 3);
+  assert.equal(limited.import.skipped, 2);
+  assert.equal(limited.import.limitReached, true);
+});
+
+test('playlist capacity options reject invalid bounds before contacting either provider', async () => {
+  const media = createMedia(spotifyConfig, { spawn: () => assert.fail('No extractor expected'), fetch: () => assert.fail('No provider request expected') });
+  for (const maxTracks of [0, -1, 2001, 1.5, Infinity, NaN, '50', null]) {
+    for (const url of [`spotify:playlist:${TRACK}`, `https://youtube.com/playlist?list=${PLAYLIST}`]) {
+      await assert.rejects(media.resolve(url, { maxTracks }), { code: 'INVALID_QUERY' });
+    }
+  }
+});
+
+test('YouTube large flat playlist metadata can exceed four MiB without exceeding the bounded sixteen MiB ceiling', async () => {
+  const result = { title: 'Large YouTube list', playlist_count: 2001,
+    entries: Array.from({ length: 2001 }, (_, index) => video(index, { description: 'x'.repeat(2300) })) };
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) > 4 * 1024 * 1024);
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) < 16 * 1024 * 1024);
+  const fake = extractor([metadata(result)]);
+  const tracks = await createMedia({}, fake).resolve(`https://youtube.com/playlist?list=${PLAYLIST}`);
+  assert.equal(tracks.length, 2000);
+  assert.equal(tracks.import.inspected, 2000);
+  assert.equal(tracks.import.limitReached, true);
+  assert.equal(tracks[1999].title, 'Song 1999');
+  assert.equal(tracks[0].description, undefined);
+  assert.equal(fake.calls.length, 1);
+  const args = fake.calls[0].args;
+  assert.equal(args[args.indexOf('--playlist-items') + 1], '1:2001');
+  assert.ok(args.includes('--flat-playlist') && args.includes('--skip-download'));
+});
+
+test('YouTube per-call capacity skips unavailable entries and preserves duplicate requests', async () => {
+  const fake = extractor([metadata({ playlist_count: 5, entries: [video(1, { title: '[Private video]' }), video(2), video(2), video(3), video(4)] })]);
+  const tracks = await createMedia({}, fake).resolve(`https://youtube.com/playlist?list=${PLAYLIST}`, { maxTracks: 2 });
+  assert.equal(tracks.length, 2);
+  assert.equal(tracks[0].sourceUrl, tracks[1].sourceUrl);
+  assert.equal(tracks.import.inspected, 3);
+  assert.equal(tracks.import.skipped, 1);
+  assert.equal(tracks.import.limitReached, true);
+  assert.equal(fake.calls.length, 1);
+});
+
+test('cancellation or timeout after Spotify pages rejects the entire import', async () => {
+  for (const cancellation of [true, false]) {
+    const controller = new AbortController();
+    let pages = 0;
+    const media = createMedia(spotifyConfig, { playlistTimeoutMs: cancellation ? 1000 : 15, fetch: async (url, { signal }) => {
+      if (url.includes('/api/token')) return json({ access_token: 'token', expires_in: 3600 });
+      if (url.includes('fields=name')) return json({ name: 'Interrupted list' });
+      const offset = Number(new URL(url).searchParams.get('offset'));
+      pages++;
+      if (pages === 2) {
+        if (cancellation) controller.abort(new Error('Request cancelled after a page'));
+        else return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+      }
+      return json({ offset, total: 2000, next: 'more', items: Array.from({ length: 50 }, (_, index) => ({ item: spotifyItem(offset + index) })) });
+    } });
+    const pending = media.resolve(`spotify:playlist:${TRACK}`, { signal: controller.signal });
+    if (cancellation) await assert.rejects(pending, /Request cancelled after a page/);
+    else await assert.rejects(pending, { code: 'MEDIA_TIMEOUT' });
+    assert.equal(pages, 2);
+  }
+});
+
 test('Spotify skips episodes, local files, missing, unavailable and overlong entries', async () => {
   const items = [{ item: spotifyItem(1) }, { item: null }, { track: spotifyItem(2, { type: 'episode' }) }, { is_local: true, item: spotifyItem(3) }, { item: spotifyItem(4, { is_local: true }) }, { item: spotifyItem(5, { is_playable: false }) }, { item: spotifyItem(6, { restrictions: { reason: 'market' } }) }, { item: spotifyItem(7, { duration_ms: 601_000 }) }, { item: spotifyItem(8, { id: 'bad' }) }];
   const media = createMedia({ ...spotifyConfig, maxTrackDurationSec: 600 }, { fetch: async url => url.includes('/api/token') ? json({ access_token: 'test-token', expires_in: 3600 }) : url.includes('fields=name') ? json({ name: 'Mixed list' }) : json({ offset: 0, total: items.length, next: null, items }) });
@@ -509,8 +636,8 @@ test('Spotify pagination is bounded even when responses provide tiny pages indef
     return json({ offset, total: 100, next: 'more', items: [{ item: spotifyItem(offset) }] });
   } });
   const tracks = await media.resolve(`spotify:playlist:${TRACK}`);
-  assert.equal(pageCalls, 5);
-  assert.equal(tracks.length, 5);
+  assert.equal(pageCalls, 45);
+  assert.equal(tracks.length, 45);
   assert.equal(tracks.import.limitReached, true);
   assert.match(tracks.import.warnings.join(' '), /pagination limit/);
 });

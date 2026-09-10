@@ -25,7 +25,7 @@ The current service uses a public-repository connection. Push changes to GitHub,
 
 Paste a YouTube playlist URL such as `https://www.youtube.com/playlist?list=PLAYLIST_ID`, or use it with `/play query:`. A video URL containing both `v=` and `list=` still requests that **one video**; use the playlist URL to import the list.
 
-The default import inspects the first **50 playlist entries**, preserving their order. Invalid, unavailable, live, and overlong entries found during import are skipped and reported. Accepted entries are checked in the background, including entries whose duration YouTube omits. Notices explain import limits and skipped entries. `MAX_PLAYLIST_TRACKS` can be configured from 1 to 100; the queue must have room for the complete accepted batch or the request adds nothing. Spotify playlist access is described below.
+Playlist imports now inspect up to **2,000 entries** and add eligible songs in order until the available queue slots are filled. Spotify playlists are fetched across multiple pages; YouTube playlists use flat metadata extraction. Invalid, unavailable, live, and overlong entries found during import are skipped and reported. Accepted entries are checked in the background, including entries whose duration YouTube omits. Notices explain skipped entries and any songs left out because the queue filled or an import limit was reached. `MAX_PLAYLIST_TRACKS` sets the inspection ceiling from 1 to 2,000; it defaults to 2,000. If another request fills some slots while a playlist loads, only the portion that still fits is added. A full queue or a provider failure before admission adds nothing. Spotify playlist access is described below.
 
 Queue entries show **Checking**, **Matched**, or **Retry pending** as their playback metadata is verified. The worker checks one entry at a time, with a pause between checks, prioritizing songs near the front and yielding to playback preparation and requests. Confirmed unavailable entries are removed immediately, freeing their queue slots without interrupting the current song. Temporary network errors, provider restrictions on the host, and rate limits back off and retry; those songs stay queued. Existing saved queues are checked after restart, and entries already marked unavailable are removed from the saved queue.
 
@@ -110,7 +110,7 @@ To activate an existing preview, add all three Discord credentials, explicitly s
 
 ## Configuration and verification
 
-`.env.example` lists all options. Defaults: 2,000 total songs per server (including the current track), first 50 playlist entries per import, 60 minutes per track, five-minute idle disconnect. Request endpoints have rate limits; media extraction has bounded concurrency/timeouts. OAuth uses one-time state, server sessions, CSRF protection, and live Discord membership/permission checks.
+`.env.example` lists all options. Defaults: 2,000 total songs per server (including the current track), up to 2,000 playlist entries inspected per import, 60 minutes per track, five-minute idle disconnect. Spotify imports use pages of at most 50 entries with a bounded page count and a 90-second overall deadline. Request endpoints have rate limits; media extraction has bounded concurrency/timeouts. OAuth uses one-time state, server sessions, CSRF protection, and live Discord membership/permission checks.
 
 ```sh
 npm run check

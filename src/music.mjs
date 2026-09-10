@@ -34,6 +34,12 @@ export function musicError(message, status = 400) {
   return Object.assign(new Error(message), { status });
 }
 
+export function publicTrack(track) {
+  if (!track) return track;
+  const { playbackMapping, searchQuery, ...visible } = track;
+  return visible;
+}
+
 /** Shared queue state. Voice and media adapters are injected so transitions can be tested offline. */
 export class MusicManager extends EventEmitter {
   constructor({ media, dataDir, maxQueueSize = 2000, idleDisconnectMs = 300_000, logger = console, randomIndex = randomInt, preloadCount = 2, preloadLeadSec = 120, preloadTtlMs = 300_000, validationDelayMs = 1000, validationRetryMs = [30_000, 120_000, 600_000], validationCooldownMs = 30_000 }) {
@@ -111,11 +117,6 @@ export class MusicManager extends EventEmitter {
 
   snapshot(guildId) {
     const state = this.state(guildId);
-    const publicTrack = track => {
-      if (!track) return track;
-      const { playbackMapping, searchQuery, ...visible } = track;
-      return visible;
-    };
     return structuredClone({
       guildId, channelId: state.channelId, channelName: state.channelName,
       nowPlaying: publicTrack(state.nowPlaying), tracks: state.tracks.map(publicTrack),

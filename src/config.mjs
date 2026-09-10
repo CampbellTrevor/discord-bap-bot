@@ -57,7 +57,7 @@ export function loadConfig(env = process.env, { demo = false } = {}) {
     dataDir: path.resolve(env.DATA_DIR || './data'), ytDlpPath: env.YT_DLP_PATH || 'yt-dlp',
     maxQueueSize: integer('MAX_QUEUE_SIZE', 2000, 1, 2000),
     maxTrackDurationSec: integer('MAX_TRACK_DURATION_SEC', 3600, 30, 14400),
-    maxPlaylistTracks: integer('MAX_PLAYLIST_TRACKS', 50, 1, 100),
+    maxPlaylistTracks: integer('MAX_PLAYLIST_TRACKS', 2000, 1, 2000),
     idleDisconnectMs: integer('IDLE_DISCONNECT_MS', 300000, 10000, 3600000),
   };
 }

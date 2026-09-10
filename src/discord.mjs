@@ -6,7 +6,7 @@ import {
   AudioPlayerStatus, NoSubscriberBehavior, StreamType, VoiceConnectionStatus,
   createAudioPlayer, createAudioResource, entersState, joinVoiceChannel,
 } from '@discordjs/voice';
-import { MusicManager, musicError } from './music.mjs';
+import { MusicManager, musicError, publicTrack } from './music.mjs';
 import { prepareAudio } from './audio-pipeline.mjs';
 import { createAudioHealth } from './audio-health.mjs';
 
@@ -297,11 +297,12 @@ export function createBot({ config, media, metrics, logger = console }, dependen
       await membership(guildId, userId);
       signal?.throwIfAborted();
       if (typeof query !== 'string' || !query.trim() || query.length > 500) throw musicError('Enter a song name or a Spotify/YouTube track or playlist URL (up to 500 characters).');
-      if (music.capacity(guildId) < 1) throw musicError('The queue is full. Wait for a song to finish or remove one.', 409);
+      const available = Math.max(0, music.capacity(guildId));
+      if (available < 1) throw musicError('The queue is full. Wait for a song to finish or remove one.', 409);
       let tracks;
       const releasePreflight = music.pausePreflight?.();
       try {
-        tracks = await media.resolve(query.trim(), { signal });
+        tracks = await media.resolve(query.trim(), { signal, maxTracks: available });
         signal?.throwIfAborted();
         // A single request is accepted only after its playback match is known.
         // Playlist checks run in the queue so large imports do not hold HTTP
@@ -316,6 +317,20 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         const identity = await membership(guildId, userId);
         signal?.throwIfAborted();
         if (!tracks.length) throw musicError('No playable tracks were found.');
+        const details = tracks.import ? structuredClone(tracks.import) : null;
+        if (details) {
+          const remaining = Math.max(0, music.capacity(guildId));
+          if (remaining < 1) throw musicError('The queue filled while the playlist was loading. Nothing was added; try again when there is room.', 409);
+          if (tracks.length > remaining) {
+            details.notAddedForCapacity = tracks.length - remaining;
+            tracks = tracks.slice(0, remaining);
+            details.accepted = tracks.length;
+            details.limitReached = true;
+            details.warnings = [...(details.warnings || []), `The queue had room for ${tracks.length} tracks; ${details.notAddedForCapacity} additional tracks from this import were not added.`];
+          } else if (details.limitReached && tracks.length === available) {
+            details.warnings = [...(details.warnings || []), `The queue had room for ${tracks.length} tracks; the rest of the playlist was not added.`];
+          }
+        }
         music.assertCapacity(guildId, tracks.length);
         const snapshot = music.snapshot(guildId);
         if (!snapshot.channelId || (channelId && channelId !== snapshot.channelId)) await joinAs(identity, channelId, { signal });
@@ -323,12 +338,11 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         // cancellation must not remove a request that has already committed.
         signal?.throwIfAborted();
         const added = await music.enqueue(guildId, tracks, { id: userId, username: identity.member.displayName });
-        const details = tracks.import ? structuredClone(tracks.import) : null;
         if (details && added.some(track => ['pending', 'checking', 'retry'].includes(track.validation?.status))) {
           details.warnings = [...new Set([...(details.warnings || []), 'Playback matches are being checked in the background.'])];
         }
         return {
-          added, queue: music.snapshot(guildId),
+          added: added.map(publicTrack), queue: music.snapshot(guildId),
           ...(details ? { import: details } : {}),
           warnings: details?.warnings || [],
         };

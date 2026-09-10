@@ -8,6 +8,9 @@ const YOUTUBE_PLAYLIST_ID = /^[A-Za-z0-9_-]{10,100}$/;
 const SPOTIFY_ID = /^[A-Za-z0-9]{22}$/;
 const YOUTUBE_HOSTS = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be', 'www.youtu.be']);
 const MAX_OUTPUT_BYTES = 1024 * 1024;
+const MAX_PLAYLIST_OUTPUT_BYTES = 16 * 1024 * 1024;
+const MAX_PLAYLIST_TRACKS = 2000;
+const MAX_SPOTIFY_PLAYLIST_PAGES = 45;
 const MAX_PROCESSES = 4;
 const SEARCH_LIMIT = 5;
 const SEARCH_CANDIDATES = 10;
@@ -295,10 +298,12 @@ export function createMedia(config = {}, dependencies = {}) {
   const startupTimeoutMs = dependencies.startupTimeoutMs ?? 45_000;
   const playlistTimeoutMs = dependencies.playlistTimeoutMs ?? 90_000;
   const maxDuration = config.maxTrackDurationSec ?? 3600;
-  const maxPlaylistTracks = config.maxPlaylistTracks ?? 50;
+  // The configured ceiling bounds inspected entries. Per-request maxTracks
+  // limits accepted songs, so unavailable entries do not consume queue slots.
+  const maxPlaylistTracks = config.maxPlaylistTracks ?? MAX_PLAYLIST_TRACKS;
   const spotifyMarket = config.spotifyMarket || 'US';
   if (!Number.isFinite(maxDuration) || maxDuration <= 0) throw new Error('maxTrackDurationSec must be a positive number.');
-  if (!Number.isInteger(maxPlaylistTracks) || maxPlaylistTracks < 1 || maxPlaylistTracks > 100) throw new Error('maxPlaylistTracks must be an integer from 1 to 100.');
+  if (!Number.isInteger(maxPlaylistTracks) || maxPlaylistTracks < 1 || maxPlaylistTracks > MAX_PLAYLIST_TRACKS) throw new Error('maxPlaylistTracks must be an integer from 1 to 2000.');
   if (!/^[A-Z]{2}$/.test(spotifyMarket)) throw new Error('spotifyMarket must be a two-letter uppercase country code.');
   let activeProcesses = 0;
   const runningProcesses = new Set();
@@ -368,7 +373,7 @@ export function createMedia(config = {}, dependencies = {}) {
       signal.addEventListener('abort', abort, { once: true });
       child.stdout.on('data', chunk => {
         outputBytes += Buffer.byteLength(chunk);
-        if (outputBytes > MAX_OUTPUT_BYTES * (playlist ? 4 : 1)) return finish(new MediaError('The provider returned too much metadata.', 'INVALID_MEDIA'));
+        if (outputBytes > (playlist ? MAX_PLAYLIST_OUTPUT_BYTES : MAX_OUTPUT_BYTES)) return finish(new MediaError('The provider returned too much metadata.', 'INVALID_MEDIA'));
         stdout.push(Buffer.from(chunk));
       });
       child.stderr.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-8192); });
@@ -472,19 +477,24 @@ export function createMedia(config = {}, dependencies = {}) {
     return tracks;
   }
 
-  async function resolveYoutubePlaylist(url, signal) {
+  async function resolveYoutubePlaylist(url, signal, acceptedLimit) {
     const result = await extractMetadata(url, signal, { playlist: true });
+    signal.throwIfAborted();
     if (!Array.isArray(result?.entries)) throw new MediaError('YouTube did not return a readable playlist.', 'INVALID_MEDIA');
     const entries = result.entries.slice(0, maxPlaylistTracks);
     const tracks = [];
+    let inspected = 0;
     for (const entry of entries) {
+      if (tracks.length >= acceptedLimit) break;
+      inspected++;
       try { tracks.push(youtubeTrack(entry, { flat: true })); }
       catch (error) { if (!(error instanceof MediaError)) throw error; }
     }
     const count = result.playlist_count;
-    const knownTotal = Number.isSafeInteger(count) && count >= entries.length ? count : null;
-    const limitReached = result.entries.length > maxPlaylistTracks || knownTotal !== null && knownTotal > entries.length;
-    return playlistResult(tracks, { source: 'youtube', title: safeText(result.title, 'YouTube playlist'), total: knownTotal ?? (limitReached ? null : entries.length), inspected: entries.length, limitReached });
+    const knownTotal = Number.isSafeInteger(count) && count >= inspected ? count : null;
+    const limitReached = result.entries.length > inspected || knownTotal !== null && knownTotal > inspected;
+    signal.throwIfAborted();
+    return playlistResult(tracks, { source: 'youtube', title: safeText(result.title, 'YouTube playlist'), total: knownTotal ?? (limitReached ? null : inspected), inspected, limitReached });
   }
 
   async function spotifyJSON(url, options, signal) {
@@ -640,7 +650,7 @@ export function createMedia(config = {}, dependencies = {}) {
     return { ...track };
   }
 
-  async function resolveSpotifyPlaylist(id, signal) {
+  async function resolveSpotifyPlaylist(id, signal, acceptedLimit) {
     const user = Boolean(config.spotifyRefreshToken);
     const tracks = [];
     let inspected = 0;
@@ -652,16 +662,22 @@ export function createMedia(config = {}, dependencies = {}) {
       const info = await spotifyRequest(`playlists/${id}?fields=name`, signal, user);
       title = safeText(info?.name, title);
       let offset = 0;
-      for (let pageNumber = 0; pageNumber < 5; pageNumber += 1) {
+      const maxPages = Math.min(MAX_SPOTIFY_PLAYLIST_PAGES, Math.max(5, Math.ceil(maxPlaylistTracks / 50) + 5));
+      for (let pageNumber = 0; pageNumber < maxPages; pageNumber += 1) {
+        signal.throwIfAborted();
         const limit = Math.min(50, maxPlaylistTracks - inspected + 1);
         const params = new URLSearchParams({ limit: String(limit), offset: String(offset), market: spotifyMarket });
         // Never follow provider-supplied pagination URLs. Construct every request
         // from the validated playlist ID and our own bounded numeric offset.
         const page = await spotifyRequest(`playlists/${id}/items?${params}`, signal, user);
+        signal.throwIfAborted();
         if (!Array.isArray(page?.items) || page.items.length > limit || page.offset !== undefined && page.offset !== offset) throw new MediaError('Spotify returned inconsistent playlist pagination.', 'INVALID_MEDIA');
         if (Number.isSafeInteger(page.total) && page.total >= 0) total = page.total;
         const entries = page.items.slice(0, maxPlaylistTracks - inspected);
+        let processed = 0;
         for (const entry of entries) {
+          if (tracks.length >= acceptedLimit) break;
+          processed++;
           inspected += 1;
           const item = entry?.item !== undefined ? entry.item : entry?.track;
           if (!item || entry.is_local || item.is_local || item.type !== 'track' || item.is_playable === false || item.restrictions?.reason) continue;
@@ -669,15 +685,15 @@ export function createMedia(config = {}, dependencies = {}) {
           catch (error) { if (!(error instanceof MediaError)) throw error; }
         }
         offset += page.items.length;
-        const more = page.items.length > entries.length || total !== null && total > inspected || Boolean(page.next);
-        if (inspected >= maxPlaylistTracks) { limitReached = more; break; }
+        const more = page.items.length > processed || total !== null && total > inspected || Boolean(page.next);
+        if (tracks.length >= acceptedLimit || inspected >= maxPlaylistTracks) { limitReached = more; break; }
         if (!page.items.length) {
           limitReached = more;
           if (more) warnings.push('Spotify returned an incomplete playlist page. Try importing again later.');
           break;
         }
         if (!more) { total ??= inspected; break; }
-        if (pageNumber === 4) {
+        if (pageNumber === maxPages - 1) {
           limitReached = true;
           warnings.push('The Spotify pagination limit was reached; try a smaller playlist.');
         }
@@ -688,16 +704,21 @@ export function createMedia(config = {}, dependencies = {}) {
         ? 'Spotify cannot read this playlist. Use a playlist owned by or shared for collaboration with the connected Spotify account. If needed, run npm run spotify:authorize again with playlist read permissions.'
         : 'Spotify requires user authorization for this playlist. The bot owner must run npm run spotify:authorize and set SPOTIFY_REFRESH_TOKEN. Current API access is limited to playlists that account owns or collaborates on.', 'SPOTIFY_PLAYLIST_ACCESS');
     }
+    signal.throwIfAborted();
     return playlistResult(tracks, { source: 'spotify', title, total, inspected, limitReached, warnings });
   }
 
-  async function resolve(query, { signal } = {}) {
+  async function resolve(query, { signal, maxTracks } = {}) {
+    if (maxTracks !== undefined && (!Number.isInteger(maxTracks) || maxTracks < 1 || maxTracks > MAX_PLAYLIST_TRACKS)) {
+      throw new MediaError('The playlist queue capacity must be an integer from 1 to 2000.', 'INVALID_QUERY');
+    }
     const parsed = parseQuery(query);
+    const acceptedLimit = Math.min(maxPlaylistTracks, maxTracks ?? maxPlaylistTracks);
     if (activeResolutions >= MAX_PROCESSES) throw new MediaError('The music provider is busy. Try again in a moment.', 'MEDIA_BUSY');
     activeResolutions += 1;
     try {
       return await withDeadline(signal, parsed.kind === 'playlist' ? playlistTimeoutMs : resolveTimeoutMs, async deadline => {
-        if (parsed.kind === 'playlist') return parsed.source === 'spotify' ? resolveSpotifyPlaylist(parsed.id, deadline) : resolveYoutubePlaylist(parsed.url, deadline);
+        if (parsed.kind === 'playlist') return parsed.source === 'spotify' ? resolveSpotifyPlaylist(parsed.id, deadline, acceptedLimit) : resolveYoutubePlaylist(parsed.url, deadline, acceptedLimit);
         return [parsed.source === 'spotify' ? await resolveSpotify(parsed.id, deadline)
           : parsed.source === 'youtube' ? await resolveYoutube(parsed.url, deadline) : await resolveYoutubeSearch(parsed.query, deadline)];
       });
