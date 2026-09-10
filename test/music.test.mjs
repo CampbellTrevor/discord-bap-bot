@@ -954,28 +954,33 @@ test('playlist admission returns before serial background checks and removed row
   assert.equal(manager.validationEntry, null);
 });
 
-test('known unavailable rows stay visible until the head, then skip in a batch without foreground opening', async t => {
+test('permanent checks remove waiting songs immediately without interrupting current playback', async t => {
   const opened = [];
   const media = { async preflight(item) {
     if (item.title.startsWith('Bad')) throw new MediaError('No suitable recording.', 'NO_PLAYBACK_MATCH');
     return item;
   }, async open(item) { opened.push(item.title); return openedAudio(); } };
-  const { manager } = await fixture(t, media, { validationDelayMs: 5 });
-  await manager.enqueue('guild', ['Bad A', 'Bad B', 'Good'].map(track), requester);
-  await until(() => manager.snapshot('guild').tracks.every(item => ['unavailable', 'ready'].includes(item.validation.status)));
-  assert.equal(manager.snapshot('guild').tracks.length, 3);
-  manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
-  await settle();
-  assert.deepEqual(opened, ['Good']);
-  assert.equal(manager.snapshot('guild').nowPlaying.title, 'Good');
-  assert.equal(manager.snapshot('guild').tracks.length, 0);
+  const { manager, dataDir } = await fixture(t, media, { validationDelayMs: 5 });
+  const voice = fakeTransport();
+  await manager.enqueue('guild', ['Current', 'Good A', 'Bad A', 'Good B', 'Bad B'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await until(() => manager.snapshot('guild').tracks.length === 2);
+  assert.deepEqual(manager.snapshot('guild').tracks.map(item => item.title), ['Good A', 'Good B']);
+  assert.deepEqual(opened, ['Current']);
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'Current');
+  assert.equal(voice.stopped, 0);
+  assert.equal(manager.capacity('guild'), 1997);
+  await manager.writes;
+  const saved = JSON.parse(await readFile(path.join(dataDir, 'queues.json'), 'utf8')).guilds.guild;
+  assert.deepEqual(saved.tracks.map(item => item.title), ['Good A', 'Good B']);
+  assert.equal(saved.nowPlaying.title, 'Current');
 });
 
 test('an entirely unavailable queue becomes empty and idle without retrying its tracks', async t => {
   const { manager } = await fixture(t, { async preflight() { throw new MediaError('No suitable recording.', 'NO_PLAYBACK_MATCH'); },
     open() { assert.fail('Known unavailable tracks must not open'); } }, { validationDelayMs: 5 });
   await manager.enqueue('guild', ['Bad A', 'Bad B'].map(track), requester);
-  await until(() => manager.snapshot('guild').tracks.every(item => item.validation.status === 'unavailable'));
+  await until(() => manager.snapshot('guild').tracks.length === 0);
   manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
   await settle();
   assert.equal(manager.snapshot('guild').nowPlaying, null);
@@ -999,19 +1004,22 @@ test('a transient background outage backs off globally instead of checking the w
   await manager.control('guild', 'stop');
 });
 
-test('restore backfills checking and old validation while keeping fresh terminal statuses', async t => {
+test('restore removes saved unavailable songs of any age and backfills other validation', async t => {
   const { manager, dataDir } = await fixture(t);
-  await manager.enqueue('guild', ['Checking', 'Ready', 'Unavailable', 'Legacy'].map(track), requester);
+  await manager.enqueue('guild', ['Checking', 'Ready', 'Unavailable', 'Legacy', 'Old unavailable'].map(track), requester);
   const rows = manager.state('guild').tracks;
   rows[0].validation = { status: 'checking' };
   rows[1].validation = { status: 'ready', checkedAt: Date.now() };
   rows[2].validation = { status: 'unavailable', checkedAt: Date.now(), code: 'NO_PLAYBACK_MATCH' };
+  rows[4].validation = { status: 'unavailable', checkedAt: Date.now() - 172_800_000, code: 'NO_PLAYBACK_MATCH' };
   await manager.persist();
   const checks = [];
   const restored = new MusicManager({ media: { async preflight(item) { checks.push(item.title); return item; } }, dataDir,
     logger: quiet, validationDelayMs: 5 });
   await restored.restore();
-  assert.deepEqual(restored.snapshot('guild').tracks.map(item => item.validation.status), ['pending', 'ready', 'unavailable', 'pending']);
+  assert.deepEqual(restored.snapshot('guild').tracks.map(item => item.validation.status), ['pending', 'ready', 'pending']);
+  const saved = JSON.parse(await readFile(path.join(dataDir, 'queues.json'), 'utf8')).guilds.guild;
+  assert.deepEqual(saved.tracks.map(item => item.title), ['Checking', 'Ready', 'Legacy']);
   await until(() => checks.length === 2);
   assert.deepEqual(checks, ['Checking', 'Legacy']);
   await restored.shutdown();
@@ -1030,7 +1038,9 @@ test('permanent preload failures extend lookahead to the next two playable reque
   await manager.enqueue('guild', ['Current', 'Bad', 'Next', 'Following'].map(track), requester);
   manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
   await settle();
-  assert.equal(manager.snapshot('guild').tracks[0].validation.status, 'unavailable');
+  assert.deepEqual(manager.snapshot('guild').tracks.map(item => item.title), ['Next', 'Following']);
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'Current');
+  assert.equal(voice.stopped, 0);
   assert.deepEqual([...manager.preloadEntries].map(entry => manager.state('guild').tracks.find(item => item.id === entry.id).title), ['Next', 'Following']);
   assert.equal(manager.preloadEntries.size, 2);
   voice.plays[0].end();
@@ -1076,6 +1086,25 @@ test('a permanent preload failure between scheduling and beginning cannot open t
   await settle();
   assert.equal(media.calls.filter(call => call.title === 'Bad').length, 1);
   assert.equal(manager.snapshot('guild').nowPlaying.title, 'Good');
+});
+
+test('removing the final failed preload after current ends releases its source and arms idle disconnect', async t => {
+  const media = warmMedia(); media.preflight = async item => item;
+  const { manager } = await fixture(t, media, { preloadCount: 2, validationDelayMs: 1000, idleDisconnectMs: 20 });
+  const voice = fakeTransport();
+  const added = await manager.enqueue('guild', ['Current', 'Bad'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  const parked = manager.state('guild').preloads.get(added[1].id).opened;
+  voice.plays[0].end();
+  parked.stream.emit('error', new MediaError('Video unavailable.', 'YOUTUBE_VIDEO_UNAVAILABLE'));
+  await until(() => voice.destroyed === 1);
+  assert.equal(manager.snapshot('guild').nowPlaying, null);
+  assert.deepEqual(manager.snapshot('guild').tracks, []);
+  assert.equal(manager.preloadEntries.size, 0);
+  assert.equal(manager.state('guild').preloads.size, 0);
+  assert.equal(parked.stream.destroyed, true);
+  assert.equal(media.calls.filter(call => call.title === 'Bad').length, 1);
 });
 
 test('public snapshots omit internal search/mapping fields while queue persistence retains them', async t => {

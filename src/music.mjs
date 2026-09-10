@@ -93,14 +93,19 @@ export class MusicManager extends EventEmitter {
     if (saved.version !== 1 || !saved.guilds || typeof saved.guilds !== 'object') {
       throw new Error('Unsupported saved queue format. Preserve queues.json before starting again.');
     }
+    let removedUnavailable = false;
     for (const [guildId, value] of Object.entries(saved.guilds)) {
       if (!value || !Array.isArray(value.tracks)) throw new Error('Invalid saved queue data.');
       const restored = [value.nowPlaying, ...value.tracks].filter(Boolean);
       if (restored.some(track => !track.id || typeof track.title !== 'string' || !track.requestedBy?.id)) {
         throw new Error('Invalid track in saved queue data.');
       }
-      this.state(guildId).tracks = restored.map(track => this.initializeValidation(track));
+      const state = this.state(guildId);
+      state.tracks = restored;
+      removedUnavailable = this.removeUnavailable(state) > 0 || removedUnavailable;
+      state.tracks = state.tracks.map(track => this.initializeValidation(track));
     }
+    if (removedUnavailable) await this.persist();
     this.scheduleValidation();
   }
 
@@ -250,18 +255,13 @@ export class MusicManager extends EventEmitter {
   }
 
   schedule(state) {
-    this.syncPreloads();
-    if (this.shuttingDown || !state.transport || state.nowPlaying) return;
-    const firstPlayable = state.tracks.findIndex(track => track.validation?.status !== 'unavailable');
-    const skipped = firstPlayable < 0 ? state.tracks.length : firstPlayable;
-    if (skipped) {
-      const removed = state.tracks.splice(0, skipped);
-      for (const track of removed) this.validationAttempts.delete(track.id);
-      state.lastError = `Skipped ${skipped} unavailable queued track${skipped === 1 ? '' : 's'}.`;
+    if (this.shuttingDown) return;
+    if (this.removeUnavailable(state)) {
       this.persistBackground(state);
       this.changed(state);
-      this.syncPreloads();
     }
+    this.syncPreloads();
+    if (!state.transport || state.nowPlaying) return;
     if (!state.tracks.length) {
       if (!state.idleTimer && this.idleDisconnectMs > 0) {
         state.idleTimer = setTimeout(() => {
@@ -478,13 +478,26 @@ export class MusicManager extends EventEmitter {
     this.validationAttempts.delete(track.id);
   }
 
-  validationFailure(track, error) {
+  removeUnavailable(state) {
+    const removed = state.tracks.filter(track => track.validation?.status === 'unavailable');
+    if (!removed.length) return 0;
+    state.tracks = state.tracks.filter(track => track.validation?.status !== 'unavailable');
+    for (const track of removed) {
+      this.validationAttempts.delete(track.id);
+      const preload = state.preloads.get(track.id);
+      if (preload) this.dropPreload(state, preload);
+    }
+    if (this.validationEntry?.state === state && removed.includes(this.validationEntry.track)) this.cancelValidation();
+    return removed.length;
+  }
+
+  validationFailure(state, track, error) {
     const checkedAt = Date.now();
     const details = failureDetails(error, 'AUDIO_SOURCE_FAILED');
     const code = SOURCE_METRIC_CODES.has(details.code) ? details.code : 'AUDIO_SOURCE_FAILED';
     if (isPermanentMediaError(error)) {
       track.validation = { status: 'unavailable', checkedAt, code };
-      this.validationAttempts.delete(track.id);
+      this.removeUnavailable(state);
     } else {
       const attempts = (this.validationAttempts.get(track.id) ?? 0) + 1;
       this.validationAttempts.set(track.id, attempts);
@@ -566,7 +579,7 @@ export class MusicManager extends EventEmitter {
       this.changed(state);
     }).catch(error => {
       if (!current()) return;
-      this.validationFailure(track, error);
+      this.validationFailure(state, track, error);
       if (!isPermanentMediaError(error)) this.validationCooldownUntil = Date.now() + (error?.code === 'MEDIA_BUSY' ? this.validationDelayMs : this.validationCooldownMs);
       this.persistBackground(state);
       this.changed(state);
@@ -666,13 +679,14 @@ export class MusicManager extends EventEmitter {
       this.preloadMetric(entry, outcome, error);
       this.logFailure('audio-preload', error, 'AUDIO_SOURCE_FAILED');
       if (outcome !== 'expired' && this.media.preflight && isPermanentMediaError(error)) {
-        this.validationFailure(track, error);
+        this.validationFailure(state, track, error);
         this.persistBackground(state);
         this.changed(state);
       }
       if (outcome !== 'expired' && !isPermanentMediaError(error)) this.preloadCooldownUntil = Date.now() + (error?.code === 'MEDIA_BUSY' ? this.validationDelayMs : this.validationCooldownMs);
-      // Keep the failed marker for this track/current-song pair. No retry loop.
-      setImmediate(() => { if (!this.shuttingDown) this.syncPreloads(); });
+      // Retryable failures retain their marker for this current-song pair.
+      // Permanent removals can leave an empty queue between end and begin.
+      setImmediate(() => { if (!this.shuttingDown) this.schedule(state); });
     };
     void Promise.resolve().then(async () => {
       entry.controller.signal.throwIfAborted();
