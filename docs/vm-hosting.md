@@ -50,3 +50,9 @@ The Compose service sets the worker role, restarts after failure/reboot, limits 
 Verify portal health reports `botReady: true`. Sign in, join voice, and test YouTube audio, Spotify matching, search selection, playlist import, shuffle, and reconnect after a portal restart. Discord playback must continue while the portal is disconnected. Unconfirmed actions are not retried automatically: refresh the queue before retrying. A successful migration requires that actual voice test; it has not happened yet.
 
 For updates, build a reviewed commit, recreate the worker with Compose, and check logs/health. Keep one previous image for rollback and back up the small data directory. The portal reconnects automatically; a worker restart preserves the queue but requires `/join` to resume voice.
+
+## Persistent website sign-in
+
+Authenticated sign-ins last up to 30 days in the same browser. The worker stores encrypted records and logout revocations in `/var/lib/bap-bot/data/.portal-sessions.json`. Keep this file with the other data backups and keep Render's `SESSION_SECRET` unchanged. The worker does not receive that secret or plaintext login records.
+
+Deploy workers with session-storage support before updating the portal. A portal restart, sleep, or worker restart preserves sign-ins; temporary worker disconnections return a retryable storage error. Static pages and health checks remain available. Users need to sign in once after upgrading from the former in-memory store, or after clearing cookies or rotating `SESSION_SECRET`.

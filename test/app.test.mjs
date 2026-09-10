@@ -1,25 +1,38 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { createApp } from '../src/app.mjs';
 import { loadConfig } from '../src/config.mjs';
 import { createDemoBot } from '../src/demo.mjs';
 import { BoundedSessionStore } from '../src/session-store.mjs';
+import { EncryptedSessionStore, FileSessionStorage } from '../src/persistent-session-store.mjs';
 
-async function fixture(t, { demo = false, setup = false, bot = createDemoBot(), fetchImpl } = {}) {
-  const config = loadConfig({ DISCORD_TOKEN: 'test-token', DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'test-secret', SETUP_MODE: String(setup) }, { demo });
-  const result = createApp({ config, bot, fetchImpl });
+async function fixture(t, { demo = false, setup = false, bot = createDemoBot(), fetchImpl, store, env = {}, cookieValue = '' } = {}) {
+  const config = loadConfig({ DISCORD_TOKEN: 'test-token', DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'test-secret', SETUP_MODE: String(setup), ...env }, { demo });
+  const result = createApp({ config, bot, fetchImpl, store });
   const server = result.app.listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
-  config.publicUrl = `http://127.0.0.1:${server.address().port}`;
-  t.after(async () => { result.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
-  let cookie = '';
+  const url = `http://127.0.0.1:${server.address().port}`;
+  if (!config.production) config.publicUrl = url;
+  let closed = false;
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    await result.close();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  };
+  t.after(close);
+  let cookie = cookieValue;
   async function request(path, options = {}) {
-    const response = await fetch(config.publicUrl + path, { ...options, redirect: 'manual', headers: { ...(cookie ? { Cookie: cookie } : {}), ...options.headers } });
+    const response = await fetch(url + path, { ...options, redirect: 'manual', headers: { ...(cookie ? { Cookie: cookie } : {}), ...(config.production ? { 'X-Forwarded-Proto': 'https' } : {}), ...options.headers } });
     const nextCookie = response.headers.get('set-cookie');
     if (nextCookie) cookie = nextCookie.split(';')[0];
     return response;
   }
-  return { request, config, cookie: () => cookie };
+  return { request, config, cookie: () => cookie, close };
 }
 
 test('private queue API requires Discord sign-in and does not expose identities', async t => {
@@ -305,3 +318,159 @@ for (const [route, method] of [['search', 'search'], ['requests', 'request']]) {
     await stopped.promise;
   });
 }
+
+async function sessionStorageFixture(t) {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'turntable-sessions-http-'));
+  const stores = [];
+  t.after(async () => {
+    for (const store of stores) await store.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  return () => {
+    const store = new FileSessionStorage({ dataDir });
+    stores.push(store);
+    return store;
+  };
+}
+
+const persistentSecret = 'test-only-stable-portal-session-secret-32';
+const persistentUser = '123456789012345679';
+const productionEnv = { NODE_ENV: 'production', PUBLIC_URL: 'https://music.example', SESSION_SECRET: persistentSecret };
+const profileProvider = async url => Response.json(url.endsWith('/oauth2/token')
+  ? { access_token: 'provider-only-token' } : { id: persistentUser, username: 'Listener', avatar: null });
+
+async function signIn(request) {
+  const start = await request('/auth/discord');
+  const state = new URL(start.headers.get('location')).searchParams.get('state');
+  return request('/auth/discord/callback?' + new URLSearchParams({ code: 'test-code', state }));
+}
+
+test('persistent login survives portal and storage restarts; logout revokes the saved cookie', async t => {
+  const storage = await sessionStorageFixture(t);
+  let providerCalls = 0;
+  const fetchImpl = url => { providerCalls++; return profileProvider(url); };
+  const bot = { isReady: () => true, listGuilds: async id => { assert.equal(id, persistentUser); return []; } };
+  const make = cookieValue => fixture(t, { bot, fetchImpl, env: productionEnv, cookieValue,
+    store: new EncryptedSessionStore({ storage: storage(), secret: persistentSecret }) });
+  const original = await make();
+  const login = await signIn(original.request);
+  assert.equal(login.headers.get('location'), '/');
+  const header = login.headers.get('set-cookie');
+  assert.match(header, /HttpOnly/);
+  assert.match(header, /Secure/);
+  assert.match(header, /SameSite=Lax/);
+  const expiry = new Date(/Expires=([^;]+)/.exec(header)[1]).getTime();
+  assert.ok(expiry - Date.now() > 29 * 24 * 3600000);
+  assert.ok(expiry - Date.now() <= 30 * 24 * 3600000);
+  const oldCookie = original.cookie();
+  const before = await (await original.request('/api/session')).json();
+  assert.equal(before.user.id, persistentUser);
+  await original.close();
+
+  const restarted = await make(oldCookie);
+  const after = await (await restarted.request('/api/session')).json();
+  assert.deepEqual(after.user, before.user);
+  assert.equal(after.csrfToken, before.csrfToken);
+  assert.equal((await restarted.request('/api/guilds')).status, 200);
+  assert.equal((await restarted.request('/auth/discord')).headers.get('location'), '/');
+  assert.equal(providerCalls, 2, 'A refresh/reconnect must not exchange another OAuth code.');
+  const logout = await restarted.request('/auth/logout', { method: 'POST', headers: { 'X-CSRF-Token': after.csrfToken } });
+  assert.equal(logout.status, 200);
+  assert.match(logout.headers.get('set-cookie'), /Expires=Thu, 01 Jan 1970/);
+  await restarted.close();
+
+  const replay = await make(oldCookie);
+  assert.equal((await replay.request('/api/guilds')).status, 401);
+  assert.equal((await (await replay.request('/api/session')).json()).user, null);
+});
+
+test('storage outages preserve the browser cookie and static assets skip session storage', async t => {
+  const makeStorage = await sessionStorageFixture(t);
+  const storage = makeStorage();
+  let failed = false;
+  let reads = 0;
+  let writes = 0;
+  const transport = {
+    async get(id) { reads++; if (failed) throw new Error('private storage diagnostic'); return storage.get(id); },
+    set(id, value) { writes++; return storage.set(id, value); },
+    take: id => storage.take(id), destroy: id => storage.destroy(id),
+  };
+  const { request, cookie } = await fixture(t, { env: productionEnv,
+    store: new EncryptedSessionStore({ storage: transport, secret: persistentSecret }) });
+  const before = await (await request('/api/session')).json();
+  const savedCookie = cookie();
+  const counts = { reads, writes };
+  for (const url of ['/', '/app.js', '/healthz']) assert.equal((await request(url)).status, 200);
+  assert.deepEqual({ reads, writes }, counts);
+  assert.equal((await (await request('/api/session')).json()).csrfToken, before.csrfToken);
+  assert.equal(writes, counts.writes, 'Polling must not rewrite the durable file.');
+  failed = true;
+  const unavailable = await request('/api/session');
+  assert.equal(unavailable.status, 503);
+  assert.equal(unavailable.headers.get('set-cookie'), null);
+  assert.equal(cookie(), savedCookie);
+  assert.doesNotMatch(JSON.stringify(await unavailable.json()), /private storage diagnostic/);
+  failed = false;
+  assert.equal((await (await request('/api/session')).json()).csrfToken, before.csrfToken);
+});
+
+test('concurrent OAuth callbacks consume one state and only the winner sets a login cookie', async t => {
+  const makeStorage = await sessionStorageFixture(t);
+  let exchanges = 0;
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const fetchImpl = async url => {
+    if (url.endsWith('/oauth2/token')) { exchanges++; started.resolve(); await release.promise; }
+    return profileProvider(url);
+  };
+  const { request, cookie } = await fixture(t, { fetchImpl, env: productionEnv,
+    store: new EncryptedSessionStore({ storage: makeStorage(), secret: persistentSecret }) });
+  const start = await request('/auth/discord');
+  const state = new URL(start.headers.get('location')).searchParams.get('state');
+  const callback = '/auth/discord/callback?' + new URLSearchParams({ code: 'one-code', state });
+  const headers = { Cookie: cookie() };
+  const callbacks = Promise.all([request(callback, { headers }), request(callback, { headers })]);
+  await started.promise;
+  release.resolve();
+  const responses = await callbacks;
+  assert.equal(exchanges, 1);
+  const success = responses.find(response => response.headers.get('location') === '/');
+  const failure = responses.find(response => response.headers.get('location') === '/?error=sign_in_failed');
+  assert.ok(success);
+  assert.ok(failure);
+  assert.ok(success.headers.get('set-cookie'));
+  assert.equal(failure.headers.get('set-cookie'), null);
+});
+
+test('an unacknowledged login save returns 503 without retrying or issuing an authenticated cookie', async t => {
+  const makeStorage = await sessionStorageFixture(t);
+  const storage = makeStorage();
+  let failed = false;
+  let refusedWrites = 0;
+  const transport = {
+    get: id => storage.get(id), take: id => storage.take(id), destroy: id => storage.destroy(id),
+    set(id, value) {
+      if (failed) { refusedWrites++; throw new Error('private write failure'); }
+      return storage.set(id, value);
+    },
+  };
+  const fetchImpl = async url => {
+    const response = await profileProvider(url);
+    if (url.endsWith('/users/@me')) failed = true;
+    return response;
+  };
+  const { request, cookie } = await fixture(t, { fetchImpl, env: productionEnv,
+    store: new EncryptedSessionStore({ storage: transport, secret: persistentSecret }) });
+  const start = await request('/auth/discord');
+  const oldCookie = cookie();
+  const state = new URL(start.headers.get('location')).searchParams.get('state');
+  const response = await request('/auth/discord/callback?' + new URLSearchParams({ code: 'test-code', state }));
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get('location'), null);
+  assert.equal(response.headers.get('set-cookie'), null);
+  assert.equal(cookie(), oldCookie);
+  assert.equal(refusedWrites, 1);
+  assert.doesNotMatch(JSON.stringify(await response.json()), /private write failure/);
+  failed = false;
+  assert.equal((await request('/api/guilds')).status, 401);
+});

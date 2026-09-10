@@ -11,7 +11,19 @@ const SECRET = 'worker-test-secret-with-at-least-thirty-two-characters';
 const USER = '123456789012345678';
 const GUILD = '223456789012345678';
 const CHANNEL = '323456789012345678';
+const SID = 'test-session-identifier-with-32-characters';
 const silent = { warn() {} };
+
+function fakeSessionStorage(overrides = {}) {
+  const records = new Map();
+  return {
+    async get(sid) { return records.get(sid) ?? null; },
+    async set(sid, record) { records.set(sid, record); return null; },
+    async take(sid) { const record = records.get(sid) ?? null; records.delete(sid); return record; },
+    async destroy(sid) { records.delete(sid); return null; },
+    ...overrides,
+  };
+}
 
 function deferred() {
   let resolve;
@@ -338,8 +350,10 @@ test('worker rejects arbitrary method aliases, extra serialized options and dupl
     connected.resolve({ socket, receive });
   });
   let calls = 0;
+  let takes = 0;
   const connection = connectWorker({ url: `http://127.0.0.1:${server.address().port}`, secret: SECRET, logger: silent,
-    bot: fakeBot({ request: async () => { calls++; return { added: [] }; } }), heartbeatMs: 20 });
+    bot: fakeBot({ request: async () => { calls++; return { added: [] }; } }), heartbeatMs: 20,
+    sessionStorage: fakeSessionStorage({ async take() { takes++; return null; } }) });
   t.after(async () => {
     connection.close();
     for (const client of wss.clients) client.terminate();
@@ -361,6 +375,15 @@ test('worker rejects arbitrary method aliases, extra serialized options and dupl
   assert.equal((await call('request', [GUILD, USER, 'Dreams', null], id)).ok, true);
   assert.equal((await call('request', [GUILD, USER, 'Dreams', null], id)).error.code, 'WORKER_DUPLICATE_REQUEST');
   assert.equal(calls, 1);
+  for (const [method, args] of [
+    ['sessionTake', ['../' + SID]], ['sessionGet', [SID, { admin: true }]],
+    ['sessionSet', [SID, { value: 'encrypted', expires: 100, user: USER }]],
+    ['sessionSet', [SID, { value: 'x'.repeat(12289), expires: 100 }]],
+  ]) assert.equal((await call(method, args)).error.code, 'WORKER_INVALID_REQUEST');
+  const takeId = randomUUID();
+  assert.equal((await call('sessionTake', [SID], takeId)).ok, true);
+  assert.equal((await call('sessionTake', [SID], takeId)).error.code, 'WORKER_DUPLICATE_REQUEST');
+  assert.equal(takes, 1);
 });
 
 test('outbound worker configuration rejects insecure remote URLs and credential-bearing endpoints', () => {
@@ -371,4 +394,97 @@ test('outbound worker configuration rejects insecure remote URLs and credential-
   for (const secret of ['short', 'a'.repeat(31), 'a'.repeat(257), 'a '.repeat(20), 'é'.repeat(40)]) {
     assert.throws(() => createWorkerBridge({ secret }), /WORKER_SECRET/);
   }
+});
+
+test('durable session calls work while Discord is reconnecting and atomically consume records', async t => {
+  const { bridge, connect } = await fixture(t);
+  connect(fakeBot({ isReady: () => false }), { sessionStorage: fakeSessionStorage(), spotifyEnabled: true });
+  await until(() => bridge.bot.capabilities().spotifyEnabled);
+  assert.equal(bridge.bot.isReady(), false);
+  await assert.rejects(bridge.bot.listGuilds(USER), { code: 'WORKER_UNAVAILABLE' });
+  const record = { value: 'opaque-encrypted-session', expires: Date.now() + 60000 };
+  assert.equal(await bridge.sessionStorage.get(SID), null);
+  assert.equal(await bridge.sessionStorage.set(SID, record), null);
+  assert.deepEqual(await bridge.sessionStorage.get(SID), record);
+  const consumed = await Promise.all([bridge.sessionStorage.take(SID), bridge.sessionStorage.take(SID)]);
+  assert.equal(consumed.filter(Boolean).length, 1);
+  assert.deepEqual(consumed.find(Boolean), record);
+  assert.equal(await bridge.sessionStorage.get(SID), null);
+  await bridge.sessionStorage.set(SID, record);
+  assert.equal(await bridge.sessionStorage.destroy(SID), null);
+  assert.equal(await bridge.sessionStorage.get(SID), null);
+});
+
+test('session storage failures never masquerade as a missing session or disclose stored values', async t => {
+  const logs = [];
+  const { bridge, connect } = await fixture(t);
+  const oldWorker = connect();
+  await until(() => bridge.bot.isReady());
+  await assert.rejects(bridge.sessionStorage.get(SID), { code: 'SESSION_STORAGE_UNAVAILABLE', status: 503 });
+  oldWorker.close();
+  await until(() => !bridge.bot.isReady());
+  connect(fakeBot(), { logger: { warn: (...args) => logs.push(args) }, sessionStorage: fakeSessionStorage({
+    async get() { throw new Error('private-session-data /var/data/sessions.json'); },
+    async take() { return { user: { id: USER } }; },
+    async destroy() { return 'unexpected result'; },
+  }) });
+  await until(() => bridge.bot.isReady());
+  for (const method of ['get', 'take', 'destroy']) {
+    await assert.rejects(bridge.sessionStorage[method](SID), error => {
+      assert.equal(error.code, 'SESSION_STORAGE_UNAVAILABLE');
+      assert.equal(error.status, 503);
+      assert.doesNotMatch(error.message, /private-session|var\/data|unexpected|123456789/);
+      return true;
+    });
+  }
+  assert.doesNotMatch(JSON.stringify(logs), /private-session|var\/data|unexpected|123456789/);
+});
+
+test('session proxy bounds identifiers and opaque records before dispatch', async t => {
+  const { bridge, connect } = await fixture(t);
+  let calls = 0;
+  connect(fakeBot(), { sessionStorage: fakeSessionStorage({ async set() { calls++; return null; } }) });
+  await until(() => bridge.bot.isReady());
+  const record = { value: 'encrypted', expires: Date.now() + 60000 };
+  for (const sid of ['short', '../' + SID, 'x'.repeat(129), USER, 'x'.repeat(32) + '\n']) {
+    await assert.rejects(bridge.sessionStorage.get(sid), { code: 'WORKER_INVALID_REQUEST' });
+  }
+  for (const invalid of [
+    { ...record, value: '' }, { ...record, value: 'x'.repeat(12289) },
+    { ...record, value: '\u00e9'.repeat(7000) }, { ...record, extra: true },
+    { ...record, expires: Infinity }, { ...record, expires: -1 }, { ...record, expires: 1.5 },
+  ]) await assert.rejects(bridge.sessionStorage.set(SID, invalid), { code: 'WORKER_INVALID_REQUEST' });
+  assert.equal(calls, 0);
+});
+
+test('portal validates session results even when supplied by an authenticated worker', async t => {
+  const { bridge, url } = await fixture(t);
+  const worker = await rawWorker(t, url);
+  worker.heartbeat();
+  await until(() => bridge.bot.isReady());
+  for (const result of [false, { value: 'encrypted', expires: 100, user: USER }, { value: 'x'.repeat(12289), expires: 100 }]) {
+    const pending = assert.rejects(bridge.sessionStorage.get(SID), { code: 'SESSION_STORAGE_UNAVAILABLE' });
+    const call = await worker.receive(frame => frame.type === 'call');
+    worker.socket.send(JSON.stringify({ v: 1, type: 'result', id: call.id, ok: true, result }));
+    await pending;
+  }
+});
+
+test('unconfirmed session writes are never replayed on a replacement connection', async t => {
+  const { bridge, connect } = await fixture(t);
+  const started = deferred();
+  const finish = deferred();
+  let writes = 0;
+  const storage = fakeSessionStorage({ async set() { writes++; started.resolve(); return finish.promise; } });
+  const first = connect(fakeBot(), { sessionStorage: storage });
+  await until(() => bridge.bot.isReady());
+  const pending = assert.rejects(bridge.sessionStorage.set(SID, { value: 'encrypted', expires: Date.now() + 60000 }), { code: 'SESSION_STORAGE_UNAVAILABLE' });
+  await started.promise;
+  first.close();
+  await pending;
+  finish.resolve(null);
+  connect(fakeBot(), { sessionStorage: storage });
+  await until(() => bridge.bot.isReady());
+  assert.equal(await bridge.sessionStorage.get(SID), null);
+  assert.equal(writes, 1);
 });

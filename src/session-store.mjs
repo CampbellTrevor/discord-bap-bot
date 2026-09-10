@@ -1,6 +1,6 @@
 import session from 'express-session';
 
-// One application instance; sessions deliberately expire on restart.
+// Local demo/test store. Production sessions use durable storage.
 export class BoundedSessionStore extends session.Store {
   constructor({ maxSessions = 10000, now = Date.now } = {}) {
     super();
@@ -28,7 +28,14 @@ export class BoundedSessionStore extends session.Store {
     this.sessions.set(id, { value: JSON.stringify(value), expires: value.cookie?.expires ? new Date(value.cookie.expires).getTime() : this.now() + 8 * 3600000 });
     callback(null);
   }
-  touch(id, value, callback = () => {}) { this.set(id, value, callback); }
+  // Reads never write an old session snapshot back over a logout or OAuth change.
+  touch(_id, _value, callback = () => {}) { callback(null); }
+  take(id, callback) {
+    this.get(id, (error, value) => {
+      if (!error) this.sessions.delete(id);
+      callback(error, value);
+    });
+  }
   destroy(id, callback = () => {}) { this.sessions.delete(id); callback(null); }
   close() { clearInterval(this.timer); this.sessions.clear(); }
 }

@@ -12,9 +12,15 @@ const equal = (a, b) => {
   const right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
 };
-const save = req => new Promise((resolve, reject) => req.session.save(err => err ? reject(err) : resolve()));
+const save = req => new Promise((resolve, reject) => req.session.save(err => err ? reject(err) : resolve())).catch(error => {
+  // An unacknowledged write must not be retried implicitly while sending an error.
+  req.session = null;
+  throw error;
+});
 const regenerate = req => new Promise((resolve, reject) => req.session.regenerate(err => err ? reject(err) : resolve()));
+const takeSession = req => new Promise((resolve, reject) => req.sessionStore.take(req.sessionID, (err, value) => err ? reject(err) : resolve(value)));
 const httpError = (message, status) => Object.assign(new Error(message), { status });
+const SIGN_IN_LIFETIME = 30 * 24 * 3600000;
 
 async function withClientCancellation(req, res, operation) {
   const controller = new AbortController();
@@ -41,7 +47,7 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
   app.use(['/api', '/auth'], (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
   const limiter = (limit, windowMs) => rateLimit({ windowMs, limit, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many requests. Please wait a moment and try again.' } });
   app.use(['/api', '/auth'], limiter(300, 60000));
-  app.use(session({ name: 'turntable.sid', secret: config.sessionSecret, store, resave: false, saveUninitialized: false,
+  app.use(['/api', '/auth'], session({ name: 'turntable.sid', secret: config.sessionSecret, store, resave: false, saveUninitialized: false,
     cookie: { httpOnly: true, sameSite: 'lax', secure: config.production, maxAge: 8 * 3600000 } }));
   const configured = !config.setupMode && Boolean(config.discordClientId && config.discordClientSecret && (config.botRole === 'portal' || config.discordToken));
   const csrf = (req, _res, next) => {
@@ -49,9 +55,11 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     if (!equal(req.session.csrfToken, req.get('x-csrf-token'))) return next(httpError('Your session changed. Refresh the page and try again.', 403));
     next();
   };
-  app.get('/api/session', (req, res) => {
+  app.get('/api/session', async (req, res) => {
+    const needsSave = !req.session.csrfToken || (config.demo && !req.session.user);
     req.session.csrfToken ||= randomBytes(32).toString('hex');
     if (config.demo) req.session.user ||= { id: 'demo-user', username: 'You', avatar: null };
+    if (needsSave) await save(req);
     res.json({ user: req.session.user || null, csrfToken: req.session.csrfToken, configured, botReady: !config.setupMode && bot.isReady(), demo: config.demo,
       spotifyEnabled: config.botRole === 'portal' ? Boolean(bot.isReady() && bot.capabilities?.().spotifyEnabled) : Boolean(config.spotifyClientId && config.spotifyClientSecret),
       inviteUrl: config.discordClientId ? `https://discord.com/oauth2/authorize?client_id=${config.discordClientId}&scope=bot%20applications.commands&permissions=36703232` : null });
@@ -59,6 +67,7 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
   app.use('/auth', limiter(20, 60000));
   app.get('/auth/discord', async (req, res) => {
     if (!configured || config.demo) throw httpError('Discord sign-in is not configured yet.', 503);
+    if (req.session.user) return res.redirect('/');
     req.session.oauthState = randomBytes(32).toString('hex');
     req.session.oauthStartedAt = Date.now();
     await save(req);
@@ -67,10 +76,13 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     res.redirect(`https://discord.com/oauth2/authorize?${params}`);
   });
   app.get('/auth/discord/callback', async (req, res) => {
-    const stateValid = configured && equal(req.session.oauthState, req.query.state) && Date.now() - req.session.oauthStartedAt < 10 * 60000;
-    delete req.session.oauthState;
-    delete req.session.oauthStartedAt;
-    await save(req);
+    if (!configured || !req.session.oauthState) return res.redirect('/?error=sign_in_failed');
+    // Consume the stored anonymous session atomically, so concurrent callbacks
+    // cannot both exchange a code. Never save the old snapshot back afterward.
+    const previous = await takeSession(req);
+    await regenerate(req);
+    const stateAge = Date.now() - previous?.oauthStartedAt;
+    const stateValid = equal(previous?.oauthState, req.query.state) && Number.isFinite(stateAge) && stateAge >= 0 && stateAge < 10 * 60000;
     if (!stateValid || typeof req.query.code !== 'string' || req.query.code.length > 2048) return res.redirect('/?error=sign_in_failed');
     try {
       const tokenResponse = await fetchImpl('https://discord.com/api/v10/oauth2/token', { method: 'POST', signal: AbortSignal.timeout(15000),
@@ -84,13 +96,15 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
       if (!profileResponse.ok) throw new Error('Profile request rejected');
       const profile = await profileResponse.json();
       if (!/^\d{17,20}$/.test(profile.id) || typeof profile.username !== 'string') throw new Error('Invalid profile');
-      await regenerate(req);
       req.session.user = { id: profile.id, username: profile.global_name || profile.username,
         avatar: /^[a-zA-Z0-9_]+$/.test(profile.avatar || '') ? `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png?size=64` : null };
       req.session.csrfToken = randomBytes(32).toString('hex');
+      req.session.cookie.maxAge = SIGN_IN_LIFETIME;
       await save(req);
       res.redirect('/');
-    } catch {
+    } catch (error) {
+      req.session = null;
+      if (error?.status === 503) throw error;
       res.redirect('/?error=sign_in_failed');
     }
   });

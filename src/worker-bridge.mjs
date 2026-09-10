@@ -8,7 +8,9 @@ const MAX_PAYLOAD = 1024 * 1024;
 const ID = /^\d{17,20}$/;
 const REQUEST_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const ACTIONS = new Set(['skip', 'pause', 'resume', 'stop', 'leave', 'remove', 'shuffle']);
-const METHODS = new Set(['listGuilds', 'detail', 'search', 'request', 'join', 'control']);
+const SESSION_ID = /^[A-Za-z0-9_-]{32,128}$/;
+const SESSION_METHODS = new Set(['sessionGet', 'sessionSet', 'sessionTake', 'sessionDestroy']);
+const METHODS = new Set(['listGuilds', 'detail', 'search', 'request', 'join', 'control', ...SESSION_METHODS]);
 const MUTATIONS = new Set(['request', 'join', 'control']);
 const STATUSES = new Set([400, 403, 404, 409, 429, 503]);
 const MEDIA_CODES = new Set([
@@ -22,6 +24,7 @@ const MEDIA_CODES = new Set([
 const BRIDGE_CODES = new Set([
   'WORKER_UNAVAILABLE', 'WORKER_BUSY', 'WORKER_TIMEOUT', 'WORKER_CANCELLED', 'WORKER_OUTCOME_UNKNOWN',
   'WORKER_INVALID_REQUEST', 'WORKER_DUPLICATE_REQUEST', 'WORKER_OPERATION_FAILED', 'WORKER_RESULT_TOO_LARGE',
+  'SESSION_STORAGE_UNAVAILABLE',
 ]);
 // These messages originate in the bot, not in Discord responses or extractor stderr.
 const PUBLIC_MESSAGES = new Set([
@@ -63,7 +66,12 @@ function unavailable() {
   return new BridgeError('The audio worker is disconnected or still connecting to Discord. Please try again shortly.', 'WORKER_UNAVAILABLE');
 }
 
+function sessionUnavailable() {
+  return new BridgeError('Sign-in storage is temporarily unavailable. Please try again shortly.', 'SESSION_STORAGE_UNAVAILABLE');
+}
+
 function interrupted(method, reason) {
+  if (SESSION_METHODS.has(method)) return sessionUnavailable();
   if (MUTATIONS.has(method)) return new BridgeError('The worker connection was interrupted before confirmation. The action may have completed. Refresh the queue before trying again.', 'WORKER_OUTCOME_UNKNOWN');
   if (reason === 'cancel') return new BridgeError('The worker request was cancelled.', 'WORKER_CANCELLED', 400);
   if (reason === 'timeout') return new BridgeError('The audio worker took too long. Please try again.', 'WORKER_TIMEOUT');
@@ -151,6 +159,8 @@ function sendFrame(socket, frame) {
 
 function validArguments(method, args) {
   if (!METHODS.has(method) || !Array.isArray(args)) return false;
+  if (SESSION_METHODS.has(method)) return typeof args[0] === 'string' && SESSION_ID.test(args[0])
+    && (method === 'sessionSet' ? args.length === 2 && validSessionRecord(args[1]) : args.length === 1);
   if (method === 'listGuilds') return args.length === 1 && typeof args[0] === 'string' && ID.test(args[0]);
   if (args.length < 2 || !args.slice(0, 2).every(value => typeof value === 'string' && ID.test(value))) return false;
   const optionalId = value => value === null || value === undefined || typeof value === 'string' && ID.test(value);
@@ -162,6 +172,16 @@ function validArguments(method, args) {
   if (method === 'control') return args.length === 4 && ACTIONS.has(args[2])
     && (args[2] === 'remove' ? typeof args[3] === 'string' && REQUEST_ID.test(args[3]) : args[3] === null || args[3] === undefined);
   return false;
+}
+
+function validSessionRecord(value) {
+  return shape(value, ['value', 'expires']) && typeof value.value === 'string'
+    && value.value.length > 0 && value.value.length <= 12288 && Buffer.byteLength(value.value) <= 12288
+    && Number.isSafeInteger(value.expires) && value.expires > 0 && value.expires <= 8.64e15;
+}
+
+function validSessionResult(method, result) {
+  return result === null || (method === 'sessionGet' || method === 'sessionTake') && validSessionRecord(result);
 }
 
 function isLoopback(address) {
@@ -249,7 +269,10 @@ export function createWorkerBridge({ secret, logger = console, trustProxy = fals
           if (frame?.type === 'result' && typeof frame.id === 'string' && REQUEST_ID.test(frame.id) && typeof frame.ok === 'boolean'
               && shape(frame, ['v', 'type', 'id', 'ok', frame.ok ? 'result' : 'error'])) {
             const entry = pending.get(frame.id);
-            if (entry) entry.finish(frame.ok ? null : receiveError(frame.error, secret), frame.result);
+            if (entry) {
+              const invalidSession = frame.ok && SESSION_METHODS.has(entry.method) && !validSessionResult(entry.method, frame.result);
+              entry.finish(invalidSession ? sessionUnavailable() : frame.ok ? null : receiveError(frame.error, secret), frame.result);
+            }
             return; // Timed-out and cancelled response IDs are never reused.
           }
           disconnect(current, 'WORKER_PROTOCOL_ERROR');
@@ -270,7 +293,7 @@ export function createWorkerBridge({ secret, logger = console, trustProxy = fals
         return reject(new BridgeError('The request cancellation options are invalid.', 'WORKER_INVALID_REQUEST', 400));
       }
       if (signal?.aborted) return reject(new BridgeError('The worker request was cancelled.', 'WORKER_CANCELLED', 400));
-      if (!fresh() || !worker.ready) return reject(unavailable());
+      if (!fresh() || !SESSION_METHODS.has(method) && !worker.ready) return reject(SESSION_METHODS.has(method) ? sessionUnavailable() : unavailable());
       if (pending.size >= pendingLimit) return reject(new BridgeError('The audio worker is busy. Please try again shortly.', 'WORKER_BUSY'));
       const connection = worker.socket;
       const id = randomUUID();
@@ -323,6 +346,12 @@ export function createWorkerBridge({ secret, logger = console, trustProxy = fals
   };
   return {
     bot,
+    sessionStorage: {
+      get: sid => rpc('sessionGet', [sid]),
+      set: (sid, record) => rpc('sessionSet', [sid, record]),
+      take: sid => rpc('sessionTake', [sid]),
+      destroy: sid => rpc('sessionDestroy', [sid]),
+    },
     attach(httpServer) {
       if (closed) throw new Error('The worker bridge is closed.');
       if (server) throw new Error('The worker bridge is already attached.');
@@ -334,12 +363,15 @@ export function createWorkerBridge({ secret, logger = console, trustProxy = fals
 }
 
 /** Worker-side connection. Its lifecycle is intentionally independent from the Discord bot. */
-export function connectWorker({ url, secret, bot, spotifyEnabled = false, logger = console, heartbeatMs,
+export function connectWorker({ url, secret, bot, sessionStorage, spotifyEnabled = false, logger = console, heartbeatMs,
   heartbeatTimeoutMs, reconnectMinMs, reconnectMaxMs, handshakeTimeoutMs, readTimeoutMs,
   requestTimeoutMs, maxPending, now = Date.now, random = Math.random } = {}) {
   validateSecret(secret);
   const endpoint = workerUrl(url);
   if (!bot || typeof bot.isReady !== 'function') throw new Error('The worker needs a Discord bot with isReady().');
+  if (sessionStorage !== undefined && (!sessionStorage || !['get', 'set', 'take', 'destroy'].every(method => typeof sessionStorage[method] === 'function'))) {
+    throw new Error('Session storage must implement get, set, take, and destroy.');
+  }
   const heartbeatInterval = duration(heartbeatMs, 15_000);
   const heartbeatTimeout = duration(heartbeatTimeoutMs, 45_000);
   const minimumRetry = duration(reconnectMinMs, 1000);
@@ -423,9 +455,14 @@ export function connectWorker({ url, secret, bot, spotifyEnabled = false, logger
       if (!validArguments(method, args)) return reply(id, null, new BridgeError('The worker request arguments are invalid.', 'WORKER_INVALID_REQUEST', 400));
       if (!remember(id)) return reply(id, null, new BridgeError('This worker request has already been received. Refresh the queue before trying again.', 'WORKER_DUPLICATE_REQUEST', 409));
       if (executing.size >= pendingLimit) return reply(id, null, new BridgeError('The audio worker is busy. Please try again shortly.', 'WORKER_BUSY'));
-      let ready = false;
-      try { ready = bot.isReady() === true; } catch { /* Readiness is checked again for every call. */ }
-      if (!ready) return reply(id, null, unavailable());
+      const sessionCall = SESSION_METHODS.has(method);
+      if (sessionCall) {
+        if (!sessionStorage) return reply(id, null, sessionUnavailable());
+      } else {
+        let ready = false;
+        try { ready = bot.isReady() === true; } catch { /* Readiness is checked again for every call. */ }
+        if (!ready) return reply(id, null, unavailable());
+      }
       const controller = new AbortController();
       const task = { connection, cancelled: false, cancel() {
         if (task.cancelled) return;
@@ -448,13 +485,19 @@ export function connectWorker({ url, secret, bot, spotifyEnabled = false, logger
           case 'request': result = await bot.request(args[0], args[1], args[2], args[3] ?? undefined, { signal: controller.signal }); break;
           case 'join': result = await bot.join(args[0], args[1], args[2] ?? undefined); break;
           case 'control': result = await bot.control(args[0], args[1], args[2], args[3] ?? undefined); break;
+          case 'sessionGet': result = await sessionStorage.get(args[0]); break;
+          case 'sessionSet': result = await sessionStorage.set(args[0], args[1]); break;
+          case 'sessionTake': result = await sessionStorage.take(args[0]); break;
+          case 'sessionDestroy': result = await sessionStorage.destroy(args[0]); break;
         }
+        if (sessionCall && !validSessionResult(method, result)) throw sessionUnavailable();
         if (!task.cancelled) reply(id, result);
       } catch (error) {
         if (!task.cancelled) {
-          const exposed = publicError(error, secret);
+          const safeError = sessionCall ? sessionUnavailable() : error;
+          const exposed = publicError(safeError, secret);
           log(logger, method, exposed.code);
-          reply(id, null, error);
+          reply(id, null, safeError);
         }
       } finally {
         clearTimeout(timeout);

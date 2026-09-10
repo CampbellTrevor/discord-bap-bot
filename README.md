@@ -10,7 +10,7 @@ The current service uses a public-repository connection. Push changes to GitHub,
 
 ## What works
 
-- Discord sign-in and server selection; only members of a server can see or change its queue.
+- Discord sign-in lasts up to 30 days with persistent storage; only members of a server can see or change its queue.
 - Switch between **Cassette** (orange hardware, with light and dark modes) and **Winamp** (silver player and green display). The browser remembers both your theme and Cassette mode; switching never changes playback or signs you out.
 - Request a **YouTube video or playlist**, **Spotify track or accessible playlist**, or **song title** from the website or `/play`.
 - Website song searches show up to five results in YouTube and Spotify tabs. Choose **Add** on a result to queue that recording; searching alone never queues a song. Direct track and playlist links still import immediately. Spotify selections use YouTube for audio.
@@ -80,7 +80,9 @@ The authorization is shared by this bot: server members with a playlist link can
 
 The Docker image includes Node, FFmpeg, yt-dlp/EJS, Opus, and Discord voice encryption support. Redeploy with a cleared build cache when you need a fresh yt-dlp release. The npm dependencies are pinned by `package-lock.json`.
 
-Use **one instance**: bot voice state and sessions live in that process; queues persist in `/var/data/queues.json` on the mounted disk. A restart signs web users out and disconnects voice, while preserving requests for the next `/join`. A disk also means deployments briefly interrupt service. Scaling horizontally would require shared storage and an assigned voice worker per guild.
+Use **one instance**: queues persist in `/var/data/queues.json`, and encrypted web sessions persist in `/var/data/.portal-sessions.json`. Keep `SESSION_SECRET` stable so existing sign-ins remain readable. A worker restart disconnects voice while preserving requests for the next `/join`. A disk also means deployments briefly interrupt service. Scaling horizontally would require shared storage and an assigned voice worker per guild.
+
+For a free Render portal with playback and storage on a separate VM, follow [Audio worker hosting](docs/vm-hosting.md). The portal stores encrypted session records on the worker's persistent disk through its authenticated connection. The session encryption key stays on Render; restarting either process preserves sign-ins, and logging out revokes the session. If the worker is temporarily unavailable, sign-in requests return a retryable error without clearing the browser cookie.
 
 [Render free services sleep after 15 minutes without inbound traffic and do not offer persistent disks](https://render.com/docs/free), so the blueprint uses a paid service. Discord voice needs outbound UDP. Hosting networks and YouTube can reject media requests; live playback must be checked from the actual Render host. This app reports failures and advances the queue, and does not bypass provider sign-in requirements or restrictions.
 
