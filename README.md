@@ -6,7 +6,7 @@ A Discord music bot and web song request portal. Run them together, or keep the 
 
 The current service uses a public-repository connection. Push changes to GitHub, then deploy the latest commit from Render's Dashboard or CLI. For automatic deployments, connect the repository through Render's GitHub integration or configure a service-specific deploy hook. See [Render deployment options](https://render.com/docs/deploys).
 
-**Playback hosting:** YouTube currently rejects audio requests from our Render instance. A paid Render plan does not establish that playback will work. See [VM options, testing, and worker deployment](docs/vm-hosting.md). The worker support is prepared; a VM must pass a real audio and Discord voice test before migration is considered successful.
+**Playback hosting:** YouTube currently rejects audio requests from our Render instance. A paid Render plan does not establish that playback will work. See [VM options, testing, and worker deployment](docs/vm-hosting.md). The portal now runs on Render and the audio worker runs on the RamNode LAX VM. Public YouTube audio and Spotify matching passed host probes; listening in Discord is the final playback check.
 
 ## What works
 
@@ -14,12 +14,12 @@ The current service uses a public-repository connection. Push changes to GitHub,
 - Switch between **Cassette** (orange hardware, with light and dark modes) and **Winamp** (silver player and green display). The browser remembers both your theme and Cassette mode; switching never changes playback or signs you out.
 - Request a **YouTube video or playlist**, **Spotify track or accessible playlist**, or **song title** from the website or `/play`.
 - Website song searches show up to five results in YouTube and Spotify tabs. Choose **Add** on a result to queue that recording; searching alone never queues a song. Direct track and playlist links still import immediately. Spotify selections use YouTube for audio.
-- Discord voice playback, now playing, live queue updates, pause/resume, skip, shuffle, stop, and remove your own requests.
+- Discord voice playback, now playing, live queue updates, pause/resume, skip, shuffle, move a waiting song to the top, stop, and remove your own requests.
 - Server managers and the optional DJ role can control playback remotely. Other members control playback from the bot's voice channel.
 - Pending songs and the interrupted song survive restarts with a persistent disk. `/join` reconnects and resumes the saved queue, restarting the interrupted song from the beginning.
 - The bot disconnects after five minutes with nothing playing or queued.
 
-**Spotify provides track information; the bot searches YouTube for playback.** This is not direct Spotify audio streaming, and a match can be a different recording. Use the exact YouTube link when the recording matters. Albums, livestreams, private YouTube videos, and shortened Spotify redirect links are unsupported.
+**Spotify provides track information; the bot searches YouTube for playback.** Search favors studio recordings and filters identifiable live performances. Spotify matching checks title, artist, duration, and recording labels; if no suitable studio recording is found, it asks for a specific YouTube link. Explicit links and explicitly selected live versions are honored. Unlabeled performances can still slip through. Use the exact YouTube link when the recording matters. Albums, livestreams, private YouTube videos, and shortened Spotify redirect links are unsupported.
 
 ## Playlists and shuffle
 
@@ -27,7 +27,7 @@ Paste a YouTube playlist URL such as `https://www.youtube.com/playlist?list=PLAY
 
 The default import inspects the first **50 playlist entries**, preserving their order. Invalid, unavailable, live, and overlong entries are skipped and reported. Entries whose duration YouTube omits are checked before playback. Notices explain import limits and skipped entries. `MAX_PLAYLIST_TRACKS` can be configured from 1 to 100; the queue must have room for the complete accepted batch or the request adds nothing. Spotify playlist access is described below.
 
-Use **Shuffle** in either theme or `/shuffle` in Discord to randomize waiting songs. The current song keeps playing; shuffle requires at least two waiting songs and the same permissions as skip/pause.
+Use **Shuffle** in either theme or `/shuffle` in Discord to randomize waiting songs. The current song keeps playing; shuffle requires at least two waiting songs and the same permissions as skip/pause. The up-arrow next to a waiting song moves it to the top with those same permissions.
 
 ## Try the portal locally
 
@@ -106,7 +106,7 @@ To activate an existing preview, add all three Discord credentials, explicitly s
 
 ## Configuration and verification
 
-`.env.example` lists all options. Defaults: 100 total songs per server, first 50 playlist entries per import, 30 minutes per track, five-minute idle disconnect. Request endpoints have rate limits; media extraction has bounded concurrency/timeouts. OAuth uses one-time state, server sessions, CSRF protection, and live Discord membership/permission checks.
+`.env.example` lists all options. Defaults: 2,000 total songs per server (including the current track), first 50 playlist entries per import, 60 minutes per track, five-minute idle disconnect. Request endpoints have rate limits; media extraction has bounded concurrency/timeouts. OAuth uses one-time state, server sessions, CSRF protection, and live Discord membership/permission checks.
 
 ```sh
 npm run check
@@ -117,3 +117,12 @@ npm run doctor
 The automated suite tests actual HTTP authentication/CSRF flows, provider parsing and errors with offline doubles, queue ordering, pause/skip cancellation, authorization, and disk restoration. It does not substitute for a real Discord voice and Render playback test. No account credentials are included.
 
 Layout: `src/app.mjs` (HTTP/OAuth), `src/discord.mjs` (Discord/policies), `src/music.mjs` (queues), `src/media.mjs` (providers), `public/` (portal), `render.yaml` and `Dockerfile` (hosting).
+
+
+## Preloading and playback host performance
+
+The worker warms the next two waiting audio sources during the final two minutes of the current track. It keeps at most two speculative sources across all servers, with bounded in-memory prefixes and five-minute expiry. Playback has priority; queue changes discard stale sources, and a missing or failed preload falls back to a normal source open. This reduces source startup delay; Discord decoding and voice transport can still add a gap.
+
+Server managers and DJs can expand **PLAYBACK HOST** below the queue in either theme. The worker samples every five seconds and retains 24 hours of minute aggregates in `DATA_DIR/.host-metrics.json`, saving at most once a minute. The panel refreshes every 15 seconds while open and shows five-minute history with peaks, CPU busy/steal/I/O wait, host RAM/swap, worker memory limits, CPU throttling, OOM counters, and disk space. It also records foreground audio-source startup waits, preload usage, and fixed error codes. Startup timing is not the audible gap between songs. Recent samples from the final unsaved minute may be lost on restart.
+
+Compare slow starts against CPU peaks, low available RAM, swap, throttling, or OOM events. Slow sources without corresponding resource pressure point toward provider/network delays, but these readings alone do not prove a cause. Container measurements include the bot, extractor, and FFmpeg children. No performance data contains request titles or user identities.

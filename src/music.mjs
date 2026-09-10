@@ -2,10 +2,13 @@ import { EventEmitter } from 'node:events';
 import { randomInt, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 import { MediaError } from './media.mjs';
 
 const SAFE_RUNTIME_CODES = new Set(['ENOENT', 'EPIPE', 'ECONNRESET', 'ETIMEDOUT', 'ABORT_ERR', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END', 'ERR_MODULE_NOT_FOUND', 'ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_OUT_OF_RANGE']);
 const SAFE_ERROR_TYPES = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError', 'TimeoutError', 'AudioPlayerError']);
+const SOURCE_METRIC_CODES = new Set(['AUDIO_SOURCE_FAILED', 'MEDIA_CANCELLED', 'MEDIA_BUSY', 'MEDIA_TIMEOUT', 'MEDIA_UNAVAILABLE', 'INVALID_MEDIA', 'UNSUPPORTED_MEDIA', 'TRACK_TOO_LONG', 'YOUTUBE_REQUEST_BLOCKED', 'YOUTUBE_RATE_LIMITED', 'YOUTUBE_RESTRICTED', 'YOUTUBE_FORMAT_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'EXTRACTOR_UNAVAILABLE']);
+for (const code of ['SPOTIFY_NOT_FOUND', 'SPOTIFY_UNAVAILABLE', 'SPOTIFY_QUOTA_EXCEEDED', 'SPOTIFY_RATE_LIMITED', 'SPOTIFY_REAUTHORIZE', 'SPOTIFY_UNAUTHORIZED', 'SPOTIFY_FORBIDDEN', 'SPOTIFY_AUTH_STORAGE', 'SPOTIFY_NOT_CONFIGURED', 'SPOTIFY_PLAYLIST_ACCESS']) SOURCE_METRIC_CODES.add(code);
 
 function failureDetails(error, fallbackCode) {
   const media = error instanceof MediaError ? error : error?.cause instanceof MediaError ? error.cause : null;
@@ -31,7 +34,7 @@ export function musicError(message, status = 400) {
 
 /** Shared queue state. Voice and media adapters are injected so transitions can be tested offline. */
 export class MusicManager extends EventEmitter {
-  constructor({ media, dataDir, maxQueueSize = 100, idleDisconnectMs = 300_000, logger = console, randomIndex = randomInt }) {
+  constructor({ media, dataDir, maxQueueSize = 2000, idleDisconnectMs = 300_000, logger = console, randomIndex = randomInt, preloadCount = 2, preloadLeadSec = 120, preloadTtlMs = 300_000 }) {
     super();
     this.media = media;
     this.file = path.join(dataDir, 'queues.json');
@@ -43,6 +46,12 @@ export class MusicManager extends EventEmitter {
     this.writes = Promise.resolve();
     this.cleaned = new WeakSet();
     this.shuttingDown = false;
+    if (!Number.isInteger(preloadCount) || preloadCount < 0 || preloadCount > 2) throw new Error('preloadCount must be from 0 to 2.');
+    if (!Number.isFinite(preloadLeadSec) || preloadLeadSec < 0 || !Number.isSafeInteger(preloadTtlMs) || preloadTtlMs < 1) throw new Error('Preload timing values are invalid.');
+    this.preloadCount = preloadCount;
+    this.preloadLeadSec = preloadLeadSec;
+    this.preloadTtlMs = preloadTtlMs;
+    this.preloadEntries = new Set();
   }
 
   state(guildId) {
@@ -52,6 +61,7 @@ export class MusicManager extends EventEmitter {
         guildId, tracks: [], nowPlaying: null, channelId: null, channelName: null,
         transport: null, generation: 0, opened: null, abort: null,
         paused: false, opening: false, lastError: null, idleTimer: null,
+        preloads: new Map(), preloadTimer: null, retryingTrackId: null,
       };
       this.states.set(guildId, state);
     }
@@ -144,6 +154,7 @@ export class MusicManager extends EventEmitter {
     state.transport = null;
     state.channelId = null;
     state.channelName = null;
+    this.syncPreloads();
     this.clearIdle(state);
     if (error) state.lastError = 'The voice connection ended. Join a voice channel to continue the saved queue.';
     try { transport?.destroy(); } catch (cause) { this.logFailure('voice-cleanup', cause, 'VOICE_CLEANUP_FAILED'); }
@@ -175,6 +186,12 @@ export class MusicManager extends EventEmitter {
           [state.tracks[index], state.tracks[other]] = [state.tracks[other], state.tracks[index]];
         }
         break;
+      case 'move-top': {
+        const index = state.tracks.findIndex(track => track.id === trackId);
+        if (index < 0) throw musicError('That song is no longer in the waiting queue.', 404);
+        if (index > 0) state.tracks.unshift(...state.tracks.splice(index, 1));
+        break;
+      }
       case 'stop':
         state.tracks = [];
         this.cancelCurrent(state);
@@ -192,6 +209,7 @@ export class MusicManager extends EventEmitter {
       default:
         throw musicError('Unknown playback action.');
     }
+    this.syncPreloads();
     await this.persist();
     this.changed(state);
     this.schedule(state);
@@ -204,6 +222,7 @@ export class MusicManager extends EventEmitter {
   }
 
   schedule(state) {
+    this.syncPreloads();
     if (this.shuttingDown || !state.transport || state.nowPlaying) return;
     if (!state.tracks.length) {
       if (!state.idleTimer && this.idleDisconnectMs > 0) {
@@ -230,20 +249,67 @@ export class MusicManager extends EventEmitter {
     state.nowPlaying = state.tracks.shift();
     state.opening = true;
     state.paused = false;
-    state.abort = new AbortController();
     const track = state.nowPlaying;
+    const cached = state.preloads.get(track.id);
+    const usePreload = cached?.status === 'ready' && !cached.opened.stream.destroyed && cached.expiresAt > Date.now() && state.retryingTrackId !== track.id;
+    let releasedSpeculation = false;
+    state.retryingTrackId = null;
+    if (usePreload) {
+      state.preloads.delete(track.id);
+      this.preloadEntries.delete(cached);
+      clearTimeout(cached.timer);
+      cached.opened.stream.off('error', cached.onError);
+      cached.status = 'playing';
+      state.abort = cached.controller;
+    } else {
+      if (cached) { releasedSpeculation = cached.status !== 'failed'; this.dropPreload(state, cached); }
+      // A cold foreground source has priority over every speculative extractor.
+      for (const other of this.states.values()) {
+        for (const entry of [...other.preloads.values()]) if (entry.status !== 'failed') { releasedSpeculation = true; this.dropPreload(other, entry); }
+      }
+      state.abort = new AbortController();
+    }
     const signal = state.abort.signal;
     this.changed(state);
     this.persistBackground(state);
     let opened;
     let operation = 'media-open';
     let streamFailure;
+    let streamFailureElapsed;
+    const sourceStarted = performance.now();
+    let metricRecorded = false;
+    const metric = (outcome, error) => {
+      if (metricRecorded) return;
+      metricRecorded = true;
+      const code = signal.aborted ? 'MEDIA_CANCELLED' : failureDetails(error, 'AUDIO_SOURCE_FAILED').code;
+      try { this.emit('playbackMetric', { outcome, durationMs: Math.max(0, performance.now() - sourceStarted), preloaded: Boolean(usePreload), ...(outcome === 'error' ? { code: SOURCE_METRIC_CODES.has(code) || SAFE_RUNTIME_CODES.has(code) ? code : 'AUDIO_SOURCE_FAILED' } : {}) }); } catch {}
+    };
     try {
-      opened = await this.media.open(track, { signal });
+      if (usePreload) opened = cached.opened;
+      else {
+        for (let attempt = 0; ; attempt += 1) {
+          signal.throwIfAborted();
+          try { opened = await this.media.open(track, { signal }); break; }
+          catch (error) {
+            if (!releasedSpeculation || !(error instanceof MediaError) || error.code !== 'MEDIA_BUSY' || error.retryableBeforeStart !== true || attempt >= 4) throw error;
+            // Only a no-provider-work-yet capacity failure is retryable. Killed
+            // children release slots asynchronously; allow at most 750ms.
+            await new Promise((resolve, reject) => {
+              const abort = () => { clearTimeout(timer); reject(signal.reason); };
+              const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, 50 * 2 ** attempt);
+              signal.addEventListener('abort', abort, { once: true });
+              if (signal.aborted) abort();
+            });
+          }
+        }
+      }
       if (state.generation !== generation || this.shuttingDown || state.transport !== transport) {
+        metric('error');
         this.cleanup(opened);
         return;
       }
+      if (opened.stream.destroyed) throw new MediaError('The audio source ended before playback could start.', 'MEDIA_UNAVAILABLE');
+      metric('ready');
       if (track.source === 'youtube' && track.needsValidation && opened.track) {
         // Playlist discovery can omit duration. Media validates before playback;
         // enrich only display fields, retaining request ownership and source identity.
@@ -256,12 +322,29 @@ export class MusicManager extends EventEmitter {
       state.opening = false;
       // @discordjs/voice wraps stream failures and drops their original code/cause.
       // Capture the adapter's typed error before that wrapper or an Idle event wins.
-      const captureStreamFailure = error => { streamFailure = error; };
+      const captureStreamFailure = error => {
+        streamFailure = error;
+        // Idle removes the transport's resource. Capture timing while the
+        // original stream error still belongs to the resource that failed.
+        streamFailureElapsed = Math.max(0, transport.elapsedSec?.() || 0);
+      };
       opened.stream.once('error', captureStreamFailure);
       opened.stream.once('close', () => opened.stream.off('error', captureStreamFailure));
       const finish = error => {
         if (state.generation !== generation) return;
         const failure = streamFailure || error;
+        const failedAfter = streamFailureElapsed ?? (error?.resource?.playbackDuration == null ? NaN : error.resource.playbackDuration / 1000);
+        if (failure && usePreload && failedAfter < 2) {
+          // A parked provider connection can fail only after its prefix drains.
+          // Retry that same request once from a fresh source, before advancing.
+          state.tracks.unshift(track);
+          this.cancelCurrent(state);
+          state.retryingTrackId = track.id;
+          this.persistBackground(state);
+          this.changed(state);
+          this.schedule(state);
+          return;
+        }
         if (failure) this.playbackFailure(state, track, failure, 'audio-playback');
         this.cancelCurrent(state);
         this.persistBackground(state);
@@ -272,15 +355,118 @@ export class MusicManager extends EventEmitter {
       transport.play(opened, () => finish(), error => finish(error));
       if (state.paused) transport.pause();
       this.changed(state);
+      this.syncPreloads();
     } catch (error) {
+      metric('error', error);
       this.cleanup(opened);
       if (state.generation !== generation || this.shuttingDown) return;
+      if (usePreload && (operation === 'media-open' || streamFailure)) {
+        state.tracks.unshift(track);
+        this.cancelCurrent(state);
+        state.retryingTrackId = track.id;
+        this.persistBackground(state);
+        this.changed(state);
+        this.schedule(state);
+        return;
+      }
       this.playbackFailure(state, track, streamFailure || error, operation);
       this.cancelCurrent(state);
       this.persistBackground(state);
       this.changed(state);
       this.schedule(state);
     }
+  }
+
+  dropPreload(state, entry) {
+    if (state.preloads.get(entry.id) === entry) state.preloads.delete(entry.id);
+    this.preloadEntries.delete(entry);
+    clearTimeout(entry.timer);
+    entry.status = 'cancelled';
+    entry.controller.abort();
+    this.cleanup(entry.opened);
+  }
+
+  syncPreloads() {
+    let foreground = 0;
+    for (const state of this.states.values()) {
+      if (state.transport && state.nowPlaying) foreground += 1;
+      clearTimeout(state.preloadTimer);
+      state.preloadTimer = null;
+      const wanted = new Set(!this.shuttingDown && state.transport ? state.tracks.slice(0, this.preloadCount).map(track => track.id) : []);
+      for (const entry of [...state.preloads.values()]) {
+        if (!wanted.has(entry.id) || entry.status === 'failed' && entry.generation !== state.generation) this.dropPreload(state, entry);
+      }
+    }
+    // Reserve one of media's four extractor slots for interactive lookups.
+    const budget = Math.min(this.preloadCount, Math.max(0, 3 - foreground));
+    while (this.preloadEntries.size > budget) {
+      const entry = [...this.preloadEntries].at(-1);
+      this.dropPreload(entry.state, entry);
+    }
+    for (const state of this.states.values()) {
+      if (this.shuttingDown || !state.transport || !state.nowPlaying || state.opening || state.paused || !this.preloadCount) continue;
+      const elapsed = Math.max(0, state.transport.elapsedSec?.() || 0);
+      const remaining = Number(state.nowPlaying.durationSec) - elapsed;
+      if (Number.isFinite(remaining) && remaining > this.preloadLeadSec) {
+        state.preloadTimer = setTimeout(() => this.syncPreloads(), Math.max(1, (remaining - this.preloadLeadSec) * 1000));
+        state.preloadTimer.unref?.();
+        continue;
+      }
+      for (const track of state.tracks.slice(0, this.preloadCount)) {
+        if (this.preloadEntries.size >= budget) break;
+        if (state.preloads.has(track.id)) continue;
+        this.startPreload(state, track);
+      }
+    }
+  }
+
+  startPreload(state, track) {
+    const entry = { id: track.id, state, generation: state.generation, status: 'opening', controller: new AbortController(), opened: null, timer: null, expiresAt: 0, onError: null };
+    state.preloads.set(entry.id, entry);
+    this.preloadEntries.add(entry);
+    const current = () => !this.shuttingDown && state.transport && state.preloads.get(entry.id) === entry && state.tracks.slice(0, this.preloadCount).some(item => item.id === entry.id);
+    const failed = error => {
+      if (!current() || ['cancelled', 'playing', 'failed'].includes(entry.status)) return;
+      entry.status = 'failed';
+      this.preloadEntries.delete(entry);
+      clearTimeout(entry.timer);
+      entry.controller.abort();
+      this.cleanup(entry.opened);
+      this.logFailure('audio-preload', error, 'AUDIO_SOURCE_FAILED');
+      // Keep the failed marker for this track/current-song pair. No retry loop.
+    };
+    void Promise.resolve().then(async () => {
+      entry.controller.signal.throwIfAborted();
+      const raw = await this.media.open(track, { signal: entry.controller.signal });
+      if (!current() || entry.status !== 'opening') { this.cleanup(raw); return; }
+      const buffer = new PassThrough({ readableHighWaterMark: 256 * 1024, writableHighWaterMark: 16 * 1024 });
+      buffer.on('error', () => {}); // The active owner supplies the actionable handler.
+      const sourceError = error => buffer.destroy(error);
+      const sourceClose = () => {
+        if (!raw.stream.readableEnded && !buffer.destroyed) buffer.destroy(new MediaError('The preloaded audio source closed early.', 'MEDIA_UNAVAILABLE'));
+      };
+      raw.stream.once('error', sourceError);
+      raw.stream.once('close', sourceClose);
+      entry.opened = { ...raw, stream: buffer, cleanup: () => {
+        raw.stream.unpipe(buffer);
+        raw.stream.off('error', sourceError);
+        raw.stream.off('close', sourceClose);
+        this.cleanup(raw);
+        buffer.destroy();
+      } };
+      entry.onError = failed;
+      buffer.once('error', entry.onError);
+      entry.status = 'ready';
+      entry.expiresAt = Date.now() + this.preloadTtlMs;
+      entry.timer = setTimeout(() => {
+        if (!current() || entry.status !== 'ready') return;
+        failed(new MediaError('The preloaded audio expired before playback.', 'MEDIA_UNAVAILABLE'));
+        this.syncPreloads();
+      }, this.preloadTtlMs);
+      entry.timer.unref?.();
+      raw.stream.pipe(buffer);
+      if (raw.stream.destroyed && !raw.stream.readableEnded) sourceClose();
+    }).catch(failed);
   }
 
   playbackFailure(state, track, error, operation) {
@@ -306,6 +492,7 @@ export class MusicManager extends EventEmitter {
     state.nowPlaying = null;
     state.opening = false;
     state.paused = false;
+    state.retryingTrackId = null;
     try { state.transport?.stop(); } catch (error) { this.logFailure('audio-stop', error, 'AUDIO_STOP_FAILED'); }
     this.cleanup(opened);
   }
@@ -350,6 +537,7 @@ export class MusicManager extends EventEmitter {
 
   async shutdown() {
     this.shuttingDown = true;
+    this.syncPreloads();
     for (const state of this.states.values()) {
       if (state.nowPlaying) state.tracks.unshift(state.nowPlaying);
       this.cancelCurrent(state);

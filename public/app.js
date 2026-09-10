@@ -15,6 +15,7 @@ const state = {
   pollCount: 0,
   feedbackTimer: null,
   search: { query: '', source: 'youtube', results: [], pending: false, revision: 0, controller: null, cache: new Map(), added: new Set(), context: '' },
+  performance: { context: '', revision: 0, controller: null, pending: false, lastAttempt: 0, blockedContext: '', snapshot: null },
 };
 
 function directRequest(query) {
@@ -259,6 +260,197 @@ function appendText(parent, tag, className, value) {
   return node;
 }
 
+function performanceContext() {
+  return state.session?.user && state.session.configured && !state.session.demo && state.guildId && state.detail?.member?.canManage === true
+    ? JSON.stringify([state.session.user.id, state.guildId]) : '';
+}
+
+function cancelPerformance() {
+  const performance = state.performance;
+  performance.revision++;
+  performance.controller?.abort();
+  performance.controller = null;
+  performance.pending = false;
+  $('performance-panel').setAttribute('aria-busy', 'false');
+}
+
+function clearPerformance() {
+  cancelPerformance();
+  state.performance.snapshot = null;
+  state.performance.lastAttempt = 0;
+  $('performance-panel').open = false;
+  $('performance-content').hidden = true;
+  $('performance-grid').replaceChildren();
+  $('performance-chart').replaceChildren();
+  $('performance-errors').replaceChildren();
+  $('performance-status').textContent = 'Loading host metrics…';
+  $('performance-status').classList.remove('error');
+}
+
+function syncPerformance() {
+  const context = performanceContext();
+  if (context !== state.performance.context) {
+    clearPerformance();
+    state.performance.context = context;
+    state.performance.blockedContext = '';
+  }
+  $('performance-panel').hidden = !context || state.performance.blockedContext === context;
+}
+
+const metricNumber = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+const metricPercent = value => metricNumber(value) ? `${value.toFixed(1)}%` : '—';
+const metricCount = value => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString() : '—';
+function metricBytes(value) {
+  if (!metricNumber(value)) return '—';
+  return value >= 1024 ** 3 ? `${(value / 1024 ** 3).toFixed(1)} GiB` : `${Math.round(value / 1024 ** 2)} MiB`;
+}
+function metricTime(value) {
+  if (!metricNumber(value)) return '—';
+  return value >= 1000 ? `${(value / 1000).toFixed(2)} s` : `${Math.round(value)} ms`;
+}
+
+function drawPerformanceChart(snapshot) {
+  const svg = $('performance-chart');
+  svg.replaceChildren();
+  const end = metricNumber(snapshot.sampledAt) ? snapshot.sampledAt : Date.now();
+  const start = end - 86400000;
+  const history = snapshot.history.slice(-288).filter(point => point && metricNumber(point.at) && point.at >= start - 300000 && point.at <= end).sort((a, b) => a.at - b.at);
+  const node = (tag, attrs = {}, text) => {
+    const element = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (const [key, value] of Object.entries(attrs)) element.setAttribute(key, String(value));
+    if (text !== undefined) element.textContent = text;
+    svg.append(element);
+    return element;
+  };
+  for (const value of [0, 50, 100]) {
+    const y = 151 - value * 1.3;
+    node('line', { x1: 40, y1: y, x2: 707, y2: y, class: 'performance-gridline' });
+    node('text', { x: 31, y: y + 4, 'text-anchor': 'end', class: 'performance-axis' }, `${value}%`);
+  }
+  node('text', { x: 40, y: 174, class: 'performance-axis' }, '−24H');
+  node('text', { x: 707, y: 174, 'text-anchor': 'end', class: 'performance-axis' }, 'NOW');
+  const ratio = (used, total) => metricNumber(used) && metricNumber(total) && total > 0 ? used / total * 100 : null;
+  const series = [
+    ['cpu', point => point.max?.hostCpuBusyPct],
+    ['steal', point => point.max?.hostCpuStealPct],
+    ['memory', point => metricNumber(point.min?.hostMemoryAvailableBytes) && metricNumber(point.max?.hostMemoryTotalBytes)
+      ? ratio(Math.max(0, point.max.hostMemoryTotalBytes - point.min.hostMemoryAvailableBytes), point.max.hostMemoryTotalBytes) : null],
+    ['worker', point => ratio(point.max?.containerMemoryBytes, point.min?.containerMemoryLimitBytes)],
+  ];
+  let hasData = false;
+  for (const [name, getValue] of series) {
+    let path = '', previousAt = null, lastPoint = null;
+    for (const point of history) {
+      const value = getValue(point);
+      if (!metricNumber(value)) { previousAt = null; continue; }
+      const x = Math.max(40, 40 + (point.at - start) / 86400000 * 667);
+      const y = 151 - Math.min(100, value) * 1.3;
+      path += `${previousAt === null || point.at - previousAt > 600000 ? 'M' : 'L'}${x.toFixed(2)},${y.toFixed(2)} `;
+      previousAt = point.at;
+      lastPoint = { x, y };
+      hasData = true;
+    }
+    if (path) node('path', { d: path.trim(), class: `performance-line performance-line-${name}` });
+    if (lastPoint) node('circle', { cx: lastPoint.x.toFixed(2), cy: lastPoint.y.toFixed(2), r: 2.5, class: `performance-point performance-point-${name}` });
+  }
+  $('performance-chart-empty').hidden = hasData;
+}
+
+function renderPerformance(snapshot) {
+  const sample = snapshot.latest || {};
+  const playback = snapshot.playback || {};
+  const grid = $('performance-grid');
+  grid.replaceChildren();
+  const card = (label, value, lines, title = '') => {
+    const item = appendText(grid, 'section', 'performance-card', '');
+    if (title) item.title = title;
+    appendText(item, 'h3', '', label);
+    appendText(item, 'strong', 'performance-value', value);
+    for (const line of lines) appendText(item, 'span', 'performance-detail', line);
+  };
+  card('VM CPU BUSY', metricPercent(sample.hostCpuBusyPct), [
+    `STEAL ${metricPercent(sample.hostCpuStealPct)} · I/O WAIT ${metricPercent(sample.hostCpuIowaitPct)}`,
+    `${metricCount(sample.hostCpuCores)} vCPU`,
+  ]);
+  card('VM RAM AVAILABLE', metricBytes(sample.hostMemoryAvailableBytes), [
+    `OF ${metricBytes(sample.hostMemoryTotalBytes)}`,
+    `SWAP ${metricBytes(sample.hostSwapUsedBytes)} / ${metricBytes(sample.hostSwapTotalBytes)}`,
+  ], sample.sources?.memory === 'os' ? 'OS fallback reports free RAM.' : 'Linux MemAvailable, including reclaimable memory.');
+  card('WORKER RAM', metricBytes(sample.containerMemoryBytes), [
+    `LIMIT ${metricBytes(sample.containerMemoryLimitBytes)}`,
+    `OOM KILLS ${metricCount(sample.containerOomKills)} · EVENTS ${metricCount(sample.containerOomEvents)}`,
+  ], 'Memory use and cumulative OOM counters for this worker container.');
+  card('THROTTLED PERIODS', metricPercent(sample.containerCpuThrottledPct), [
+    `CPU ${metricPercent(sample.containerCpuUsagePct)} OF 1 CORE`,
+    `${metricTime(sample.containerCpuThrottledMs)} THROTTLED / SAMPLE`,
+  ], 'Share of container scheduling periods that were throttled; CPU usage uses 100% per core.');
+  card('DISK FREE', metricBytes(sample.diskFreeBytes), [
+    `OF ${metricBytes(sample.diskTotalBytes)}`,
+    snapshot.persistence?.available === false ? 'HISTORY NOT SAVED' : '24H HISTORY',
+  ]);
+  card('SOURCE WAIT · 24H AVG', metricTime(playback.meanReadyMs), [
+    `P95 ≤ ${metricTime(playback.p95ReadyMsUpperBound)}`,
+    `${metricCount(playback.preloadedReady)} PRELOADED / ${metricCount(playback.ready)} STARTED`,
+  ], 'Time opening the audio source. P95 is a histogram upper bound; voice-gap timing is not measured.');
+  const errors = $('performance-errors');
+  errors.replaceChildren();
+  appendText(errors, 'strong', '', `${metricCount(playback.error)} ERRORS`);
+  appendText(errors, 'span', '', `${metricCount(playback.preloadedError)} PRELOADED`);
+  for (const error of (Array.isArray(playback.errors) ? playback.errors : []).slice(0, 17)) {
+    if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code || '') || !Number.isSafeInteger(error.count) || error.count < 0) continue;
+    appendText(errors, 'span', 'performance-error-code', `${error.code.replaceAll('_', ' ')} ${metricCount(error.count)}`);
+  }
+  drawPerformanceChart(snapshot);
+  $('performance-storage').hidden = snapshot.persistence?.available !== false;
+  $('performance-content').hidden = false;
+  const sampled = metricNumber(sample.at) && sample.at <= 8.64e15 ? new Date(sample.at) : null;
+  const stale = sampled && Date.now() - sample.at > 45000;
+  $('performance-status').textContent = sampled ? `${stale ? 'LAST SAMPLE' : 'UPDATED'} ${sampled.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : 'Collecting host readings…';
+  $('performance-status').classList.toggle('error', Boolean(stale));
+}
+
+async function pollPerformance(force = false) {
+  syncPerformance();
+  const panel = $('performance-panel');
+  const performance = state.performance;
+  if (document.hidden || panel.hidden || !panel.open || performance.pending || !performance.context
+      || !force && Date.now() - performance.lastAttempt < 15000) return;
+  const context = performance.context;
+  const revision = ++performance.revision;
+  const controller = new AbortController();
+  performance.controller = controller;
+  performance.pending = true;
+  performance.lastAttempt = Date.now();
+  const current = () => revision === performance.revision && context === performanceContext() && !panel.hidden && panel.open;
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  panel.setAttribute('aria-busy', 'true');
+  if (!performance.snapshot) $('performance-status').textContent = 'Loading host metrics…';
+  try {
+    const snapshot = await api(`/api/guilds/${encodeURIComponent(state.guildId)}/performance`, { signal: controller.signal });
+    if (!current()) return;
+    if (snapshot?.version !== 1 || !Array.isArray(snapshot.history) || snapshot.history.length > 288) throw new Error('Invalid host readings.');
+    performance.snapshot = snapshot;
+    renderPerformance(snapshot);
+  } catch (error) {
+    if (!current()) return;
+    if (error.status === 401 || error.status === 403) {
+      clearPerformance();
+      performance.blockedContext = context;
+      panel.hidden = true;
+    } else {
+      $('performance-status').textContent = 'Host readings unavailable · retrying';
+      $('performance-status').classList.add('error');
+    }
+  } finally {
+    clearTimeout(timeout);
+    if (revision === performance.revision) {
+      performance.pending = false;
+      performance.controller = null;
+      panel.setAttribute('aria-busy', 'false');
+    }
+  }
+}
+
 function renderAuth() {
   const session = state.session;
   const container = $('auth-container');
@@ -293,6 +485,7 @@ function renderAuth() {
         logout.disabled = true;
         try {
           await api('/auth/logout', { method: 'POST' });
+          clearPerformance();
           window.location.assign('/');
         } catch (error) {
           logout.disabled = false;
@@ -341,8 +534,10 @@ function renderSession() {
     $('notice-description').textContent = 'Add Turntable to a Discord server you belong to, then refresh this page to find it here.';
   }
   $('request-hint').textContent = session?.demo ? 'Local demo: requests do not play audio.' : session && !session.configured ? 'Song and playlist requests will be available after setup.' : session && !session.spotifyEnabled ? 'YouTube songs and playlists supported. Spotify requires server credentials.' : 'Spotify and YouTube songs or playlists. Imports join the end of the queue.';
+  if (session?.configured && !session.demo) $('request-hint').textContent += ' 2,000 tracks total · 60 min per track.';
   renderPlayer();
   renderEnabled();
+  syncPerformance();
 }
 
 function renderGuildSelect() {
@@ -394,7 +589,8 @@ function renderEnabled() {
   $('skip-button').disabled = !canControl || !queue?.nowPlaying;
   $('stop-button').disabled = !canControl || (!queue?.nowPlaying && !queue?.tracks?.length);
   $('shuffle-button').disabled = !canControl || (queue?.tracks?.length || 0) < 2;
-  for (const button of $('queue-list').querySelectorAll('button')) button.disabled = !ready;
+  for (const button of $('queue-list').querySelectorAll('.queue-remove')) button.disabled = !ready;
+  for (const button of $('queue-list').querySelectorAll('.queue-move')) button.disabled = !canControl || button.dataset.first === 'true';
   if (state.search.pending && (state.offline || !state.session?.botReady || !state.session?.user)) {
     cancelSearch(false);
     $('search-results-status').textContent = 'Search interrupted. Reconnect and try again.';
@@ -470,10 +666,11 @@ function renderQueue() {
   $('queue-list').hidden = !tracks.length;
   $('queue-note').hidden = !tracks.length;
   $('queue-empty-copy').textContent = !state.session?.user ? 'Connect Discord, select your server, and add a song.' : !state.guildId ? 'Add Turntable to a Discord server you belong to.' : state.detail?.queue?.nowPlaying ? 'No tracks waiting. Request the next song above.' : 'Paste a song or playlist link above, or search by name.';
-  const signature = JSON.stringify([tracks, state.session?.user?.id, state.detail?.member?.canManage]);
+  const signature = JSON.stringify([tracks, state.session?.user?.id, state.guildId, state.detail?.member?.canManage]);
   if (signature === state.queueSignature) return;
   state.queueSignature = signature;
   const list = $('queue-list');
+  const context = searchContext();
   list.replaceChildren();
   for (const [index, track] of tracks.entries()) {
     const item = document.createElement('li');
@@ -490,13 +687,23 @@ function renderQueue() {
     person.title = `Requested by ${track.requestedBy?.username || 'a listener'}`;
     appendText(requester, 'span', 'queue-item-source', track.source === 'spotify' ? 'Spotify' : 'YouTube');
     appendText(item, 'span', 'queue-item-duration', duration(track.durationSec));
+    const actions = appendText(item, 'div', 'queue-actions', '');
+    const move = appendText(actions, 'button', 'queue-move', '↑');
+    move.type = 'button';
+    move.dataset.first = String(index === 0);
+    move.setAttribute('aria-label', `Move ${track.title || 'track'} to the top of the queue`);
+    move.title = index === 0 ? 'Already next in queue' : 'Move to top';
+    move.addEventListener('click', () => {
+      if (index === 0 || !state.detail?.member?.canControl || context !== searchContext()) return;
+      return mutate('control', { action: 'move-top', trackId: track.id }, 'Song moved to the top of the queue.');
+    });
     if (state.detail?.member?.canManage || track.requestedBy?.id === state.session?.user?.id) {
-      const remove = appendText(item, 'button', 'queue-remove', '×');
+      const remove = appendText(actions, 'button', 'queue-remove', '×');
       remove.type = 'button';
       remove.setAttribute('aria-label', `Remove ${track.title || 'track'} from queue`);
       remove.title = 'Remove from queue';
       remove.addEventListener('click', () => mutate('control', { action: 'remove', trackId: track.id }, 'Song removed from the queue.'));
-    } else appendText(item, 'span', '', '');
+    }
     list.append(item);
   }
 }
@@ -506,6 +713,7 @@ function renderDetail() {
   renderPlayer();
   renderQueue();
   renderEnabled();
+  syncPerformance();
 }
 
 async function loadDetail({ silent = false } = {}) {
@@ -516,6 +724,7 @@ async function loadDetail({ silent = false } = {}) {
   if (guildId !== state.guildId || revision !== state.detailRevision) return;
   const oldError = state.detail?.queue?.lastError;
   state.detail = detail;
+  state.performance.blockedContext = '';
   state.sampleTime = Date.now();
   state.offline = false;
   renderSession();
@@ -527,8 +736,9 @@ async function initialize() {
   try {
     const session = await api('/api/session');
     const changedUser = state.session?.user?.id !== session.user?.id;
-    if (changedUser) { cancelSearch(); state.search.cache.clear(); }
+    if (changedUser) { cancelSearch(); state.search.cache.clear(); state.detail = null; clearPerformance(); }
     state.session = session;
+    syncPerformance();
     state.offline = false;
     renderAuth();
     if (session.user && session.botReady) {
@@ -614,6 +824,7 @@ $('request-form').addEventListener('submit', async (event) => {
 
 $('guild-select').addEventListener('change', async () => {
   cancelSearch();
+  clearPerformance();
   state.guildId = $('guild-select').value;
   saveGuild(state.guildId);
   state.detailRevision += 1;
@@ -655,6 +866,10 @@ $('pause-button').addEventListener('click', () => {
 $('skip-button').addEventListener('click', () => mutate('control', { action: 'skip' }, 'Skipped the current track.'));
 $('stop-button').addEventListener('click', () => mutate('control', { action: 'stop' }, 'Playback stopped and the queue cleared.'));
 $('shuffle-button').addEventListener('click', () => mutate('control', { action: 'shuffle' }, 'Shuffled the upcoming tracks.'));
+$('performance-panel').addEventListener('toggle', () => {
+  if ($('performance-panel').open) void pollPerformance(true);
+  else cancelPerformance();
+});
 $('now-art').referrerPolicy = 'no-referrer';
 $('now-art').addEventListener('error', () => {
   $('now-art').hidden = true;
@@ -680,7 +895,10 @@ async function poll() {
   } finally { state.polling = false; }
 }
 
-document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { poll(); void pollPerformance(true); }
+  else cancelPerformance();
+});
 window.addEventListener('online', poll);
 window.addEventListener('offline', () => { state.offline = true; renderSession(); });
 
@@ -707,3 +925,4 @@ if (authError) {
 initialize();
 setInterval(poll, 5000);
 setInterval(renderProgress, 1000);
+setInterval(pollPerformance, 15000);

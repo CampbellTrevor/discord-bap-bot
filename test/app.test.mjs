@@ -9,6 +9,23 @@ import { createDemoBot } from '../src/demo.mjs';
 import { BoundedSessionStore } from '../src/session-store.mjs';
 import { EncryptedSessionStore, FileSessionStorage } from '../src/persistent-session-store.mjs';
 
+test('move-top API preserves current playback and requires a queued track ID and CSRF', async t => {
+  const { request, config } = await fixture(t, { demo: true });
+  const { csrfToken } = await (await request('/api/session')).json();
+  const before = await (await request('/api/guilds/demo-guild')).json();
+  const endpoint = '/api/guilds/demo-guild/control';
+  const trackId = before.queue.tracks.at(-1).id;
+  const headers = { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken, Origin: config.publicUrl };
+  assert.equal((await request(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'move-top', trackId }) })).status, 403);
+  assert.equal((await request(endpoint, { method: 'POST', headers, body: JSON.stringify({ action: 'move-top' }) })).status, 400);
+  const response = await request(endpoint, { method: 'POST', headers, body: JSON.stringify({ action: 'move-top', trackId }) });
+  assert.equal(response.status, 200);
+  const { queue } = await response.json();
+  assert.equal(queue.tracks[0].id, trackId);
+  assert.equal(queue.nowPlaying.id, before.queue.nowPlaying.id);
+  assert.equal(queue.tracks.length, before.queue.tracks.length);
+});
+
 async function fixture(t, { demo = false, setup = false, bot = createDemoBot(), fetchImpl, store, env = {}, cookieValue = '' } = {}) {
   const config = loadConfig({ DISCORD_TOKEN: 'test-token', DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'test-secret', SETUP_MODE: String(setup), ...env }, { demo });
   const result = createApp({ config, bot, fetchImpl, store });

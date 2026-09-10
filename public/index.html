@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#eee7d8">
   <meta name="description" content="Request songs and playlists from Spotify or YouTube for your Discord voice channel.">
   <title>Turntable — Discord music queue</title>
-  <link rel="stylesheet" href="/styles.css?v=provider-search-1">
-  <script src="/app.js?v=provider-search-1" defer></script>
+  <link rel="stylesheet" href="/styles.css?v=host-performance-1">
+  <script src="/app.js?v=host-performance-1" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to player</a>
@@ -50,7 +50,7 @@
       <section class="request-panel" aria-label="Add a song or playlist">
         <div class="request-heading"><label for="request-query"><span class="label-block cassette-only" aria-hidden="true">B</span>REQUEST INPUT</label><span class="input-sources">SPOTIFY / YOUTUBE</span></div>
         <form id="request-form" class="request-form"><input id="request-query" name="query" type="text" placeholder="Search a song or paste a link" aria-label="Search song titles or paste a Spotify or YouTube song or playlist link" aria-describedby="request-hint" maxlength="500" autocomplete="off" required disabled><button id="request-button" type="submit" disabled><span>SEARCH</span></button></form>
-        <p class="request-hint" id="request-hint">Search by title, or paste a song or playlist link.</p>
+        <p class="request-hint" id="request-hint">Search by title, or paste a song or playlist link. 2,000 tracks total · 60 min per track.</p>
         <section class="search-results" id="search-results" aria-labelledby="search-results-heading" hidden>
           <header class="search-results-header"><h3 id="search-results-heading">SEARCH RESULTS</h3><button id="search-close" class="search-close" type="button" aria-label="Close search results">Close ×</button></header>
           <div class="search-source-tabs" role="tablist" aria-label="Search source"><button id="search-tab-youtube" type="button" data-search-source="youtube" role="tab" aria-controls="search-results-panel" aria-selected="true" tabindex="0">YouTube</button><button id="search-tab-spotify" type="button" data-search-source="spotify" role="tab" aria-controls="search-results-panel" aria-selected="false" tabindex="-1">Spotify</button></div>
@@ -66,9 +66,28 @@
         <div class="queue-empty" id="queue-empty"><strong>THE QUEUE IS EMPTY</strong><p id="queue-empty-copy">Connect Discord, select your server, and add a song.</p></div>
         <ol class="queue" id="queue-list" aria-label="Upcoming tracks; scroll for more songs" tabindex="0" hidden></ol>
         <footer class="queue-footer"><span>TOTAL RUN TIME</span><strong id="queue-duration">0:00</strong></footer>
-        <p class="queue-note" id="queue-note" hidden>First requested, first played. Shuffle changes upcoming tracks only.</p>
+        <p class="queue-note" id="queue-note" hidden>Move ↑ and shuffle reorder upcoming tracks.</p>
       </div>
     </section>
+
+    <details class="performance-window window" id="performance-panel" hidden>
+      <summary class="performance-heading"><span>PLAYBACK HOST</span><span class="performance-access">MANAGER / DJ</span></summary>
+      <div class="performance-body">
+        <div class="performance-meta"><span>LIVE HOST · 5 SEC SAMPLES</span><span id="performance-status" role="status" aria-live="polite">Loading host metrics…</span></div>
+        <div class="performance-content" id="performance-content" hidden>
+          <div class="performance-grid" id="performance-grid"></div>
+          <section class="performance-chart-wrap" aria-label="Host pressure history">
+            <div class="performance-chart-heading"><h3>24H PRESSURE</h3><span>5 MIN PEAKS</span></div>
+            <div class="performance-legend"><span class="legend-cpu">CPU BUSY</span><span class="legend-steal">CPU STEAL</span><span class="legend-memory">VM RAM USED</span><span class="legend-worker">WORKER RAM / LIMIT</span></div>
+            <svg class="performance-chart" id="performance-chart" viewBox="0 0 720 180" role="img" aria-label="Five-minute peaks for CPU use, CPU steal, VM memory use and worker memory use over the last 24 hours"></svg>
+            <p class="performance-chart-empty" id="performance-chart-empty" hidden>Collecting history…</p>
+          </section>
+          <div class="performance-source-note"><span>SOURCE STARTUP · 24H</span><span>Voice gaps are not measured</span></div>
+          <div class="performance-errors" id="performance-errors" aria-label="Source startup errors in the last 24 hours"></div>
+          <p class="performance-storage" id="performance-storage" hidden>History storage unavailable · live readings continue</p>
+        </div>
+      </div>
+    </details>
   </main>
   <footer class="page-footer"><span>TURNTABLE / TT–01</span><span>IN DISCORD: <code>/play</code> OR <code>/shuffle</code></span></footer>
 </div>

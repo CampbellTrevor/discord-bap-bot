@@ -52,7 +52,7 @@ export function authorizeJoin({ manager, voiceChannelId, targetChannelId, snapsh
   }
 }
 
-export function createBot({ config, media, logger = console }, dependencies = {}) {
+export function createBot({ config, media, metrics, logger = console }, dependencies = {}) {
   const client = dependencies.client ?? new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
   const music = dependencies.music ?? new MusicManager({ media, dataDir: config.dataDir, maxQueueSize: config.maxQueueSize, idleDisconnectMs: config.idleDisconnectMs, logger });
   const locks = new Map();
@@ -255,6 +255,12 @@ export function createBot({ config, media, logger = console }, dependencies = {}
       // Membership is checked before reading or returning any queue snapshot.
       const context = await api.context(guildId, userId);
       return { ...context, queue: music.snapshot(guildId) };
+    },
+    async performance(guildId, userId) {
+      const { manager } = await membership(guildId, userId);
+      if (!manager) throw musicError('Only a server manager or DJ can view host performance.', 403);
+      if (!metrics) throw musicError('Host performance is temporarily unavailable.', 503);
+      return metrics.getSnapshot();
     },
     async join(guildId, userId, channelId) {
       return locked(guildId, async () => joinAs(await membership(guildId, userId), channelId));

@@ -7,6 +7,7 @@ import { createBot } from './discord.mjs';
 import { createDemoBot } from './demo.mjs';
 import { createWorkerBridge, connectWorker } from './worker-bridge.mjs';
 import { EncryptedSessionStore, FileSessionStorage } from './persistent-session-store.mjs';
+import { createHostMetrics } from './host-metrics.mjs';
 
 const config = loadConfig(process.env, { demo: process.argv.includes('--demo') });
 const remotePortal = config.botRole === 'portal';
@@ -14,7 +15,9 @@ const workerOnly = config.botRole === 'worker';
 const configured = !config.setupMode && Boolean(config.discordClientId &&
   (remotePortal ? config.discordClientSecret : config.discordToken && (workerOnly || config.discordClientSecret)));
 const bridge = remotePortal ? createWorkerBridge({ secret: config.workerSecret, trustProxy: config.production }) : null;
-const bot = bridge?.bot || (config.demo ? createDemoBot() : configured ? createBot({ config, media: createMedia(config) }) : { isReady: () => false, shutdown: async () => {} });
+const metrics = !remotePortal && !config.demo && configured ? createHostMetrics({ dataDir: config.dataDir }) : null;
+const bot = bridge?.bot || (config.demo ? createDemoBot() : configured ? createBot({ config, media: createMedia(config), metrics }) : { isReady: () => false, shutdown: async () => {} });
+bot.music?.on('playbackMetric', sample => metrics?.recordPlayback(sample));
 const durableSessions = workerOnly || (config.production && !remotePortal && !config.setupMode)
   ? new FileSessionStorage({ dataDir: config.dataDir }) : null;
 const sessionStore = remotePortal && !config.setupMode
@@ -33,6 +36,7 @@ async function shutdown(code = 0) {
   server?.close();
   server?.closeIdleConnections();
   try { if (!remotePortal) await bot.shutdown(); } catch { console.error('Could not finish saving the queue.'); code = 1; }
+  try { await metrics?.close(); } catch { console.error('Could not finish saving host performance.'); code = 1; }
   try {
     await appResources?.close();
     if (workerOnly) await durableSessions?.close();
@@ -55,12 +59,13 @@ if (!workerOnly) {
   });
 }
 if (!remotePortal && (config.demo || configured)) {
-  if (workerOnly) {
+  await metrics?.start();
+  if (!stopping && workerOnly) {
     connection = connectWorker({ url: config.workerUrl, secret: config.workerSecret, bot, sessionStorage: durableSessions,
       spotifyEnabled: Boolean(config.spotifyClientId && config.spotifyClientSecret) });
     console.log('Audio worker running; connecting to the portal.');
   }
-  bot.start().catch(error => {
+  if (!stopping) bot.start().catch(error => {
     console.error('Bot startup failed:', error.message);
     void shutdown(1);
   });

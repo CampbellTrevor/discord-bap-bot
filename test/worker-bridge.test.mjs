@@ -14,6 +14,35 @@ const CHANNEL = '323456789012345678';
 const SID = 'test-session-identifier-with-32-characters';
 const silent = { warn() {} };
 
+test('2,000 Unicode queue entries round trip without exceeding the bounded frame', async t => {
+  const tracks = Array.from({ length: 2000 }, (_, index) => ({ id: randomUUID(), title: `${index} ${'音'.repeat(300)}`, artist: '楽'.repeat(300),
+    requestedBy: { id: USER, username: 'Listener' }, durationSec: 3600, source: 'youtube', sourceUrl: 'https://www.youtube.com/watch?v=abcdefghijk' }));
+  const detail = { guild: { id: GUILD }, queue: { nowPlaying: null, tracks } };
+  assert.ok(Buffer.byteLength(JSON.stringify(detail)) > 1024 * 1024);
+  const { bridge, connect } = await fixture(t);
+  connect(fakeBot({ detail: async () => detail }));
+  await until(() => bridge.bot.isReady());
+  assert.deepEqual(await bridge.bot.detail(GUILD, USER), detail);
+  assert.equal(bridge.bot.isReady(), true);
+});
+
+test('performance and move-top RPCs validate identities and retain track IDs', async t => {
+  const trackId = randomUUID();
+  const { bridge, connect } = await fixture(t);
+  const calls = [];
+  connect(fakeBot({
+    performance: async (...args) => { calls.push(args); return { version: 1, history: [] }; },
+    control: async (...args) => { calls.push(args); return { tracks: [{ id: trackId }] }; },
+  }));
+  await until(() => bridge.bot.isReady());
+  assert.equal((await bridge.bot.performance(GUILD, USER)).version, 1);
+  assert.equal((await bridge.bot.control(GUILD, USER, 'move-top', trackId)).tracks[0].id, trackId);
+  assert.deepEqual(calls, [[GUILD, USER], [GUILD, USER, 'move-top', trackId]]);
+  await assert.rejects(bridge.bot.performance('invalid', USER), { code: 'WORKER_INVALID_REQUEST' });
+  await assert.rejects(bridge.bot.control(GUILD, USER, 'move-top'), { code: 'WORKER_INVALID_REQUEST' });
+  assert.equal(calls.length, 2);
+});
+
 function fakeSessionStorage(overrides = {}) {
   const records = new Map();
   return {

@@ -18,6 +18,38 @@ const workerEnv = {
   DISCORD_TOKEN: 'test-worker-discord-token', DISCORD_CLIENT_ID: CLIENT_ID,
 };
 
+test('queue defaults support 2,000 total songs and one-hour tracks across roles', () => {
+  for (const env of [{}, workerEnv, portalEnv]) {
+    const config = loadConfig(env);
+    assert.equal(config.maxQueueSize, 2000);
+    assert.equal(config.maxTrackDurationSec, 3600);
+    assert.equal(config.maxPlaylistTracks, 50);
+    assert.equal(loadConfig({ ...env, MAX_QUEUE_SIZE: '2000', MAX_TRACK_DURATION_SEC: '3600' }).maxQueueSize, 2000);
+    assert.throws(() => loadConfig({ ...env, MAX_QUEUE_SIZE: '2001' }), /MAX_QUEUE_SIZE/);
+  }
+});
+
+test('performance API authenticates and forwards the user and guild to worker authorization', async t => {
+  let allowed = true;
+  const calls = [];
+  const bot = { isReady: () => true, performance: async (guild, user) => {
+    calls.push([guild, user]);
+    if (!allowed) throw Object.assign(new Error('Only a server manager or DJ can view host performance.'), { status: 403 });
+    return { version: 1, latest: { hostCpuBusyPct: 9 } };
+  } };
+  const { request, signIn } = await portalFixture(t, { bot });
+  const endpoint = `/api/guilds/${GUILD_ID}/performance`;
+  assert.equal((await request(endpoint)).status, 401);
+  assert.equal(calls.length, 0);
+  await signIn();
+  const response = await request(endpoint);
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).latest.hostCpuBusyPct, 9);
+  assert.deepEqual(calls, [[GUILD_ID, USER_ID]]);
+  allowed = false;
+  assert.equal((await request(endpoint)).status, 403);
+});
+
 async function portalFixture(t, { bot, env = {} } = {}) {
   const config = loadConfig({ ...portalEnv, ...env });
   const fetchImpl = async (url, options) => {

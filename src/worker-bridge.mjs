@@ -4,13 +4,14 @@ import { MediaError } from './media.mjs';
 
 const VERSION = 1;
 const WORKER_PATH = '/internal/worker';
-const MAX_PAYLOAD = 1024 * 1024;
+// A full 2,000-track queue can exceed 1 MiB, particularly with Unicode metadata.
+const MAX_PAYLOAD = 8 * 1024 * 1024;
 const ID = /^\d{17,20}$/;
 const REQUEST_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
-const ACTIONS = new Set(['skip', 'pause', 'resume', 'stop', 'leave', 'remove', 'shuffle']);
+const ACTIONS = new Set(['skip', 'pause', 'resume', 'stop', 'leave', 'remove', 'shuffle', 'move-top']);
 const SESSION_ID = /^[A-Za-z0-9_-]{32,128}$/;
 const SESSION_METHODS = new Set(['sessionGet', 'sessionSet', 'sessionTake', 'sessionDestroy']);
-const METHODS = new Set(['listGuilds', 'detail', 'search', 'request', 'join', 'control', ...SESSION_METHODS]);
+const METHODS = new Set(['listGuilds', 'detail', 'performance', 'search', 'request', 'join', 'control', ...SESSION_METHODS]);
 const MUTATIONS = new Set(['request', 'join', 'control']);
 const STATUSES = new Set([400, 403, 404, 409, 429, 503]);
 const MEDIA_CODES = new Set([
@@ -50,6 +51,8 @@ const PUBLIC_MESSAGES = new Set([
   'Nothing is playing.',
   'At least two songs must be waiting in the queue to shuffle.',
   'Unknown playback action.',
+  'Only a server manager or DJ can view host performance.',
+  'Host performance is temporarily unavailable.',
 ]);
 const CAPACITY_MESSAGE = /^This request contains \d{1,4} tracks?, but only \d{1,4} queue slots? (?:is|are) available \(limit \d{1,4}, including the current track\)\. Nothing was added\. Try a smaller request or wait for space\.$/;
 
@@ -165,12 +168,12 @@ function validArguments(method, args) {
   if (args.length < 2 || !args.slice(0, 2).every(value => typeof value === 'string' && ID.test(value))) return false;
   const optionalId = value => value === null || value === undefined || typeof value === 'string' && ID.test(value);
   const query = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 500 && !/[\u0000-\u001f\u007f]/u.test(value);
-  if (method === 'detail') return args.length === 2;
+  if (method === 'detail' || method === 'performance') return args.length === 2;
   if (method === 'search') return args.length === 4 && query(args[2]) && ['youtube', 'spotify'].includes(args[3]);
   if (method === 'request') return args.length === 4 && query(args[2]) && optionalId(args[3]);
   if (method === 'join') return args.length === 3 && optionalId(args[2]);
   if (method === 'control') return args.length === 4 && ACTIONS.has(args[2])
-    && (args[2] === 'remove' ? typeof args[3] === 'string' && REQUEST_ID.test(args[3]) : args[3] === null || args[3] === undefined);
+    && (['remove', 'move-top'].includes(args[2]) ? typeof args[3] === 'string' && REQUEST_ID.test(args[3]) : args[3] === null || args[3] === undefined);
   return false;
 }
 
@@ -338,6 +341,7 @@ export function createWorkerBridge({ secret, logger = console, trustProxy = fals
     capabilities: () => ({ spotifyEnabled: Boolean(fresh() && worker.spotifyEnabled) }),
     listGuilds: (userId, options) => rpc('listGuilds', [userId], options),
     detail: (guildId, userId, options) => rpc('detail', [guildId, userId], options),
+    performance: (guildId, userId, options) => rpc('performance', [guildId, userId], options),
     search: (guildId, userId, query, source = 'youtube', options) => rpc('search', [guildId, userId, query, source], options),
     request: (guildId, userId, query, channelId, options) => rpc('request', [guildId, userId, query, channelId ?? null], options),
     join: (guildId, userId, channelId, options) => rpc('join', [guildId, userId, channelId ?? null], options),
@@ -481,6 +485,7 @@ export function connectWorker({ url, secret, bot, sessionStorage, spotifyEnabled
         switch (method) {
           case 'listGuilds': result = await bot.listGuilds(args[0]); break;
           case 'detail': result = await bot.detail(args[0], args[1]); break;
+          case 'performance': result = await bot.performance(args[0], args[1]); break;
           case 'search': result = await bot.search(args[0], args[1], args[2], args[3], { signal: controller.signal }); break;
           case 'request': result = await bot.request(args[0], args[1], args[2], args[3] ?? undefined, { signal: controller.signal }); break;
           case 'join': result = await bot.join(args[0], args[1], args[2] ?? undefined); break;

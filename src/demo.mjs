@@ -51,7 +51,7 @@ export function createDemoBot() {
     },
     request: async (id, _userId, query) => {
       validate(id); tick();
-      if (queue.tracks.length >= 100) throw failure('The demo queue is full.', 409);
+      if (queue.tracks.length + Number(Boolean(queue.nowPlaying)) >= 2000) throw failure('The demo queue is full.', 409);
       const selected = searchFixtures.get(query);
       const track = selected
         ? { ...structuredClone(selected), id: randomUUID(), requestedBy: user }
@@ -77,6 +77,11 @@ export function createDemoBot() {
       if (action === 'leave') {
         if (queue.nowPlaying) queue.tracks.unshift(queue.nowPlaying);
         queue.channelId = null; queue.channelName = null; advance();
+      }
+      if (action === 'move-top') {
+        const index = queue.tracks.findIndex(track => track.id === trackId);
+        if (index === -1) throw failure('Song not found.', 404);
+        if (index > 0) queue.tracks.unshift(queue.tracks.splice(index, 1)[0]);
       }
       if (action === 'remove') {
         const index = queue.tracks.findIndex(track => track.id === trackId);

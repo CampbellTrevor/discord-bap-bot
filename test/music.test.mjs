@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { AudioPlayerError } from '@discordjs/voice';
 import { MusicManager } from '../src/music.mjs';
 import { MediaError } from '../src/media.mjs';
@@ -35,7 +35,7 @@ function fakeTransport() {
 
 async function fixture(t, media = { open: async () => openedAudio() }, options = {}) {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'discord-music-test-'));
-  const manager = new MusicManager({ media, dataDir, logger: quiet, idleDisconnectMs: 0, ...options });
+  const manager = new MusicManager({ media, dataDir, logger: quiet, idleDisconnectMs: 0, preloadCount: 0, ...options });
   t.after(async () => {
     await manager.shutdown();
     // Delete only the exact temporary directory allocated by this fixture.
@@ -466,4 +466,286 @@ test('cleanup diagnostics exclude raw exception messages', async t => {
   await manager.control('guild', 'stop');
   assert.deepEqual(logs, [['Music operation failed.', { operation: 'media-cleanup', code: 'MEDIA_CLEANUP_FAILED', type: 'Error' }]]);
   assert.doesNotMatch(JSON.stringify(logs), /private-token|provider\.invalid/);
+});
+
+const settle = async () => { for (let index = 0; index < 4; index += 1) await turn(); };
+function warmMedia() {
+  const calls = [];
+  return { calls, async open(item, { signal }) {
+    const opened = openedAudio();
+    opened.stream.write(Buffer.from(`audio:${item.title}`));
+    calls.push({ title: item.title, signal, opened });
+    return opened;
+  } };
+}
+
+test('preloads only the next two audio sources and promotes the same buffered bytes in queue order', async t => {
+  const media = warmMedia();
+  const { manager } = await fixture(t, media, { preloadCount: 2 });
+  const metrics = [];
+  manager.on('playbackMetric', value => metrics.push(value));
+  const voice = fakeTransport();
+  await manager.enqueue('guild', ['A', 'B', 'C', 'D'].map(track), requester);
+  assert.equal(media.calls.length, 0);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  assert.deepEqual(media.calls.map(call => call.title), ['A', 'B', 'C']);
+  assert.equal(voice.plays.length, 1);
+  const state = manager.state('guild');
+  const warm = state.preloads.get(state.tracks[0].id);
+  assert.equal(warm.opened.stream.readableLength, Buffer.byteLength('audio:B'));
+  assert.equal(manager.preloadEntries.size, 2);
+  voice.plays[0].end();
+  await settle();
+  assert.equal(voice.plays[1].opened, warm.opened);
+  assert.equal(voice.plays[1].opened.stream.read().toString(), 'audio:B');
+  assert.deepEqual(media.calls.map(call => call.title), ['A', 'B', 'C', 'D']);
+  assert.deepEqual(manager.snapshot('guild').tracks.map(item => item.title), ['C', 'D']);
+  assert.equal(media.calls[1].signal.aborted, false);
+  assert.deepEqual(metrics.map(value => [value.outcome, value.preloaded]), [['ready', false], ['ready', true]]);
+  for (const metric of metrics) {
+    assert.ok(metric.durationMs >= 0);
+    assert.deepEqual(Object.keys(metric).sort(), ['durationMs', 'outcome', 'preloaded']);
+  }
+});
+
+test('preload buffers apply backpressure and do not download whole long sources', async t => {
+  const sources = [];
+  const media = { async open(item) {
+    if (item.title === 'Current') return openedAudio();
+    let bytes = 0;
+    const stream = new Readable({ highWaterMark: 16 * 1024, read() { bytes += 16 * 1024; this.push(Buffer.alloc(16 * 1024, 7)); } });
+    sources.push({ stream, bytes: () => bytes });
+    return { stream, cleanup: () => stream.destroy() };
+  } };
+  const { manager } = await fixture(t, media, { preloadCount: 2 });
+  await manager.enqueue('guild', [track('Current'), { ...track('Long one'), durationSec: 3600 }, { ...track('Long two'), durationSec: 3600 }, track('Not loaded')], requester);
+  manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
+  await settle();
+  assert.equal(sources.length, 2);
+  const before = sources.map(source => source.bytes());
+  for (const bytes of before) assert.ok(bytes >= 256 * 1024 && bytes <= 512 * 1024);
+  await settle();
+  assert.deepEqual(sources.map(source => source.bytes()), before);
+  await manager.control('guild', 'stop');
+  assert.ok(sources.every(source => source.stream.destroyed));
+  assert.equal(manager.preloadEntries.size, 0);
+});
+
+test('removing or moving pending songs reconciles preloads without changing current playback', async t => {
+  const media = warmMedia();
+  const { manager } = await fixture(t, media, { preloadCount: 2 });
+  const voice = fakeTransport();
+  const added = await manager.enqueue('guild', ['A', 'B', 'C', 'D'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  const current = manager.state('guild').opened;
+  await manager.control('guild', 'move-top', added[3].id);
+  await settle();
+  assert.deepEqual(manager.snapshot('guild').tracks.map(item => item.title), ['D', 'B', 'C']);
+  assert.equal(media.calls.find(call => call.title === 'C').opened.cleanupCount, 1);
+  assert.equal(media.calls.find(call => call.title === 'B').opened.cleanupCount, 0);
+  assert.equal(manager.state('guild').opened, current);
+  const plays = voice.plays.length;
+  await manager.control('guild', 'move-top', added[3].id);
+  assert.equal(voice.plays.length, plays);
+  await assert.rejects(manager.control('guild', 'move-top', 'missing'), { status: 404 });
+  await manager.control('guild', 'remove', added[1].id);
+  await settle();
+  assert.equal(media.calls.find(call => call.title === 'B').opened.cleanupCount, 1);
+  assert.deepEqual(manager.snapshot('guild').tracks.map(item => item.title), ['D', 'C']);
+  assert.equal(manager.snapshot('guild').nowPlaying.id, added[0].id);
+});
+
+test('shuffle cancels only preloads that leave the next-two window and preserves pause', async t => {
+  const media = warmMedia();
+  const { manager } = await fixture(t, media, { preloadCount: 2, randomIndex: () => 0 });
+  const voice = fakeTransport();
+  await manager.enqueue('guild', ['A', 'B', 'C', 'D'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  await manager.control('guild', 'pause');
+  await manager.control('guild', 'shuffle');
+  assert.equal(manager.snapshot('guild').paused, true);
+  assert.equal(voice.paused, true);
+  assert.deepEqual(manager.snapshot('guild').tracks.map(item => item.title), ['C', 'D', 'B']);
+  assert.equal(media.calls.find(call => call.title === 'B').signal.aborted, true);
+  assert.equal(media.calls.find(call => call.title === 'C').signal.aborted, false);
+  assert.equal(media.calls.some(call => call.title === 'D'), false);
+  await manager.control('guild', 'resume');
+  await settle();
+  assert.equal(media.calls.some(call => call.title === 'D'), true);
+});
+
+test('pending preload cancellation discards late results and never stalls foreground playback', async t => {
+  const pending = deferred();
+  const media = warmMedia();
+  const normal = media.open.bind(media);
+  let pendingSignal;
+  let attempts = 0;
+  media.open = async (item, options) => {
+    if (item.title === 'B' && ++attempts === 1) { pendingSignal = options.signal; return pending.promise; }
+    return normal(item, options);
+  };
+  const { manager } = await fixture(t, media, { preloadCount: 2 });
+  const voice = fakeTransport();
+  await manager.enqueue('guild', ['A', 'B', 'C'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  voice.plays[0].end();
+  await settle();
+  assert.equal(pendingSignal.aborted, true);
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'B');
+  assert.equal(voice.plays.length, 2);
+  const stale = openedAudio();
+  pending.resolve(stale);
+  await settle();
+  assert.equal(stale.cleanupCount, 1);
+  assert.notEqual(voice.plays[1].opened, stale);
+});
+
+test('failed preloads fall back once on demand without changing the queue or reporting a playback error early', async t => {
+  const media = warmMedia();
+  const normal = media.open.bind(media);
+  let attempts = 0;
+  media.open = async (item, options) => {
+    if (item.title === 'B' && ++attempts === 1) throw new MediaError('Provider unavailable.', 'YOUTUBE_UNAVAILABLE');
+    return normal(item, options);
+  };
+  const { manager } = await fixture(t, media, { preloadCount: 2 });
+  const metrics = [];
+  manager.on('playbackMetric', metric => metrics.push(metric));
+  const voice = fakeTransport();
+  await manager.enqueue('guild', ['A', 'B'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  manager.syncPreloads();
+  await settle();
+  assert.equal(attempts, 1);
+  assert.equal(manager.snapshot('guild').lastError, null);
+  assert.equal(metrics.length, 1);
+  voice.plays[0].end();
+  await settle();
+  assert.equal(attempts, 2);
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'B');
+  assert.equal(metrics.at(-1).preloaded, false);
+});
+
+test('long songs defer warming and expired parked streams refresh only in the next playback window', async t => {
+  const media = warmMedia();
+  const { manager } = await fixture(t, media, { preloadCount: 2, preloadTtlMs: 25 });
+  const voice = fakeTransport();
+  let elapsed = 0;
+  voice.elapsedSec = () => elapsed;
+  await manager.enqueue('guild', [{ ...track('A'), durationSec: 3600 }, { ...track('B'), durationSec: 3600 }, track('C')], requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  assert.deepEqual(media.calls.map(call => call.title), ['A']);
+  elapsed = 3500;
+  manager.syncPreloads();
+  await settle();
+  assert.deepEqual(media.calls.map(call => call.title), ['A', 'B', 'C']);
+  elapsed = 0;
+  voice.plays[0].end();
+  await settle();
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.equal(media.calls.find(call => call.title === 'C').opened.cleanupCount, 1);
+  assert.equal(manager.preloadEntries.size, 0);
+  manager.syncPreloads();
+  assert.equal(media.calls.length, 3);
+  elapsed = 3500;
+  manager.syncPreloads();
+  await settle();
+  assert.equal(media.calls.filter(call => call.title === 'C').length, 2);
+});
+
+test('leave and shutdown clean all warm sources and restore preserves queue order without prefetching', async t => {
+  const media = warmMedia();
+  const { manager, dataDir } = await fixture(t, media, { preloadCount: 2 });
+  await manager.enqueue('guild', ['A', 'B', 'C'].map(track), requester);
+  manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
+  await settle();
+  await manager.control('guild', 'leave');
+  assert.equal(manager.preloadEntries.size, 0);
+  assert.ok(media.calls.every(call => call.signal.aborted && call.opened.cleanupCount === 1));
+  assert.deepEqual(manager.snapshot('guild').tracks.map(item => item.title), ['A', 'B', 'C']);
+  const restored = new MusicManager({ media: { open: () => assert.fail('Restoration must not preload') }, dataDir });
+  await restored.restore();
+  assert.deepEqual(restored.snapshot('guild').tracks.map(item => item.title), ['A', 'B', 'C']);
+  await restored.shutdown();
+  manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
+  await settle();
+  await manager.shutdown();
+  assert.equal(manager.preloadEntries.size, 0);
+  assert.ok(media.calls.every(call => call.opened.cleanupCount === 1));
+});
+
+test('an early parked-source failure retries the same request cold, while a late Idle error never replays it', async t => {
+  for (const failedAfter of [0.5, 30]) {
+    const media = warmMedia();
+    const { manager } = await fixture(t, media, { preloadCount: 2 });
+    const voice = fakeTransport();
+    let elapsed = 0;
+    voice.elapsedSec = () => elapsed;
+    const added = await manager.enqueue('guild', ['A', 'B', 'C'].map(track), requester);
+    manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+    await settle();
+    voice.plays[0].end();
+    await settle();
+    elapsed = failedAfter;
+    voice.plays[1].opened.stream.emit('error', new MediaError('Provider stream ended.', 'YOUTUBE_UNAVAILABLE'));
+    elapsed = 0; // Discord Idle has discarded the failed resource by this point.
+    voice.plays[1].end();
+    await settle();
+    assert.equal(manager.snapshot('guild').nowPlaying.id, failedAfter < 2 ? added[1].id : added[2].id);
+    assert.equal(media.calls.filter(call => call.title === 'B').length, failedAfter < 2 ? 2 : 1);
+    if (failedAfter < 2) {
+      const cold = voice.plays.at(-1);
+      cold.opened.stream.emit('error', new MediaError('Still unavailable.', 'YOUTUBE_UNAVAILABLE'));
+      cold.end();
+      await settle();
+      assert.equal(manager.snapshot('guild').nowPlaying.id, added[2].id);
+      assert.equal(media.calls.filter(call => call.title === 'B').length, 2);
+    }
+  }
+});
+
+test('foreground retries only marked no-work capacity failures after cancelling speculation', async t => {
+  for (const marked of [true, false]) {
+    const media = warmMedia();
+    const normal = media.open.bind(media);
+    let calls = 0;
+    media.open = async (item, options) => {
+      if (item.title === 'New guild' && ++calls === 1) {
+        const error = new MediaError('Provider busy.', 'MEDIA_BUSY');
+        if (marked) error.retryableBeforeStart = true;
+        throw error;
+      }
+      return normal(item, options);
+    };
+    const { manager } = await fixture(t, media, { preloadCount: 2 });
+    await manager.enqueue('first', ['A', 'B', 'C'].map(track), requester);
+    manager.attach('first', fakeTransport(), { id: 'voice', name: 'Lounge' });
+    await settle();
+    await manager.enqueue('second', [track('New guild')], requester);
+    manager.attach('second', fakeTransport(), { id: 'other', name: 'Other' });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.equal(calls, marked ? 2 : 1);
+    assert.equal(manager.snapshot('second').nowPlaying?.title || null, marked ? 'New guild' : null);
+    assert.ok(manager.preloadEntries.size <= 2);
+  }
+});
+
+test('foreground metrics classify safe provider errors and exclude speculative attempts', async t => {
+  const { manager } = await fixture(t, { open: async () => { throw new MediaError('Spotify quota reached.', 'SPOTIFY_QUOTA_EXCEEDED'); } });
+  const metrics = [];
+  manager.on('playbackMetric', metric => metrics.push(metric));
+  await manager.enqueue('guild', [track('Private title')], requester);
+  manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
+  await settle();
+  assert.equal(metrics.length, 1);
+  assert.equal(metrics[0].outcome, 'error');
+  assert.equal(metrics[0].code, 'SPOTIFY_QUOTA_EXCEEDED');
+  assert.equal(metrics[0].preloaded, false);
+  assert.doesNotMatch(JSON.stringify(metrics), /Private title|guild|user-a|https/);
 });

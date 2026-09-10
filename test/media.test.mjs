@@ -66,11 +66,11 @@ test('canonicalizes YouTube links and ignores playlist tracking parameters', asy
 });
 
 test('song searches are one literal ytsearch argument, never shell commands', async () => {
-  const fake = extractor([metadata({ entries: [youtube] })]);
+  const fake = extractor([metadata({ entries: [youtube] }), metadata(youtube)]);
   const query = 'Artist; song name --help';
   const [track] = await createMedia({}, fake).resolve(query);
   assert.equal(track.title, 'A song');
-  assert.equal(fake.calls[0].args.at(-1), `ytsearch1:${query}`);
+  assert.equal(fake.calls[0].args.at(-1), `ytsearch10:${query}`);
   assert.equal(fake.calls[0].options.shell, false);
 });
 
@@ -89,7 +89,48 @@ test('rejects unsupported URLs, malformed playlist links, invalid IDs and contro
 test('rejects long tracks, live streams, and unknown durations', async () => {
   for (const entry of [{ ...youtube, duration: 601 }, { ...youtube, is_live: true }, { ...youtube, duration: null }]) {
     const media = createMedia({ maxTrackDurationSec: 600 }, extractor([metadata(entry)]));
-    await assert.rejects(media.resolve('song'), error => ['TRACK_TOO_LONG', 'UNSUPPORTED_MEDIA'].includes(error.code));
+    await assert.rejects(media.resolve(`https://youtu.be/${VIDEO}`), error => ['TRACK_TOO_LONG', 'UNSUPPORTED_MEDIA'].includes(error.code));
+  }
+});
+
+test('the default duration limit accepts exactly one hour and rejects longer direct links', async () => {
+  const fake = extractor([metadata({ ...youtube, duration: 3600 }), metadata({ ...youtube, duration: 3601 })]);
+  const media = createMedia({}, fake);
+  const [track] = await media.resolve(`https://youtu.be/${VIDEO}`);
+  assert.equal(track.durationSec, 3600);
+  await assert.rejects(media.resolve(`https://youtu.be/${VIDEO}`), { code: 'TRACK_TOO_LONG' });
+  assert.equal(fake.calls.length, 2);
+  assert.ok(fake.calls.every(call => call.args.includes('--skip-download')));
+});
+
+test('opening accepts a one-hour track and rejects 3601 seconds before starting audio', async () => {
+  const fake = extractor([child => child.stdout.write('audio prefix')]);
+  const media = createMedia({}, fake);
+  const track = { source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`, durationSec: 3600 };
+  const opened = await media.open(track);
+  try {
+    assert.equal(opened.stream.read().toString(), 'audio prefix');
+    await assert.rejects(media.open({ ...track, durationSec: 3601 }), { code: 'TRACK_TOO_LONG' });
+    assert.equal(fake.calls.length, 1);
+  } finally { opened.cleanup(); }
+});
+
+test('unknown playlist durations enforce the same one-hour boundary before audio begins', async () => {
+  for (const duration of [3600, 3601]) {
+    const fake = extractor([metadata({ ...youtube, duration }), child => child.stdout.write('audio prefix')]);
+    const media = createMedia({}, fake);
+    const track = { source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`, durationSec: null, needsValidation: true };
+    if (duration === 3601) {
+      await assert.rejects(media.open(track), { code: 'TRACK_TOO_LONG' });
+      assert.equal(fake.calls.length, 1, 'Overlong playlist entries never start an audio extractor.');
+    } else {
+      const opened = await media.open(track);
+      try {
+        assert.equal(opened.track.durationSec, 3600);
+        assert.equal(opened.track.needsValidation, false);
+        assert.equal(fake.calls.length, 2);
+      } finally { opened.cleanup(); }
+    }
   }
 });
 
@@ -118,6 +159,58 @@ test('caps concurrent extractors and cancellation releases capacity', async () =
   await Promise.all(pending);
   assert.equal(fake.stopped.length, 4);
   assert.equal(fake.calls.length, 4);
+});
+
+test('full initial capacity marks open as retryable without starting provider work', async () => {
+  const fake = extractor();
+  const media = createMedia({}, fake);
+  const controllers = Array.from({ length: 4 }, () => new AbortController());
+  const pending = controllers.map(controller => assert.rejects(
+    media.resolve(`https://youtu.be/${VIDEO}`, { signal: controller.signal }), /test cleanup/));
+  try {
+    await assert.rejects(media.open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
+      title: 'A song', artist: 'An artist', durationSec: 120 }), error => {
+      assert.equal(error.code, 'MEDIA_BUSY');
+      assert.equal(error.retryableBeforeStart, true);
+      assert.equal(Object.keys(error).includes('retryableBeforeStart'), false);
+      return true;
+    });
+    assert.equal(fake.calls.length, 4, 'No search, validation, or audio extractor was started.');
+  } finally {
+    for (const controller of controllers) controller.abort(new Error('test cleanup'));
+    await Promise.all(pending);
+  }
+});
+
+test('capacity lost after metadata validation is not marked safe to retry provider work', async () => {
+  const controllers = [];
+  const pending = [];
+  let media;
+  const occupy = () => {
+    const controller = new AbortController();
+    controllers.push(controller);
+    pending.push(assert.rejects(media.resolve(`https://youtu.be/${VIDEO}`, { signal: controller.signal }), /test cleanup/));
+  };
+  const fake = extractor([undefined, undefined, undefined, child => {
+    metadata(youtube)(child);
+    // Refill the released metadata slot before open resumes to start audio.
+    child.once('close', occupy);
+  }]);
+  media = createMedia({}, fake);
+  for (let index = 0; index < 3; index++) occupy();
+  try {
+    await assert.rejects(media.open({ source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`,
+      durationSec: null, needsValidation: true }), error => {
+      assert.equal(error.code, 'MEDIA_BUSY');
+      assert.equal(error.retryableBeforeStart, undefined);
+      return true;
+    });
+    assert.equal(fake.calls.length, 5);
+    assert.ok(fake.calls.every(call => call.args.includes('--skip-download')));
+  } finally {
+    for (const controller of controllers) controller.abort(new Error('test cleanup'));
+    await Promise.all(pending);
+  }
 });
 
 test('reports missing yt-dlp and provider restrictions without exposing stderr', async () => {
@@ -193,11 +286,12 @@ test('open returns all first audio bytes and idempotent cleanup terminates its e
 });
 
 test('open resolves Spotify to a YouTube match at playback time', async () => {
-  const fake = extractor([metadata({ entries: [youtube] }), child => child.stdout.write('audio')]);
+  const fake = extractor([metadata({ entries: [youtube] }), metadata(youtube), child => child.stdout.write('audio')]);
   const media = createMedia({}, fake);
   const opened = await media.open({ source: 'spotify', sourceUrl: `https://open.spotify.com/track/${TRACK}`, title: 'A song', artist: 'An artist', durationSec: 120 });
-  assert.equal(fake.calls[0].args.at(-1), 'ytsearch1:A song An artist official audio');
+  assert.equal(fake.calls[0].args.at(-1), 'ytsearch10:A song An artist official audio');
   assert.equal(fake.calls[1].args.at(-1), `https://www.youtube.com/watch?v=${VIDEO}`);
+  assert.equal(fake.calls[2].args.at(-1), `https://www.youtube.com/watch?v=${VIDEO}`);
   opened.cleanup();
 });
 
@@ -463,12 +557,12 @@ test('YouTube search returns at most five ordered canonical choices without reso
   assert.equal(results[0].thumbnail, `https://i.ytimg.com/vi/${entries[0].id}/hqdefault.jpg`);
   assert.equal(fake.calls.length, 1);
   const args = fake.calls[0].args;
-  assert.equal(args.at(-1), 'ytsearch5:song & artist');
+  assert.equal(args.at(-1), 'ytsearch10:song & artist');
   assert.equal(args.at(-2), '--');
   assert.equal(fake.calls[0].options.shell, false);
   assert.ok(args.includes('--flat-playlist'));
   assert.ok(args.includes('--skip-download'));
-  assert.equal(args[args.indexOf('--playlist-items') + 1], '1:5');
+  assert.equal(args[args.indexOf('--playlist-items') + 1], '1:10');
   const [selected] = await media.resolve(results[1].sourceUrl);
   assert.equal(selected.title, 'Song 2');
   assert.equal(fake.calls[1].args.at(-1), results[1].sourceUrl);
@@ -526,7 +620,7 @@ test('Spotify search uses one official bounded catalog request and normalizes se
   assert.equal(url.pathname, '/v1/search');
   assert.equal(url.searchParams.get('q'), 'Artist & track:Song');
   assert.equal(url.searchParams.get('type'), 'track');
-  assert.equal(url.searchParams.get('limit'), '5');
+  assert.equal(url.searchParams.get('limit'), '10');
   assert.equal(url.searchParams.get('offset'), '0');
   assert.equal(url.searchParams.get('market'), 'GB');
   assert.equal(calls[1].options.redirect, 'error');
@@ -622,4 +716,116 @@ test('playback failure logs only its operation and safe classification', async (
   const media = createMedia({}, { ...fake, logger: { warn: (...args) => logs.push(args) } });
   await assert.rejects(media.open({ source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`, durationSec: 120 }), { code: 'YOUTUBE_REQUEST_BLOCKED' });
   assert.deepEqual(logs, [['YouTube extractor failed.', { operation: 'playback', code: 'YOUTUBE_REQUEST_BLOCKED' }]]);
+});
+
+test('default YouTube search omits recorded performances and prefers studio audio within ten candidates', async () => {
+  const entries = [
+    video(1, { title: 'An artist - A song (Live at Wembley)' }),
+    video(2, { title: 'An artist - A song', was_live: true }),
+    video(3, { title: 'An artist - A song [Full Concert]' }),
+    video(4, { title: 'An artist - A song (Official Music Video)' }),
+    video(5, { title: 'A song', uploader: 'An artist - Topic' }),
+    video(6, { title: 'An artist - A song (Official Audio)' }),
+    video(7, { title: 'An artist - A song' }),
+    video(8, { title: 'An artist - A song', live_status: 'post_live' }),
+    video(9, { title: 'An artist - A song (Live)' }),
+    video(10, { title: 'An artist - A song - Live 2025' }),
+    video(11, { title: 'An artist - A song (Official Audio)' }),
+  ];
+  const fake = extractor([metadata({ entries })]);
+  const tracks = await createMedia({}, fake).search('A song An artist');
+  assert.deepEqual(tracks.map(track => track.providerId), [5, 6, 4, 7].map(id => String(id).padStart(11, '0')));
+  assert.equal(fake.calls.length, 1, 'Ranking must not fully extract every search result.');
+});
+
+test('recording filters preserve Live Forever, the artist Live, and Live Through This', async () => {
+  const entries = [video(1, { title: 'Oasis - Live Forever (Official Audio)', uploader: 'Oasis' }),
+    video(2, { title: 'Live - Lightning Crashes', uploader: 'Live' })];
+  const tracks = await createMedia({}, extractor([metadata({ entries })])).search('Live');
+  assert.equal(tracks.length, 2);
+  const spotifyEntries = [spotifyItem(1, { name: 'Live Forever', album: { name: 'Definitely Maybe' } }),
+    spotifyItem(2, { name: 'Doll Parts', album: { name: 'Live Through This' } }),
+    spotifyItem(3, { name: 'Lightning Crashes', artists: [{ name: 'Live' }] }),
+    spotifyItem(4, { name: 'Doll Parts - Live at Reading' }),
+    spotifyItem(5, { name: 'Doll Parts', album: { name: 'Live at Reading' } })];
+  const media = createMedia(spotifyConfig, { fetch: async url => url.includes('/api/token')
+    ? json({ access_token: 'token', expires_in: 3600 }) : json({ tracks: { items: spotifyEntries } }) });
+  assert.deepEqual((await media.search('Live', 'spotify')).map(track => track.title), ['Live Forever', 'Doll Parts', 'Lightning Crashes']);
+});
+
+test('Spotify matching selects relevant studio audio instead of the first live, cover or mismatched result', async () => {
+  const chosen = video(6, { title: 'A song', uploader: 'An artist - Topic', duration: 120 });
+  const entries = [video(1, { title: 'An artist - A song (Live)' }),
+    video(2, { title: 'An artist - A song (Cover)' }),
+    video(3, { title: 'Another artist - A song', uploader: 'Another artist' }),
+    video(4, { title: 'An artist - A song (Official Audio)', duration: 400 }),
+    video(5, { title: 'An artist - A song (Official Music Video)', duration: 125 }), chosen];
+  const fake = extractor([metadata({ entries }), metadata(chosen), child => child.stdout.write('audio')]);
+  const opened = await createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
+    title: 'A song', artist: 'An artist', durationSec: 120 });
+  assert.equal(fake.calls.length, 3);
+  assert.equal(fake.calls[1].args.at(-1), `https://www.youtube.com/watch?v=${chosen.id}`);
+  assert.equal(fake.calls[2].args.at(-1), `https://www.youtube.com/watch?v=${chosen.id}`);
+  opened.cleanup();
+});
+
+test('Spotify matching rejects live-only and unrelated candidates without opening audio', async () => {
+  for (const entries of [[video(1, { title: 'An artist - A song (Live)' })],
+    [video(2, { title: 'An artist - Another song', duration: 120 })],
+    [video(3, { title: 'Different band - A song', uploader: 'Different band' })]]) {
+    const fake = extractor([metadata({ entries })]);
+    await assert.rejects(createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
+      title: 'A song', artist: 'An artist', durationSec: 120 }), error => error.code === 'UNSUPPORTED_MEDIA' && /studio/.test(error.message));
+    assert.equal(fake.calls.length, 1);
+  }
+});
+
+test('Spotify matching accepts official M/V labels on the requested recording', async () => {
+  const recording = video(1, { title: "BLACKPINK - 'Lovesick Girls' M/V", uploader: 'BLACKPINK', duration: 194 });
+  const fake = extractor([metadata({ entries: [recording] }), metadata(recording), child => child.stdout.write('audio')]);
+  const opened = await createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
+    title: 'Lovesick Girls', artist: 'BLACKPINK', durationSec: 192 });
+  assert.equal(fake.calls.at(-1).args.at(-1), `https://www.youtube.com/watch?v=${recording.id}`);
+  opened.cleanup();
+});
+
+test('full metadata rechecks studio matches and tries only the next ranked candidate', async () => {
+  const first = video(1, { title: 'An artist - A song (Official Audio)' });
+  const next = video(2, { title: 'An artist - A song' });
+  const fake = extractor([metadata({ entries: [first, next] }), metadata({ ...first, was_live: true }),
+    metadata(next), child => child.stdout.write('audio')]);
+  const opened = await createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
+    title: 'A song', artist: 'An artist', durationSec: 120 });
+  assert.equal(fake.calls.at(-1).args.at(-1), `https://www.youtube.com/watch?v=${next.id}`);
+  opened.cleanup();
+});
+
+test('explicit recorded-live links and Spotify album versions remain selectable', async () => {
+  const live = video(1, { title: 'An artist - A song (Live at Wembley)', was_live: true });
+  const directFake = extractor([metadata(live), child => child.stdout.write('audio')]);
+  const direct = createMedia({}, directFake);
+  const [exact] = await direct.resolve(`https://youtu.be/${live.id}`);
+  const openedDirect = await direct.open(exact);
+  assert.equal(directFake.calls.at(-1).args.at(-1), exact.sourceUrl);
+  openedDirect.cleanup();
+  const fake = extractor([metadata({ entries: [youtube, live] }), metadata(live), child => child.stdout.write('audio')]);
+  const media = createMedia(spotifyConfig, { ...fake, fetch: async url => url.includes('/api/token')
+    ? json({ access_token: 'token', expires_in: 3600 }) : json({ ...spotify, album: { name: 'Live at Wembley' } }) });
+  const [selected] = await media.resolve(`spotify:track:${TRACK}`);
+  assert.equal(selected.recordingKind, 'live');
+  const opened = await media.open(selected);
+  assert.equal(fake.calls.at(-1).args.at(-1), `https://www.youtube.com/watch?v=${live.id}`);
+  opened.cleanup();
+});
+
+test('Spotify candidate validation keeps cancellation and duration limits', async () => {
+  const first = video(1, { title: 'An artist - A song (Official Audio)', duration: null });
+  const fake = extractor([metadata({ entries: [first] }), metadata({ ...first, duration: 999 })]);
+  const track = { source: 'spotify', sourceUrl: `spotify:track:${TRACK}`, title: 'A song', artist: 'An artist', durationSec: 120 };
+  await assert.rejects(createMedia({ maxTrackDurationSec: 600 }, fake).open(track), { code: 'UNSUPPORTED_MEDIA' });
+  assert.equal(fake.calls.length, 2);
+  const controller = new AbortController();
+  const stalled = extractor([metadata({ entries: [first] }), () => controller.abort(new Error('skip cancelled matching'))]);
+  await assert.rejects(createMedia({}, stalled).open(track, { signal: controller.signal }), /skip cancelled/);
+  assert.equal(stalled.stopped.length, 1);
 });

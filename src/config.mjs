@@ -55,8 +55,8 @@ export function loadConfig(env = process.env, { demo = false } = {}) {
     spotifyClientId: env.SPOTIFY_CLIENT_ID || '', spotifyClientSecret: env.SPOTIFY_CLIENT_SECRET || '',
     spotifyRefreshToken: env.SPOTIFY_REFRESH_TOKEN || '', spotifyMarket: env.SPOTIFY_MARKET || 'US',
     dataDir: path.resolve(env.DATA_DIR || './data'), ytDlpPath: env.YT_DLP_PATH || 'yt-dlp',
-    maxQueueSize: integer('MAX_QUEUE_SIZE', 100, 1, 1000),
-    maxTrackDurationSec: integer('MAX_TRACK_DURATION_SEC', 1800, 30, 14400),
+    maxQueueSize: integer('MAX_QUEUE_SIZE', 2000, 1, 2000),
+    maxTrackDurationSec: integer('MAX_TRACK_DURATION_SEC', 3600, 30, 14400),
     maxPlaylistTracks: integer('MAX_PLAYLIST_TRACKS', 50, 1, 100),
     idleDisconnectMs: integer('IDLE_DISCONNECT_MS', 300000, 10000, 3600000),
   };

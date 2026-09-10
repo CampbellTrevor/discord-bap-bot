@@ -129,6 +129,10 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     const detail = bot.detail ? await bot.detail(guildId, userId) : { ...await bot.context(guildId, userId), queue: await bot.snapshot(guildId) };
     res.json(detail);
   });
+  app.get('/api/guilds/:guildId/performance', limiter(20, 60000), async (req, res) => {
+    if (!bot.performance) throw httpError('Host performance is temporarily unavailable.', 503);
+    res.json(await bot.performance(req.params.guildId, req.session.user.id));
+  });
   app.post('/api/guilds/:guildId/search', csrf, limiter(20, 60000), async (req, res) => {
     const { query, source = 'youtube' } = req.body || {};
     if (typeof query !== 'string' || !query.trim() || query.length > 500) throw httpError('Enter a song or artist to search, up to 500 characters.', 400);
@@ -150,8 +154,8 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
   });
   app.post('/api/guilds/:guildId/control', csrf, limiter(30, 60000), async (req, res) => {
     const { action, trackId } = req.body || {};
-    if (!['skip', 'pause', 'resume', 'stop', 'leave', 'remove', 'shuffle'].includes(action)) throw httpError('Unknown playback control.', 400);
-    if (action === 'remove' && (typeof trackId !== 'string' || trackId.length > 100)) throw httpError('Choose a queued song to remove.', 400);
+    if (!['skip', 'pause', 'resume', 'stop', 'leave', 'remove', 'shuffle', 'move-top'].includes(action)) throw httpError('Unknown playback control.', 400);
+    if (['remove', 'move-top'].includes(action) && (typeof trackId !== 'string' || !trackId || trackId.length > 100)) throw httpError('Choose a queued song.', 400);
     res.json({ queue: await bot.control(req.params.guildId, req.session.user.id, action, trackId) });
   });
   app.use('/api', (_req, _res, next) => next(httpError('API route not found.', 404)));

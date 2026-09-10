@@ -10,6 +10,7 @@ const YOUTUBE_HOSTS = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com'
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_PROCESSES = 4;
 const SEARCH_LIMIT = 5;
+const SEARCH_CANDIDATES = 10;
 const EXTRACTOR_FAILURE_CODES = new Set(['YOUTUBE_REQUEST_BLOCKED', 'YOUTUBE_RATE_LIMITED', 'YOUTUBE_RESTRICTED', 'YOUTUBE_FORMAT_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'EXTRACTOR_UNAVAILABLE']);
 
 export class MediaError extends Error {
@@ -92,6 +93,67 @@ function safeText(value, fallback = '') {
   return typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/gu, '').slice(0, 250) : fallback;
 }
 
+function liveAnnotation(value, album = false) {
+  const text = safeText(value).normalize('NFKC');
+  // Match recording annotations, not the word inside song/artist names such as
+  // Live Forever, Live Through This, or the band Live.
+  return /(?:\(|\[|\s[-–—|:]\s)\s*live(?:\s*(?:\)|\]|$)|\s+\d{4}\b|\s*[-–—|:])/iu.test(text)
+    || /\b(?:recorded|performed)\s+live\b|\blive\s+(?:at|from|in|on|version|recording|performance|session|video|audio|acoustic|concert)\b/iu.test(text)
+    || /\b(?:in|full|live)\s+concert\b|\bconcert\s+(?:performance|recording|footage)\b|\bfancam\b/iu.test(text)
+    || album && /^live(?:\s+\d{4})?$/iu.test(text.trim());
+}
+
+function liveRecording(info) {
+  return info?.is_live === true || info?.was_live === true
+    || ['is_live', 'is_upcoming', 'was_live', 'post_live'].includes(info?.live_status)
+    || liveAnnotation(info?.title ?? info?.name) || liveAnnotation(info?.album?.name, true);
+}
+
+function matchWords(value) {
+  const normalized = safeText(value).normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  const words = normalized.split(/\s+/u).filter(Boolean);
+  const meaningful = words.filter(word => !/^(?:the|a|an|and|official|audio|video|lyrics|hd|hq|4k|remaster(?:ed)?|(?:19|20)\d{2})$/u.test(word));
+  return meaningful.length ? meaningful : words;
+}
+
+function overlap(expected, actual) {
+  const words = new Set(matchWords(expected));
+  const available = new Set(matchWords(actual));
+  return words.size ? [...words].filter(word => available.has(word)).length / words.size : 0;
+}
+
+function studioScore(info) {
+  const title = safeText(info?.title ?? info?.name);
+  const channel = safeText(info?.channel || info?.uploader || info?.artist);
+  return (/\bofficial\s+audio\b|\bstudio\s+(?:version|recording)\b/iu.test(title) ? 8 : 0)
+    + (/\s-\sTopic$/iu.test(channel) ? 8 : 0)
+    + (/\bofficial\s+(?:music\s+)?video\b/iu.test(title) ? 3 : 0);
+}
+
+function spotifyMatchScore(info, track, allowLive) {
+  if (allowLive !== liveRecording(info)) return null;
+  const title = safeText(info?.title);
+  const artistText = `${title} ${safeText(info?.artist)} ${safeText(info?.uploader)} ${safeText(info?.channel)}`;
+  const withoutLiveAnnotation = value => safeText(value).replace(/\s*(?:\(|\[|[-–—])\s*live\b.*$/iu, '').replace(/\s+live\s+(?:at|from|in|on)\b.*$/iu, '');
+  const wantedTitle = allowLive ? withoutLiveAnnotation(track.title) : track.title;
+  const matchedTitle = allowLive ? withoutLiveAnnotation(title) : title;
+  const titleMatch = overlap(wantedTitle, matchedTitle);
+  const artistMatch = overlap(safeText(track.artist).split(',')[0], artistText);
+  if (titleMatch < 0.8 || artistMatch < 0.5) return null;
+  const expectedWords = new Set([...matchWords(wantedTitle), ...matchWords(track.artist)]);
+  const decorations = /^(?:music|mv|m|v|lyric|visuali[sz]er|original|studio|recording|version|album|track|full|only|\d{3,4}p)$/u;
+  if (matchWords(matchedTitle).some(word => !expectedWords.has(word) && !decorations.test(word))) return null;
+  // A cover/remix should not displace the requested studio recording merely
+  // because it repeats the title and artist in its description.
+  for (const variant of ['cover', 'karaoke', 'instrumental', 'remix', 'nightcore', 'slowed', 'sped up']) {
+    if (` ${matchWords(title).join(' ')} `.includes(` ${variant} `) && !` ${matchWords(track.title).join(' ')} `.includes(` ${variant} `)) return null;
+  }
+  const difference = typeof info.duration === 'number' ? Math.abs(info.duration - track.durationSec) : null;
+  if (difference !== null && difference > Math.max(15, track.durationSec * 0.15)) return null;
+  return titleMatch * 30 + artistMatch * 20 + (allowLive ? (liveRecording(info) ? 12 : -12) : studioScore(info))
+    + (difference === null ? -10 : 15 - Math.min(15, difference));
+}
+
 function durationSeconds(value, maximum) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
     throw new MediaError('Live streams and tracks without a known duration cannot be queued.', 'UNSUPPORTED_MEDIA');
@@ -158,7 +220,7 @@ export function createMedia(config = {}, dependencies = {}) {
   const resolveTimeoutMs = dependencies.resolveTimeoutMs ?? 30_000;
   const startupTimeoutMs = dependencies.startupTimeoutMs ?? 45_000;
   const playlistTimeoutMs = dependencies.playlistTimeoutMs ?? 90_000;
-  const maxDuration = config.maxTrackDurationSec ?? 1800;
+  const maxDuration = config.maxTrackDurationSec ?? 3600;
   const maxPlaylistTracks = config.maxPlaylistTracks ?? 50;
   const spotifyMarket = config.spotifyMarket || 'US';
   if (!Number.isFinite(maxDuration) || maxDuration <= 0) throw new Error('maxTrackDurationSec must be a positive number.');
@@ -213,7 +275,7 @@ export function createMedia(config = {}, dependencies = {}) {
     // full extraction per video. One extra entry detects a truncated playlist.
     if (playlist) extraArgs.push('--flat-playlist', '--lazy-playlist', '--playlist-items', `1:${maxPlaylistTracks + 1}`);
     // Search lists catalog metadata without resolving audio for every candidate.
-    if (search) extraArgs.push('--flat-playlist', '--lazy-playlist', '--playlist-items', `1:${SEARCH_LIMIT}`);
+    if (search) extraArgs.push('--flat-playlist', '--lazy-playlist', '--playlist-items', `1:${SEARCH_CANDIDATES}`);
     const child = startExtractor(extraArgs, target, { playlist: playlist || search });
     return new Promise((resolve, reject) => {
       const stdout = [];
@@ -275,6 +337,39 @@ export function createMedia(config = {}, dependencies = {}) {
   async function resolveYoutube(target, signal) {
     const result = await extractMetadata(target, signal);
     return youtubeTrack(Array.isArray(result?.entries) ? result.entries.find(Boolean) : result);
+  }
+
+  async function youtubeCandidates(query, signal) {
+    const result = await extractMetadata(`ytsearch${SEARCH_CANDIDATES}:${query}`, signal, { search: true });
+    if (!Array.isArray(result?.entries)) throw new MediaError('YouTube returned invalid search results.', 'INVALID_MEDIA');
+    const seen = new Set();
+    return result.entries.slice(0, SEARCH_CANDIDATES).filter(info => {
+      try {
+        const track = youtubeTrack(info, { flat: true });
+        if (seen.has(track.sourceUrl)) return false;
+        seen.add(track.sourceUrl);
+        return true;
+      } catch (error) { if (!(error instanceof MediaError)) throw error; return false; }
+    });
+  }
+
+  async function resolveYoutubeSearch(query, signal, reference) {
+    const allowLive = reference?.recordingKind === 'live' || liveAnnotation(reference?.title || query);
+    const candidates = (await youtubeCandidates(query, signal)).map(info => ({ info,
+      score: reference ? spotifyMatchScore(info, reference, allowLive)
+        : !allowLive && liveRecording(info) ? null : overlap(query, `${info.title} ${info.uploader || info.channel || ''}`) * 50 + studioScore(info),
+    })).filter(candidate => candidate.score !== null).sort((a, b) => b.score - a.score);
+    // At most two full validations after one bounded catalog query. Never
+    // silently fall back to a known live or mismatched recording.
+    for (const { info } of candidates.slice(0, 2)) {
+      const full = await extractMetadata(youtubeUrl(info.id), signal);
+      if (!allowLive && liveRecording(full)) continue;
+      if (reference && spotifyMatchScore(full, reference, allowLive) === null) continue;
+      try { return youtubeTrack(full); }
+      catch (error) { if (!(error instanceof MediaError)) throw error; }
+    }
+    throw new MediaError(allowLive ? 'No suitable recording was found. Choose a specific YouTube link.'
+      : 'No suitable studio recording was found. Choose a specific YouTube link.', 'UNSUPPORTED_MEDIA');
   }
 
   function playlistResult(tracks, { source, title, total, inspected, limitReached, warnings = [] }) {
@@ -446,7 +541,9 @@ export function createMedia(config = {}, dependencies = {}) {
         if (image.protocol === 'https:' && image.hostname === 'i.scdn.co' && !image.username && !image.password && !image.port) { thumbnail = image.href; break; }
       } catch {}
     }
-    return { title, artist, durationSec: durationSeconds(data.duration_ms / 1000, maxDuration), thumbnail, source: 'spotify', sourceUrl: `https://open.spotify.com/track/${id}`, searchQuery: `${title} ${artist} official audio`.slice(0, 500) };
+    const live = liveRecording(data);
+    return { title, artist, durationSec: durationSeconds(data.duration_ms / 1000, maxDuration), thumbnail, source: 'spotify', sourceUrl: `https://open.spotify.com/track/${id}`,
+      ...(live ? { recordingKind: 'live' } : {}), searchQuery: `${title} ${artist}${live ? ` ${safeText(data.album?.name)} live` : ' official audio'}`.slice(0, 500) };
   }
 
   async function resolveSpotify(id, signal) {
@@ -517,7 +614,8 @@ export function createMedia(config = {}, dependencies = {}) {
     try {
       return await withDeadline(signal, parsed.kind === 'playlist' ? playlistTimeoutMs : resolveTimeoutMs, async deadline => {
         if (parsed.kind === 'playlist') return parsed.source === 'spotify' ? resolveSpotifyPlaylist(parsed.id, deadline) : resolveYoutubePlaylist(parsed.url, deadline);
-        return [parsed.source === 'spotify' ? await resolveSpotify(parsed.id, deadline) : await resolveYoutube(parsed.source === 'youtube' ? parsed.url : `ytsearch1:${parsed.query}`, deadline)];
+        return [parsed.source === 'spotify' ? await resolveSpotify(parsed.id, deadline)
+          : parsed.source === 'youtube' ? await resolveYoutube(parsed.url, deadline) : await resolveYoutubeSearch(parsed.query, deadline)];
       });
     } finally { activeResolutions -= 1; }
   }
@@ -532,28 +630,30 @@ export function createMedia(config = {}, dependencies = {}) {
       return await withDeadline(signal, resolveTimeoutMs, async deadline => {
         let entries;
         if (source === 'youtube') {
-          const result = await extractMetadata(`ytsearch${SEARCH_LIMIT}:${parsed.query}`, deadline, { search: true });
-          entries = result?.entries;
+          entries = await youtubeCandidates(parsed.query, deadline);
         } else {
-          const params = new URLSearchParams({ q: parsed.query, type: 'track', limit: String(SEARCH_LIMIT), offset: '0', market: spotifyMarket });
+          const params = new URLSearchParams({ q: parsed.query, type: 'track', limit: String(SEARCH_CANDIDATES), offset: '0', market: spotifyMarket });
           const result = await spotifyRequest(`search?${params}`, deadline, Boolean(config.spotifyRefreshToken));
           entries = result?.tracks?.items;
         }
         if (!Array.isArray(entries)) throw new MediaError('The music provider returned invalid search results.', 'INVALID_MEDIA');
         const tracks = [];
         const seen = new Set();
-        // Never follow search pagination or resolve extra tracks to backfill
-        // unavailable entries. Canonical URLs are queued through resolve later.
-        for (const entry of entries.slice(0, SEARCH_LIMIT)) {
+        const allowLive = liveAnnotation(parsed.query);
+        // A single bounded catalog page supplies up to five studio choices.
+        // Canonical URLs still preserve the user's exact selection afterward.
+        for (const entry of entries.slice(0, SEARCH_CANDIDATES)) {
           if (!entry || source === 'spotify' && (entry.is_playable === false || entry.restrictions?.reason)) continue;
+          if (!allowLive && liveRecording(entry)) continue;
           try {
             const track = source === 'youtube' ? youtubeTrack(entry, { flat: true }) : spotifyTrack(entry, entry.id);
             if (seen.has(track.sourceUrl)) continue;
             seen.add(track.sourceUrl);
-            tracks.push({ ...track, providerId: entry.id });
+            tracks.push({ track: { ...track, providerId: entry.id }, score: source === 'youtube'
+              ? overlap(parsed.query, `${entry.title} ${entry.uploader || entry.channel || ''}`) * 50 + studioScore(entry) : 0 });
           } catch (error) { if (!(error instanceof MediaError)) throw error; }
         }
-        return tracks;
+        return tracks.sort((a, b) => b.score - a.score).slice(0, SEARCH_LIMIT).map(item => item.track);
       });
     } finally { activeResolutions -= 1; }
   }
@@ -613,13 +713,21 @@ export function createMedia(config = {}, dependencies = {}) {
   async function open(track, { signal } = {}) {
     if (!track || !['youtube', 'spotify'].includes(track.source)) throw new MediaError('This track has an unsupported source.', 'UNSUPPORTED_MEDIA');
     if (!(track.source === 'youtube' && track.needsValidation === true && track.durationSec == null)) durationSeconds(track.durationSec, maxDuration);
+    signal?.throwIfAborted();
+    if (activeProcesses >= MAX_PROCESSES) {
+      const error = new MediaError('The music provider is busy. Try again in a moment.', 'MEDIA_BUSY');
+      // The queue may briefly wait for its cancelled speculative processes to
+      // close. Only this preflight has performed no metadata or provider work.
+      Object.defineProperty(error, 'retryableBeforeStart', { value: true });
+      throw error;
+    }
     return withDeadline(signal, startupTimeoutMs, async deadline => {
       let playable;
       if (track.source === 'spotify') {
         const parsed = parseQuery(track.sourceUrl);
         if (parsed.source !== 'spotify' || parsed.kind !== 'track') throw new MediaError('This Spotify track link is invalid.', 'INVALID_MEDIA');
-        const query = safeText(track.title) + ' ' + safeText(track.artist) + ' official audio';
-        playable = await resolveYoutube(`ytsearch1:${query}`, deadline);
+        const query = safeText(track.searchQuery) || `${safeText(track.title)} ${safeText(track.artist)} ${track.recordingKind === 'live' || liveAnnotation(track.title) ? 'live' : 'official audio'}`;
+        playable = await resolveYoutubeSearch(query, deadline, track);
       } else {
         const parsed = parseQuery(track.playbackUrl || track.sourceUrl);
         if (parsed.source !== 'youtube' || parsed.kind !== 'track') throw new MediaError('This playback link is not a YouTube video.', 'INVALID_MEDIA');

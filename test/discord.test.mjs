@@ -12,7 +12,37 @@ function deferred() {
 
 const track = { title: 'Song', artist: 'Artist', durationSec: 120, source: 'youtube', sourceUrl: 'https://www.youtube.com/watch?v=abcdefghijk' };
 
-async function fixture(t, { fetchMember } = {}) {
+test('performance requires current membership and manager permission before reading metrics', async t => {
+  let reads = 0;
+  const metrics = { getSnapshot() { reads++; return { version: 1, latest: { hostCpuBusyPct: 12 } }; } };
+  const { bot, member, guild } = await fixture(t, { metrics });
+  await assert.rejects(bot.performance('guild', 'listener'), { status: 403 });
+  assert.equal(reads, 0);
+  member.permissions.has = () => true;
+  assert.equal((await bot.performance('guild', 'manager')).latest.hostCpuBusyPct, 12);
+  assert.equal(reads, 1);
+  guild.members.fetch = async () => { throw Object.assign(new Error('Unknown member'), { code: 10007 }); };
+  await assert.rejects(bot.performance('guild', 'removed-manager'), { status: 403 });
+  assert.equal(reads, 1);
+});
+
+test('move-top uses playback permissions even for a listener’s own request', async t => {
+  const { bot, member, music, queue } = await fixture(t);
+  const calls = [];
+  queue.tracks.push({ id: 'queued', requestedBy: { id: 'listener' } });
+  music.control = async (...args) => { calls.push(args); return queue; };
+  member.voice.channelId = 'other-voice';
+  await assert.rejects(bot.control('guild', 'listener', 'move-top', 'queued'), { status: 403 });
+  assert.equal(calls.length, 0);
+  member.voice.channelId = 'voice';
+  await bot.control('guild', 'listener', 'move-top', 'queued');
+  member.voice.channelId = null;
+  member.permissions.has = () => true;
+  await bot.control('guild', 'manager', 'move-top', 'queued');
+  assert.deepEqual(calls, [['guild', 'move-top', 'queued'], ['guild', 'move-top', 'queued']]);
+});
+
+async function fixture(t, { fetchMember, metrics } = {}) {
   const calls = { memberships: 0, snapshots: 0, enqueues: 0, searches: 0, resolves: 0 };
   const member = { displayName: 'Listener', voice: { channelId: 'voice' }, permissions: { has: () => false }, roles: { cache: new Map() } };
   const channel = { id: 'voice', name: 'Lounge', type: ChannelType.GuildVoice, position: 0, permissionsFor: () => ({ has: () => true }) };
@@ -43,7 +73,7 @@ async function fixture(t, { fetchMember } = {}) {
     async search() { calls.searches += 1; return [track]; },
     async resolve() { calls.resolves += 1; return [track]; },
   };
-  const bot = createBot({ config: { discordClientId: '123456789012345678', discordToken: 'unused-test-token' }, media, logger: { info() {}, warn() {}, error() {} } }, { client, music, rest: { async put() {} } });
+  const bot = createBot({ config: { discordClientId: '123456789012345678', discordToken: 'unused-test-token' }, media, metrics, logger: { info() {}, warn() {}, error() {} } }, { client, music, rest: { async put() {} } });
   await bot.start();
   t.after(() => bot.shutdown());
   return { bot, calls, member, guild, music, media, queue };

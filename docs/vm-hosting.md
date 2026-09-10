@@ -56,3 +56,12 @@ For updates, build a reviewed commit, recreate the worker with Compose, and chec
 Authenticated sign-ins last up to 30 days in the same browser. The worker stores encrypted records and logout revocations in `/var/lib/bap-bot/data/.portal-sessions.json`. Keep this file with the other data backups and keep Render's `SESSION_SECRET` unchanged. The worker does not receive that secret or plaintext login records.
 
 Deploy workers with session-storage support before updating the portal. A portal restart, sleep, or worker restart preserves sign-ins; temporary worker disconnections return a retryable storage error. Static pages and health checks remain available. Users need to sign in once after upgrading from the former in-memory store, or after clearing cookies or rotating `SESSION_SECRET`.
+
+
+## Performance history
+
+Open the portal's **PLAYBACK HOST** panel as a server manager or DJ to inspect the audio VM. The panel is served through the authenticated worker connection; it requires no additional inbound VM port. Keep `.host-metrics.json` with data backups to retain the last 24 hours of performance history across worker recreation. It contains aggregate counters and fixed error codes, with no song titles or user IDs.
+
+The current LAX host has 2 GB RAM and one vCPU; the worker's Compose limit is 768 MiB RAM and 1,536 MiB including swap. Observe those limits under actual listening, searches, and preloading before deciding to upgrade. Host CPU steal measures time denied by the hypervisor; container throttling measures quota pressure. Source startup waits measure the media opener, not Discord voice gaps.
+
+Set `MAX_QUEUE_SIZE=2000` and `MAX_TRACK_DURATION_SEC=3600` in the private worker environment. The current track counts toward queue capacity; playlist imports remain capped separately at 50 entries by default. A worker restart preserves songs and sign-ins but requires `/join` to resume voice.
