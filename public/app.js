@@ -363,6 +363,8 @@ function renderPerformance(snapshot) {
   const playback = snapshot.playback || {};
   const preload = snapshot.preload || {};
   const transition = snapshot.transition || {};
+  const audio = snapshot.audio || {};
+  const packets = audio.latest || {};
   const includesPreparation = playback.measurement === 'source-and-packet-preparation';
   const grid = $('performance-grid');
   grid.replaceChildren();
@@ -408,6 +410,21 @@ function renderPerformance(snapshot) {
     `P95 ≤ ${metricTime(transition.p95ReadyMsUpperBound)} · MAX ${metricTime(transition.maxReadyMs)}`,
     `${metricCount(transition.preloadedReady)} PRELOADED / ${metricCount(transition.ready)} TRANSITIONS`,
   ], 'Natural track end until the next resource enters Discord transport Playing. Excludes network, client and audible-gap timing.');
+  card('STARVED READS · LAST INTERVAL', metricCount(packets.starvedReads), [
+    `${metricCount(packets.packetsRead)} PACKETS / ${metricCount(packets.readAttempts)} READS`,
+    `MIN BUFFER ${metricCount(packets.minBufferedPackets)} PACKETS`,
+    `24H STARVED ${metricCount(audio.totals?.starvedReads)} · NON-20MS ${metricCount(audio.totals?.opusMismatch)}`,
+  ], 'Packet reads that returned no audio before the source ended. Aggregate counts cover the worker; they do not measure listener packet loss.');
+  card('PACKET READ GAP · MAX', metricTime(packets.maxReadGapMs), [
+    `24H PEAK ${metricTime(audio.max?.maxReadGapMs)}`,
+    `LARGEST ${metricCount(packets.maxPacketBytes)} B · 24H ${metricCount(audio.max?.maxPacketBytes)} B`,
+    `VOICE WS PING ${metricTime(packets.voiceWsPingMs)}`,
+  ], 'Interval between packet reads while playing. Pauses and resource changes reset the comparison. WebSocket ping is signalling latency, not UDP audio latency.');
+  card('EVENT LOOP DELAY · MAX', metricTime(sample.eventLoopMaxMs), [
+    `P99 ${metricTime(sample.eventLoopP99Ms)}`,
+    `24H PEAK ${metricTime(snapshot.eventLoop?.max?.eventLoopMaxMs)}`,
+    '20 MS TIMER RESOLUTION',
+  ], 'Node timer delay sampled over each host interval. The normal baseline includes the 20 ms timer resolution; short peaks can be hidden by average CPU use.');
   const errors = $('performance-errors');
   errors.replaceChildren();
   appendText(errors, 'strong', '', `${metricCount(playback.error)} FOREGROUND ERRORS`);

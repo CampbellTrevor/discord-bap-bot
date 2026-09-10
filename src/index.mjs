@@ -29,6 +29,7 @@ let stopping = false;
 bot.music?.on('playbackMetric', sample => { if (!stopping) metrics?.recordPlayback(sample); });
 bot.music?.on('preloadMetric', sample => { if (!stopping) metrics?.recordPreload(sample); });
 bot.music?.on('transitionMetric', sample => { if (!stopping) metrics?.recordTransition(sample); });
+bot.music?.on('audioHealthMetric', sample => { if (!stopping) metrics?.recordAudioHealth(sample); });
 async function shutdown(code = 0) {
   if (stopping) return;
   stopping = true;

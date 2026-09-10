@@ -8,6 +8,7 @@ import {
 } from '@discordjs/voice';
 import { MusicManager, musicError } from './music.mjs';
 import { prepareAudio } from './audio-pipeline.mjs';
+import { createAudioHealth } from './audio-health.mjs';
 
 const commands = [
   new SlashCommandBuilder().setName('play').setDescription('Request a song or playlist from Spotify or YouTube')
@@ -100,6 +101,10 @@ export function createBot({ config, media, metrics, logger = console }, dependen
       selfDeaf: true, selfMute: false, daveEncryption: true,
     });
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
+    const audioHealth = createAudioHealth({
+      onMetric: metric => music.emit('audioHealthMetric', metric),
+      getVoiceWsPing: () => connection.ping.ws,
+    });
     let destroyed = false;
     const transport = {
       connection,
@@ -109,6 +114,7 @@ export function createBot({ config, media, metrics, logger = console }, dependen
           inputType: StreamType.Arbitrary,
         });
         resource.metadata = { onEnd, onError, onStarted };
+        audioHealth.observeResource(resource);
         player.play(resource);
       },
       stop() { player.stop(true); },
@@ -119,10 +125,12 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         if (destroyed) return;
         destroyed = true;
         player.stop(true);
+        audioHealth.close();
         if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
       },
     };
     player.on('stateChange', (previous, next) => {
+      audioHealth.playerState(next.status);
       if (next.status === AudioPlayerStatus.Playing && previous.resource !== next.resource) {
         next.resource?.metadata?.onStarted?.();
       } else if (next.status === AudioPlayerStatus.Playing && previous.status === AudioPlayerStatus.Buffering) {
@@ -132,6 +140,7 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         previous.resource?.metadata?.onEnd?.();
       }
     });
+    connection.on('stateChange', (previous, next) => audioHealth.voiceStateChanged(previous.status, next.status));
     player.on('error', error => {
       if (error.resource?.metadata?.onError) error.resource.metadata.onError(error);
       else logger.warn('Audio player error:', error.message);

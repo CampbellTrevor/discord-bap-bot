@@ -2,6 +2,7 @@ import * as nodeFs from 'node:fs/promises';
 import * as nodeOs from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { monitorEventLoopDelay as nodeMonitorEventLoopDelay } from 'node:perf_hooks';
 
 const MINUTE = 60000;
 const RETENTION = 24 * 60 * MINUTE;
@@ -14,6 +15,14 @@ const FIELDS = [
   'containerCpuThrottledPct', 'containerCpuThrottledMs', 'containerOomEvents', 'containerOomKills',
   'containerOomEventsDelta', 'containerOomKillsDelta', 'diskTotalBytes', 'diskFreeBytes',
 ];
+// Kept separate from the original version-1 field order for existing history.
+const LOOP_FIELDS = ['eventLoopMaxMs', 'eventLoopP99Ms'];
+const AUDIO_COUNTERS = ['readAttempts', 'packetsRead', 'emptyReads', 'starvedReads',
+  'opus2_5Ms', 'opus5Ms', 'opus10Ms', 'opus20Ms', 'opus40Ms', 'opus60Ms', 'opus80Ms', 'opus100Ms', 'opus120Ms', 'opusOtherMs',
+  'opusInvalid', 'opusMismatch', 'voiceStateChanges'];
+const AUDIO_FIELDS = ['windowMs', ...AUDIO_COUNTERS, 'minBufferedPackets', 'maxReadGapMs', 'maxPacketBytes', 'voiceWsPingMs', 'voiceUdpPingMs'];
+const MAX_AUDIO_SAMPLES = 720;
+const MAX_HEALTH_VALUE = 1e9;
 const count = value => Number.isSafeInteger(value) && value >= 0;
 const numeric = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 const round = value => numeric(value) ? Math.round(value * 100) / 100 : null;
@@ -23,8 +32,59 @@ const pairs = text => Object.fromEntries((text ?? '').trim().split('\n').map(lin
 const emptyPlayback = () => ({ ready: 0, error: 0, preloadedReady: 0, preloadedError: 0,
   readyDurationSumMs: 0, readyDurationMaxMs: 0, latencyBins: LATENCY_BOUNDS.map(() => 0), errors: {} });
 const emptyPreload = () => ({ ...emptyPlayback(), cancelled: 0, expired: 0 });
+const emptyStats = fields => fields.map(() => [0, 0, null, null]);
+const emptyAudio = () => ({ samples: 0, metrics: emptyStats(AUDIO_FIELDS) });
 const emptyBucket = at => ({ at, samples: 0, metrics: FIELDS.map(() => [0, 0, null, null]),
-  playback: emptyPlayback(), legacySourceOnly: false, preload: emptyPreload(), transition: emptyPlayback() });
+  playback: emptyPlayback(), legacySourceOnly: false, preload: emptyPreload(), transition: emptyPlayback(),
+  audio: emptyAudio(), eventLoop: emptyStats(LOOP_FIELDS) });
+
+function addStats(target, fields, values) {
+  fields.forEach((field, index) => {
+    const value = values[field];
+    if (!numeric(value)) return;
+    const stat = target[index];
+    stat[0]++; stat[1] += value;
+    stat[2] = stat[2] === null ? value : Math.min(stat[2], value);
+    stat[3] = stat[3] === null ? value : Math.max(stat[3], value);
+  });
+}
+function mergeStats(target, source) {
+  source.forEach(([n, sum, low, high], index) => {
+    if (!n) return;
+    const stat = target[index];
+    stat[0] += n; stat[1] += sum;
+    stat[2] = stat[2] === null ? low : Math.min(stat[2], low);
+    stat[3] = stat[3] === null ? high : Math.max(stat[3], high);
+  });
+}
+function statsSummary(fields, values) {
+  const avg = {}, min = {}, max = {};
+  fields.forEach((field, index) => {
+    const [n, sum, low, high] = values[index];
+    avg[field] = n ? round(sum / n) : null;
+    min[field] = low; max[field] = high;
+  });
+  return { avg, min, max };
+}
+function audioSummary(value) {
+  const totals = {};
+  for (const field of AUDIO_COUNTERS) {
+    const [n, sum] = value.metrics[AUDIO_FIELDS.indexOf(field)];
+    totals[field] = n ? sum : null;
+  }
+  return { samples: value.samples, ...statsSummary(AUDIO_FIELDS, value.metrics), totals };
+}
+function validStats(value, fields, samples) {
+  return Array.isArray(value) && value.length === fields.length && value.every(stat =>
+    Array.isArray(stat) && stat.length === 4 && count(stat[0]) && stat[0] <= samples && numeric(stat[1])
+    && stat[1] <= stat[0] * MAX_HEALTH_VALUE && (stat[0] === 0
+      ? stat[1] === 0 && stat[2] === null && stat[3] === null
+      : numeric(stat[2]) && numeric(stat[3]) && stat[2] <= stat[3] && stat[3] <= MAX_HEALTH_VALUE
+        && stat[1] / stat[0] >= stat[2] - 0.01 && stat[1] / stat[0] <= stat[3] + 0.01));
+}
+function validAudio(value) {
+  return value && count(value.samples) && value.samples <= MAX_AUDIO_SAMPLES && validStats(value.metrics, AUDIO_FIELDS, value.samples);
+}
 
 function recordReady(target, durationMs) {
   const duration = Math.round(durationMs);
@@ -73,9 +133,11 @@ function bucketView(bucket) {
     min[field] = low;
     max[field] = high;
   });
+  const loop = statsSummary(LOOP_FIELDS, bucket.eventLoop);
+  Object.assign(avg, loop.avg); Object.assign(min, loop.min); Object.assign(max, loop.max);
   return { at: bucket.at, samples: bucket.samples, avg, min, max,
     playback: { ...playbackSummary(bucket.playback), legacySourceOnly: bucket.legacySourceOnly },
-    preload: preloadSummary(bucket.preload), transition: transitionSummary(bucket.transition) };
+    preload: preloadSummary(bucket.preload), transition: transitionSummary(bucket.transition), audio: audioSummary(bucket.audio) };
 }
 function validPlayback(p) {
   if (!p || ['ready', 'error', 'preloadedReady', 'preloadedError', 'readyDurationSumMs', 'readyDurationMaxMs'].some(key => !count(p[key]))
@@ -106,6 +168,7 @@ function validBucket(bucket, now) {
 
 /** Records source/packet preparation and transport transitions, not audible voice gaps. */
 export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date.now, fs = nodeFs, os = nodeOs,
+  monitorEventLoopDelay = nodeMonitorEventLoopDelay,
   setInterval: schedule = globalThis.setInterval, clearInterval: unschedule = globalThis.clearInterval } = {}) {
   if (typeof dataDir !== 'string' || !dataDir || !Number.isSafeInteger(sampleIntervalMs) || sampleIntervalMs < 1000 || sampleIntervalMs > MINUTE) {
     throw new Error('Host metrics require a data directory and a sample interval between 1 and 60 seconds.');
@@ -113,6 +176,7 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
   const file = path.join(dataDir, '.host-metrics.json');
   const buckets = new Map();
   let latest = null, previous = null, timer, starting, sampling, closed = false;
+  let lastAudio = null, loopMonitor;
   let persistent = null, lastSavedAt = null, lastWriteAttempt = -Infinity;
   const read = async location => { try { const text = await fs.readFile(location, 'utf8'); return text.length <= 128 * 1024 ? text : null; } catch { return null; } };
   const prune = at => { for (const timestamp of buckets.keys()) if (timestamp < at - RETENTION || timestamp > at) buckets.delete(timestamp); };
@@ -156,6 +220,8 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
           for (const [key, validate] of [['preload', validPreload], ['transition', validTransition]]) {
             if (validate(entry[key])) for (const field of Object.keys(clean[key])) clean[key][field] = entry[key][field];
           }
+          if (validAudio(entry.audio)) clean.audio = { samples: entry.audio.samples, metrics: entry.audio.metrics.map(stat => [...stat]) };
+          if (validStats(entry.eventLoop, LOOP_FIELDS, entry.samples)) clean.eventLoop = entry.eventLoop.map(stat => [...stat]);
           buckets.set(entry.at, clean);
         }
         if (count(data.savedAt) && data.savedAt <= current) { lastSavedAt = data.savedAt; lastWriteAttempt = data.savedAt; }
@@ -259,6 +325,17 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
       sources.disk = 'statfs';
     }
     previous = { at, cpu, cpuSource: sources.cpu, cg, events };
+    result.eventLoopMaxMs = null;
+    result.eventLoopP99Ms = null;
+    try {
+      if (loopMonitor?.count > 0) {
+        const maximum = loopMonitor.max / 1e6;
+        const percentile = loopMonitor.percentile(99) / 1e6;
+        result.eventLoopMaxMs = numeric(maximum) && maximum <= MAX_HEALTH_VALUE ? round(maximum) : null;
+        result.eventLoopP99Ms = numeric(percentile) && percentile <= MAX_HEALTH_VALUE ? round(percentile) : null;
+      }
+      loopMonitor?.reset();
+    } catch { /* A missing histogram must not interrupt host/audio metrics. */ }
     return { at, intervalMs: elapsed > 0 ? elapsed : null, sources, ...result };
   }
   function sample() {
@@ -269,6 +346,7 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
       const target = bucket(at);
       if (target.samples < 120) {
         target.samples++;
+        addStats(target.eventLoop, LOOP_FIELDS, latest);
         FIELDS.forEach((field, i) => {
           const value = latest[field];
           if (!numeric(value)) return;
@@ -285,7 +363,14 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
   return {
     start() {
       if (closed) return Promise.resolve();
-      if (!starting) starting = (async () => { await load(); await sample(); if (!closed) { timer = schedule(sample, sampleIntervalMs); timer?.unref?.(); } })();
+      if (!starting) starting = (async () => {
+        await load();
+        if (closed) return;
+        try { loopMonitor = monitorEventLoopDelay?.({ resolution: 20 }); loopMonitor?.enable(); }
+        catch { try { loopMonitor?.disable(); } catch {} loopMonitor = undefined; }
+        await sample();
+        if (!closed) { timer = schedule(sample, sampleIntervalMs); timer?.unref?.(); }
+      })();
       return starting;
     },
     async close() {
@@ -294,6 +379,8 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
       if (timer !== undefined) unschedule(timer);
       await starting;
       await sampling;
+      try { loopMonitor?.disable(); } catch {}
+      loopMonitor = undefined;
       // Respect the same once-per-minute write limit even during shutdown.
       await persist(now());
     },
@@ -323,10 +410,24 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
       if (preloaded) target.preloadedReady++;
       recordReady(target, durationMs);
     },
+    recordAudioHealth(value = {}) {
+      if (closed || !numeric(value?.windowMs) || value.windowMs > MAX_HEALTH_VALUE) return;
+      const target = bucket(now()).audio;
+      if (target.samples >= MAX_AUDIO_SAMPLES) return;
+      const clean = {};
+      for (const field of AUDIO_FIELDS) {
+        const item = value[field];
+        clean[field] = numeric(item) && item <= MAX_HEALTH_VALUE && (!AUDIO_COUNTERS.includes(field) || count(item)) ? item : null;
+      }
+      target.samples++;
+      addStats(target.metrics, AUDIO_FIELDS, clean);
+      lastAudio = { at: now(), ...clean };
+    },
     getSnapshot() {
       const at = now();
       prune(at);
       const grouped = new Map(), playback = emptyPlayback(), preload = emptyPreload(), transition = emptyPlayback();
+      const audio = emptyAudio(), eventLoop = emptyStats(LOOP_FIELDS);
       let legacySourceOnly = false;
       for (const source of buckets.values()) {
         const timestamp = Math.floor(source.at / (5 * MINUTE)) * 5 * MINUTE;
@@ -351,6 +452,12 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
         }
         combinePlayback(target.transition, source.transition);
         combinePlayback(transition, source.transition);
+        for (const destination of [target.audio, audio]) {
+          destination.samples += source.audio.samples;
+          mergeStats(destination.metrics, source.audio.metrics);
+        }
+        mergeStats(target.eventLoop, source.eventLoop);
+        mergeStats(eventLoop, source.eventLoop);
       }
       const history = [...grouped.values()].sort((a, b) => a.at - b.at).slice(-288).map(bucketView);
       return { version: 1, sampledAt: at, sampleIntervalMs, historyIntervalMs: 5 * MINUTE, retentionMs: RETENTION,
@@ -358,6 +465,9 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
         playback: { measurement: 'source-and-packet-preparation', legacySourceOnly, ...playbackSummary(playback) },
         preload: { measurement: 'background-source-and-packet-preparation', ...preloadSummary(preload) },
         transition: { measurement: 'natural-end-to-transport-playing', ...transitionSummary(transition) },
+        audio: { measurement: 'transport-packet-reads', latest: lastAudio && at >= lastAudio.at && at - lastAudio.at <= 15000 ? structuredClone(lastAudio) : null,
+          ...audioSummary(audio) },
+        eventLoop: { resolutionMs: 20, ...statsSummary(LOOP_FIELDS, eventLoop) },
         persistence: { available: persistent, lastSavedAt } };
     },
   };
