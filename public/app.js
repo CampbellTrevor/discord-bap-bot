@@ -283,6 +283,8 @@ function clearPerformance() {
   $('performance-grid').replaceChildren();
   $('performance-chart').replaceChildren();
   $('performance-errors').replaceChildren();
+  $('performance-preload-errors').replaceChildren();
+  $('performance-legacy').hidden = true;
   $('performance-status').textContent = 'Loading host metrics…';
   $('performance-status').classList.remove('error');
 }
@@ -359,6 +361,9 @@ function drawPerformanceChart(snapshot) {
 function renderPerformance(snapshot) {
   const sample = snapshot.latest || {};
   const playback = snapshot.playback || {};
+  const preload = snapshot.preload || {};
+  const transition = snapshot.transition || {};
+  const includesPreparation = playback.measurement === 'source-and-packet-preparation';
   const grid = $('performance-grid');
   grid.replaceChildren();
   const card = (label, value, lines, title = '') => {
@@ -388,18 +393,35 @@ function renderPerformance(snapshot) {
     `OF ${metricBytes(sample.diskTotalBytes)}`,
     snapshot.persistence?.available === false ? 'HISTORY NOT SAVED' : '24H HISTORY',
   ]);
-  card('SOURCE WAIT · 24H AVG', metricTime(playback.meanReadyMs), [
+  card(includesPreparation ? 'SOURCE + PACKET PREP · 24H AVG' : 'SOURCE OPEN · 24H AVG', metricTime(playback.meanReadyMs), [
     `P95 ≤ ${metricTime(playback.p95ReadyMsUpperBound)}`,
+    `MAX ${metricTime(playback.maxReadyMs)}`,
     `${metricCount(playback.preloadedReady)} PRELOADED / ${metricCount(playback.ready)} STARTED`,
-  ], 'Time opening the audio source. P95 is a histogram upper bound; voice-gap timing is not measured.');
+  ], includesPreparation ? 'Foreground source opening and preparation of the first audio packet. P95 is a histogram upper bound.' : 'Older worker measurement: opening the audio source only.');
+  card('PRELOAD PREP · 24H AVG', metricTime(preload.meanReadyMs), [
+    `${metricCount(preload.ready)} READY · ${metricCount(preload.error)} ERRORS`,
+    `${metricCount(preload.cancelled)} CANCELLED · ${metricCount(preload.expired)} EXPIRED`,
+    `P95 ≤ ${metricTime(preload.p95ReadyMsUpperBound)} · MAX ${metricTime(preload.maxReadyMs)}`,
+  ], 'Background source and packet preparation. Lifecycle counts overlap: a ready preload may later expire or be cancelled.');
+  card('TRANSITION · 24H AVG', metricTime(transition.meanReadyMs), [
+    'NATURAL END → TRANSPORT PLAYING',
+    `P95 ≤ ${metricTime(transition.p95ReadyMsUpperBound)} · MAX ${metricTime(transition.maxReadyMs)}`,
+    `${metricCount(transition.preloadedReady)} PRELOADED / ${metricCount(transition.ready)} TRANSITIONS`,
+  ], 'Natural track end until the next resource enters Discord transport Playing. Excludes network, client and audible-gap timing.');
   const errors = $('performance-errors');
   errors.replaceChildren();
-  appendText(errors, 'strong', '', `${metricCount(playback.error)} ERRORS`);
+  appendText(errors, 'strong', '', `${metricCount(playback.error)} FOREGROUND ERRORS`);
   appendText(errors, 'span', '', `${metricCount(playback.preloadedError)} PRELOADED`);
-  for (const error of (Array.isArray(playback.errors) ? playback.errors : []).slice(0, 17)) {
-    if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code || '') || !Number.isSafeInteger(error.count) || error.count < 0) continue;
-    appendText(errors, 'span', 'performance-error-code', `${error.code.replaceAll('_', ' ')} ${metricCount(error.count)}`);
+  const preloadErrors = $('performance-preload-errors');
+  preloadErrors.replaceChildren();
+  appendText(preloadErrors, 'strong', '', `${metricCount(preload.error)} PRELOAD ERRORS`);
+  for (const [container, entries] of [[errors, playback.errors], [preloadErrors, preload.errors]]) {
+    for (const error of (Array.isArray(entries) ? entries : []).slice(0, 17)) {
+      if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code || '') || !Number.isSafeInteger(error.count) || error.count < 0) continue;
+      appendText(container, 'span', 'performance-error-code', `${error.code.replaceAll('_', ' ')} ${metricCount(error.count)}`);
+    }
   }
+  $('performance-legacy').hidden = !playback.legacySourceOnly;
   drawPerformanceChart(snapshot);
   $('performance-storage').hidden = snapshot.persistence?.available !== false;
   $('performance-content').hidden = false;

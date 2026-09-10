@@ -7,6 +7,7 @@ import {
   createAudioPlayer, createAudioResource, entersState, joinVoiceChannel,
 } from '@discordjs/voice';
 import { MusicManager, musicError } from './music.mjs';
+import { prepareAudio } from './audio-pipeline.mjs';
 
 const commands = [
   new SlashCommandBuilder().setName('play').setDescription('Request a song or playlist from Spotify or YouTube')
@@ -102,11 +103,12 @@ export function createBot({ config, media, metrics, logger = console }, dependen
     let destroyed = false;
     const transport = {
       connection,
-      play(opened, onEnd, onError) {
-        const resource = createAudioResource(opened.stream, {
+      prepare: prepareAudio,
+      play(opened, onEnd, onError, onStarted) {
+        const resource = opened.resource ?? createAudioResource(opened.stream, {
           inputType: StreamType.Arbitrary,
-          metadata: { onEnd, onError },
         });
+        resource.metadata = { onEnd, onError, onStarted };
         player.play(resource);
       },
       stop() { player.stop(true); },
@@ -121,6 +123,11 @@ export function createBot({ config, media, metrics, logger = console }, dependen
       },
     };
     player.on('stateChange', (previous, next) => {
+      if (next.status === AudioPlayerStatus.Playing && previous.resource !== next.resource) {
+        next.resource?.metadata?.onStarted?.();
+      } else if (next.status === AudioPlayerStatus.Playing && previous.status === AudioPlayerStatus.Buffering) {
+        next.resource?.metadata?.onStarted?.();
+      }
       if (next.status === AudioPlayerStatus.Idle && previous.status !== AudioPlayerStatus.Idle) {
         previous.resource?.metadata?.onEnd?.();
       }

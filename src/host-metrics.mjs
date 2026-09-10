@@ -22,7 +22,17 @@ const delta = (current, previous) => numeric(current) && numeric(previous) && cu
 const pairs = text => Object.fromEntries((text ?? '').trim().split('\n').map(line => line.trim().split(/\s+/)).filter(parts => parts.length === 2).map(([key, value]) => [key, number(value)]));
 const emptyPlayback = () => ({ ready: 0, error: 0, preloadedReady: 0, preloadedError: 0,
   readyDurationSumMs: 0, readyDurationMaxMs: 0, latencyBins: LATENCY_BOUNDS.map(() => 0), errors: {} });
-const emptyBucket = at => ({ at, samples: 0, metrics: FIELDS.map(() => [0, 0, null, null]), playback: emptyPlayback() });
+const emptyPreload = () => ({ ...emptyPlayback(), cancelled: 0, expired: 0 });
+const emptyBucket = at => ({ at, samples: 0, metrics: FIELDS.map(() => [0, 0, null, null]),
+  playback: emptyPlayback(), legacySourceOnly: false, preload: emptyPreload(), transition: emptyPlayback() });
+
+function recordReady(target, durationMs) {
+  const duration = Math.round(durationMs);
+  target.readyDurationSumMs += duration;
+  target.readyDurationMaxMs = Math.max(target.readyDurationMaxMs, duration);
+  target.latencyBins[LATENCY_BOUNDS.findIndex(bound => duration <= bound)]++;
+}
+const safeCode = code => typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : 'UNKNOWN';
 
 function addError(errors, code, amount) {
   const key = Object.hasOwn(errors, code) || Object.keys(errors).length < 16 ? code : 'OTHER';
@@ -47,6 +57,14 @@ function playbackSummary(value) {
     maxReadyMs: value.ready ? value.readyDurationMaxMs : null, p95ReadyMsUpperBound,
     errors: Object.entries(value.errors).map(([code, total]) => ({ code, count: total })).sort((a, b) => b.count - a.count) };
 }
+function preloadSummary(value) {
+  const { ready, error, meanReadyMs, maxReadyMs, p95ReadyMsUpperBound, errors } = playbackSummary(value);
+  return { ready, error, cancelled: value.cancelled, expired: value.expired, meanReadyMs, maxReadyMs, p95ReadyMsUpperBound, errors };
+}
+function transitionSummary(value) {
+  const { ready, preloadedReady, meanReadyMs, maxReadyMs, p95ReadyMsUpperBound } = playbackSummary(value);
+  return { ready, preloadedReady, meanReadyMs, maxReadyMs, p95ReadyMsUpperBound };
+}
 function bucketView(bucket) {
   const avg = {}, min = {}, max = {};
   FIELDS.forEach((field, i) => {
@@ -55,15 +73,11 @@ function bucketView(bucket) {
     min[field] = low;
     max[field] = high;
   });
-  return { at: bucket.at, samples: bucket.samples, avg, min, max, playback: playbackSummary(bucket.playback) };
+  return { at: bucket.at, samples: bucket.samples, avg, min, max,
+    playback: { ...playbackSummary(bucket.playback), legacySourceOnly: bucket.legacySourceOnly },
+    preload: preloadSummary(bucket.preload), transition: transitionSummary(bucket.transition) };
 }
-function validBucket(bucket, now) {
-  if (!bucket || !count(bucket.at) || bucket.at % MINUTE || bucket.at < now - RETENTION || bucket.at > now
-      || !count(bucket.samples) || bucket.samples > 120 || !Array.isArray(bucket.metrics) || bucket.metrics.length !== FIELDS.length) return false;
-  if (bucket.metrics.some(stat => !Array.isArray(stat) || stat.length !== 4 || !count(stat[0]) || stat[0] > bucket.samples
-      || !numeric(stat[1]) || stat[1] > 1e20 || (stat[0] === 0 ? stat[1] !== 0 || stat[2] !== null || stat[3] !== null
-        : !numeric(stat[2]) || !numeric(stat[3]) || stat[2] > stat[3]))) return false;
-  const p = bucket.playback;
+function validPlayback(p) {
   if (!p || ['ready', 'error', 'preloadedReady', 'preloadedError', 'readyDurationSumMs', 'readyDurationMaxMs'].some(key => !count(p[key]))
       || p.ready + p.error > 1000 || p.preloadedReady > p.ready || p.preloadedError > p.error
       || p.readyDurationMaxMs > 3600000 || p.readyDurationSumMs > p.ready * 3600000
@@ -73,8 +87,24 @@ function validBucket(bucket, now) {
       || Object.entries(p.errors).some(([code, amount]) => !/^[A-Z][A-Z0-9_]{0,63}$/.test(code) || !count(amount) || amount > p.error)) return false;
   return true;
 }
+function validPreload(value) {
+  return validPlayback(value) && count(value.cancelled) && count(value.expired)
+    && value.ready + value.error + value.cancelled + value.expired <= 1000
+    && value.preloadedReady === 0 && value.preloadedError === 0;
+}
+function validTransition(value) {
+  return validPlayback(value) && value.error === 0 && value.preloadedError === 0 && Object.keys(value.errors).length === 0;
+}
+function validBucket(bucket, now) {
+  if (!bucket || !count(bucket.at) || bucket.at % MINUTE || bucket.at < now - RETENTION || bucket.at > now
+      || !count(bucket.samples) || bucket.samples > 120 || !Array.isArray(bucket.metrics) || bucket.metrics.length !== FIELDS.length) return false;
+  if (bucket.metrics.some(stat => !Array.isArray(stat) || stat.length !== 4 || !count(stat[0]) || stat[0] > bucket.samples
+      || !numeric(stat[1]) || stat[1] > 1e20 || (stat[0] === 0 ? stat[1] !== 0 || stat[2] !== null || stat[3] !== null
+        : !numeric(stat[2]) || !numeric(stat[3]) || stat[2] > stat[3]))) return false;
+  return validPlayback(bucket.playback);
+}
 
-/** Records source startup and host pressure, not Discord voice gaps or a diagnosis. */
+/** Records source/packet preparation and transport transitions, not audible voice gaps. */
 export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date.now, fs = nodeFs, os = nodeOs,
   setInterval: schedule = globalThis.setInterval, clearInterval: unschedule = globalThis.clearInterval } = {}) {
   if (typeof dataDir !== 'string' || !dataDir || !Number.isSafeInteger(sampleIntervalMs) || sampleIntervalMs < 1000 || sampleIntervalMs > MINUTE) {
@@ -119,6 +149,13 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
           clean.samples = entry.samples;
           clean.metrics = entry.metrics.map(stat => [...stat]);
           for (const key of Object.keys(clean.playback)) clean.playback[key] = entry.playback[key];
+          // Version 1 history predates these additive fields. Keep its readings
+          // and source-only timing rather than dropping the existing history.
+          clean.legacySourceOnly = entry.legacySourceOnly === true ||
+            (!Object.hasOwn(entry, 'legacySourceOnly') && entry.playback.ready + entry.playback.error > 0);
+          for (const [key, validate] of [['preload', validPreload], ['transition', validTransition]]) {
+            if (validate(entry[key])) for (const field of Object.keys(clean[key])) clean[key][field] = entry[key][field];
+          }
           buckets.set(entry.at, clean);
         }
         if (count(data.savedAt) && data.savedAt <= current) { lastSavedAt = data.savedAt; lastWriteAttempt = data.savedAt; }
@@ -266,17 +303,31 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
       if (target.ready + target.error >= 1000) return;
       target[outcome]++;
       if (preloaded) target[outcome === 'ready' ? 'preloadedReady' : 'preloadedError']++;
-      if (outcome === 'ready') {
-        const duration = Math.round(durationMs);
-        target.readyDurationSumMs += duration;
-        target.readyDurationMaxMs = Math.max(target.readyDurationMaxMs, duration);
-        target.latencyBins[LATENCY_BOUNDS.findIndex(bound => duration <= bound)]++;
-      } else addError(target.errors, typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : 'UNKNOWN', 1);
+      if (outcome === 'ready') recordReady(target, durationMs);
+      else addError(target.errors, safeCode(code), 1);
+    },
+    recordPreload({ outcome, durationMs, code } = {}) {
+      if (closed || !['ready', 'error', 'cancelled', 'expired'].includes(outcome) || !numeric(durationMs) || durationMs > 3600000) return;
+      const target = bucket(now()).preload;
+      if (target.ready + target.error + target.cancelled + target.expired >= 1000) return;
+      // These count lifecycle events: a ready preload may later expire/cancel.
+      target[outcome]++;
+      if (outcome === 'ready') recordReady(target, durationMs);
+      else if (outcome === 'error') addError(target.errors, safeCode(code), 1);
+    },
+    recordTransition({ outcome, durationMs, preloaded } = {}) {
+      if (closed || outcome !== 'ready' || !numeric(durationMs) || durationMs > 3600000 || typeof preloaded !== 'boolean') return;
+      const target = bucket(now()).transition;
+      if (target.ready >= 1000) return;
+      target.ready++;
+      if (preloaded) target.preloadedReady++;
+      recordReady(target, durationMs);
     },
     getSnapshot() {
       const at = now();
       prune(at);
-      const grouped = new Map(), playback = emptyPlayback();
+      const grouped = new Map(), playback = emptyPlayback(), preload = emptyPreload(), transition = emptyPlayback();
+      let legacySourceOnly = false;
       for (const source of buckets.values()) {
         const timestamp = Math.floor(source.at / (5 * MINUTE)) * 5 * MINUTE;
         if (!grouped.has(timestamp)) grouped.set(timestamp, emptyBucket(timestamp));
@@ -291,11 +342,22 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
         });
         combinePlayback(target.playback, source.playback);
         combinePlayback(playback, source.playback);
+        target.legacySourceOnly ||= source.legacySourceOnly;
+        legacySourceOnly ||= source.legacySourceOnly;
+        for (const destination of [target.preload, preload]) {
+          combinePlayback(destination, source.preload);
+          destination.cancelled += source.preload.cancelled;
+          destination.expired += source.preload.expired;
+        }
+        combinePlayback(target.transition, source.transition);
+        combinePlayback(transition, source.transition);
       }
       const history = [...grouped.values()].sort((a, b) => a.at - b.at).slice(-288).map(bucketView);
       return { version: 1, sampledAt: at, sampleIntervalMs, historyIntervalMs: 5 * MINUTE, retentionMs: RETENTION,
         latest: latest && structuredClone(latest), history,
-        playback: { measurement: 'source-startup', ...playbackSummary(playback) },
+        playback: { measurement: 'source-and-packet-preparation', legacySourceOnly, ...playbackSummary(playback) },
+        preload: { measurement: 'background-source-and-packet-preparation', ...preloadSummary(preload) },
+        transition: { measurement: 'natural-end-to-transport-playing', ...transitionSummary(transition) },
         persistence: { available: persistent, lastSavedAt } };
     },
   };

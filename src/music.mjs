@@ -61,7 +61,7 @@ export class MusicManager extends EventEmitter {
         guildId, tracks: [], nowPlaying: null, channelId: null, channelName: null,
         transport: null, generation: 0, opened: null, abort: null,
         paused: false, opening: false, lastError: null, idleTimer: null,
-        preloads: new Map(), preloadTimer: null, retryingTrackId: null,
+        preloads: new Map(), preloadTimer: null, retryingTrackId: null, transitionStartedAt: null,
       };
       this.states.set(guildId, state);
     }
@@ -174,6 +174,11 @@ export class MusicManager extends EventEmitter {
         if (!state.nowPlaying) throw musicError('Nothing is playing.', 409);
         state.paused = false;
         state.transport?.resume();
+        // A long explicit pause can outlast a parked connection's TTL. Allow
+        // one new warm attempt on resume, without retrying provider failures.
+        for (const entry of [...state.preloads.values()]) {
+          if (entry.status === 'failed' && entry.failureOutcome === 'expired') this.dropPreload(state, entry);
+        }
         break;
       case 'skip':
         if (!state.nowPlaying) throw musicError('Nothing is playing.', 409);
@@ -263,9 +268,20 @@ export class MusicManager extends EventEmitter {
       state.abort = cached.controller;
     } else {
       if (cached) { releasedSpeculation = cached.status !== 'failed'; this.dropPreload(state, cached); }
-      // A cold foreground source has priority over every speculative extractor.
-      for (const other of this.states.values()) {
-        for (const entry of [...other.preloads.values()]) if (entry.status !== 'failed') { releasedSpeculation = true; this.dropPreload(other, entry); }
+      // Stop competing startup work, but retain already playable songs when
+      // current playback plus speculation still leaves an interactive slot.
+      for (const entry of [...this.preloadEntries]) {
+        if (entry.status !== 'ready' || entry.opened.stream.destroyed || entry.expiresAt <= Date.now()) {
+          releasedSpeculation = true;
+          this.dropPreload(entry.state, entry);
+        }
+      }
+      const foreground = [...this.states.values()].filter(other => other.transport && other.nowPlaying).length;
+      const budget = Math.min(this.preloadCount, Math.max(0, 3 - foreground));
+      while (this.preloadEntries.size > budget) {
+        const entry = [...this.preloadEntries].at(-1);
+        releasedSpeculation = true;
+        this.dropPreload(entry.state, entry);
       }
       state.abort = new AbortController();
     }
@@ -291,7 +307,13 @@ export class MusicManager extends EventEmitter {
           signal.throwIfAborted();
           try { opened = await this.media.open(track, { signal }); break; }
           catch (error) {
-            if (!releasedSpeculation || !(error instanceof MediaError) || error.code !== 'MEDIA_BUSY' || error.retryableBeforeStart !== true || attempt >= 4) throw error;
+            if (!(error instanceof MediaError) || error.code !== 'MEDIA_BUSY' || error.retryableBeforeStart !== true || attempt >= 4) throw error;
+            // Live provider/search work can consume more slots than our queue
+            // budget predicts. Only on this preflight failure sacrifice a
+            // parked source to make room for the foreground request.
+            const parked = [...this.preloadEntries].at(-1);
+            if (parked) { releasedSpeculation = true; this.dropPreload(parked.state, parked); }
+            if (!releasedSpeculation) throw error;
             // Only a no-provider-work-yet capacity failure is retryable. Killed
             // children release slots asynchronously; allow at most 750ms.
             await new Promise((resolve, reject) => {
@@ -302,6 +324,7 @@ export class MusicManager extends EventEmitter {
             });
           }
         }
+        opened = await this.prepareSource(opened, transport, signal);
       }
       if (state.generation !== generation || this.shuttingDown || state.transport !== transport) {
         metric('error');
@@ -332,13 +355,14 @@ export class MusicManager extends EventEmitter {
       opened.stream.once('close', () => opened.stream.off('error', captureStreamFailure));
       const finish = error => {
         if (state.generation !== generation) return;
+        const finishedAt = performance.now();
         const failure = streamFailure || error;
         const failedAfter = streamFailureElapsed ?? (error?.resource?.playbackDuration == null ? NaN : error.resource.playbackDuration / 1000);
         if (failure && usePreload && failedAfter < 2) {
           // A parked provider connection can fail only after its prefix drains.
           // Retry that same request once from a fresh source, before advancing.
           state.tracks.unshift(track);
-          this.cancelCurrent(state);
+          this.cancelCurrent(state, { preserveTransition: true });
           state.retryingTrackId = track.id;
           this.persistBackground(state);
           this.changed(state);
@@ -346,13 +370,20 @@ export class MusicManager extends EventEmitter {
           return;
         }
         if (failure) this.playbackFailure(state, track, failure, 'audio-playback');
-        this.cancelCurrent(state);
+        this.cancelCurrent(state, { preserveTransition: true });
+        if (!failure && state.tracks.length) state.transitionStartedAt = finishedAt;
         this.persistBackground(state);
         this.changed(state);
         this.schedule(state);
       };
       operation = 'audio-start';
-      transport.play(opened, () => finish(), error => finish(error));
+      const onStarted = () => {
+        if (state.generation !== generation || state.transitionStartedAt === null) return;
+        const durationMs = Math.max(0, performance.now() - state.transitionStartedAt);
+        state.transitionStartedAt = null;
+        try { this.emit('transitionMetric', { outcome: 'ready', durationMs, preloaded: Boolean(usePreload) }); } catch {}
+      };
+      transport.play(opened, () => finish(), error => finish(error), onStarted);
       if (state.paused) transport.pause();
       this.changed(state);
       this.syncPreloads();
@@ -362,7 +393,7 @@ export class MusicManager extends EventEmitter {
       if (state.generation !== generation || this.shuttingDown) return;
       if (usePreload && (operation === 'media-open' || streamFailure)) {
         state.tracks.unshift(track);
-        this.cancelCurrent(state);
+        this.cancelCurrent(state, { preserveTransition: true });
         state.retryingTrackId = track.id;
         this.persistBackground(state);
         this.changed(state);
@@ -370,17 +401,37 @@ export class MusicManager extends EventEmitter {
         return;
       }
       this.playbackFailure(state, track, streamFailure || error, operation);
-      this.cancelCurrent(state);
+      this.cancelCurrent(state, { preserveTransition: true });
       this.persistBackground(state);
       this.changed(state);
       this.schedule(state);
     }
   }
 
+  async prepareSource(raw, transport, signal) {
+    if (!transport.prepare) return raw;
+    try {
+      signal.throwIfAborted();
+      // Both the preparing adapter and race cleanup can release this source;
+      // route ownership through the manager's idempotent cleanup guard.
+      return await transport.prepare({ ...raw, cleanup: () => this.cleanup(raw) }, { signal });
+    } catch (error) {
+      this.cleanup(raw);
+      throw error;
+    }
+  }
+
+  preloadMetric(entry, outcome, error) {
+    const code = failureDetails(error, 'AUDIO_SOURCE_FAILED').code;
+    try { this.emit('preloadMetric', { outcome, durationMs: Math.max(0, performance.now() - entry.startedAt),
+      ...(error ? { code: SOURCE_METRIC_CODES.has(code) || SAFE_RUNTIME_CODES.has(code) ? code : 'AUDIO_SOURCE_FAILED' } : {}) }); } catch {}
+  }
+
   dropPreload(state, entry) {
     if (state.preloads.get(entry.id) === entry) state.preloads.delete(entry.id);
     this.preloadEntries.delete(entry);
     clearTimeout(entry.timer);
+    if (!['failed', 'cancelled', 'playing'].includes(entry.status)) this.preloadMetric(entry, 'cancelled');
     entry.status = 'cancelled';
     entry.controller.abort();
     this.cleanup(entry.opened);
@@ -421,17 +472,20 @@ export class MusicManager extends EventEmitter {
   }
 
   startPreload(state, track) {
-    const entry = { id: track.id, state, generation: state.generation, status: 'opening', controller: new AbortController(), opened: null, timer: null, expiresAt: 0, onError: null };
+    const transport = state.transport;
+    const entry = { id: track.id, state, generation: state.generation, status: 'opening', controller: new AbortController(), opened: null, timer: null, expiresAt: 0, onError: null, startedAt: performance.now() };
     state.preloads.set(entry.id, entry);
     this.preloadEntries.add(entry);
     const current = () => !this.shuttingDown && state.transport && state.preloads.get(entry.id) === entry && state.tracks.slice(0, this.preloadCount).some(item => item.id === entry.id);
-    const failed = error => {
+    const failed = (error, outcome = 'error') => {
       if (!current() || ['cancelled', 'playing', 'failed'].includes(entry.status)) return;
       entry.status = 'failed';
+      entry.failureOutcome = outcome;
       this.preloadEntries.delete(entry);
       clearTimeout(entry.timer);
       entry.controller.abort();
       this.cleanup(entry.opened);
+      this.preloadMetric(entry, outcome, error);
       this.logFailure('audio-preload', error, 'AUDIO_SOURCE_FAILED');
       // Keep the failed marker for this track/current-song pair. No retry loop.
     };
@@ -439,33 +493,45 @@ export class MusicManager extends EventEmitter {
       entry.controller.signal.throwIfAborted();
       const raw = await this.media.open(track, { signal: entry.controller.signal });
       if (!current() || entry.status !== 'opening') { this.cleanup(raw); return; }
-      const buffer = new PassThrough({ readableHighWaterMark: 256 * 1024, writableHighWaterMark: 16 * 1024 });
-      buffer.on('error', () => {}); // The active owner supplies the actionable handler.
-      const sourceError = error => buffer.destroy(error);
-      const sourceClose = () => {
-        if (!raw.stream.readableEnded && !buffer.destroyed) buffer.destroy(new MediaError('The preloaded audio source closed early.', 'MEDIA_UNAVAILABLE'));
-      };
-      raw.stream.once('error', sourceError);
-      raw.stream.once('close', sourceClose);
-      entry.opened = { ...raw, stream: buffer, cleanup: () => {
-        raw.stream.unpipe(buffer);
-        raw.stream.off('error', sourceError);
-        raw.stream.off('close', sourceClose);
-        this.cleanup(raw);
-        buffer.destroy();
-      } };
+      let buffer;
+      if (transport.prepare) {
+        // This is an object-mode Opus packet stream and its exact resource.
+        // Never run it through the byte-mode speculative source buffer.
+        const prepared = await this.prepareSource(raw, transport, entry.controller.signal);
+        if (!current() || entry.status !== 'opening') { this.cleanup(prepared); return; }
+        entry.opened = prepared;
+        buffer = prepared.stream;
+      } else {
+        buffer = new PassThrough({ readableHighWaterMark: 256 * 1024, writableHighWaterMark: 16 * 1024 });
+        buffer.on('error', () => {}); // The active owner supplies the actionable handler.
+        const sourceError = error => buffer.destroy(error);
+        const sourceClose = () => {
+          if (!raw.stream.readableEnded && !buffer.destroyed) buffer.destroy(new MediaError('The preloaded audio source closed early.', 'MEDIA_UNAVAILABLE'));
+        };
+        raw.stream.once('error', sourceError);
+        raw.stream.once('close', sourceClose);
+        entry.opened = { ...raw, stream: buffer, cleanup: () => {
+          raw.stream.unpipe(buffer);
+          raw.stream.off('error', sourceError);
+          raw.stream.off('close', sourceClose);
+          this.cleanup(raw);
+          buffer.destroy();
+        } };
+        raw.stream.pipe(buffer);
+        if (raw.stream.destroyed && !raw.stream.readableEnded) sourceClose();
+      }
       entry.onError = failed;
       buffer.once('error', entry.onError);
       entry.status = 'ready';
+      this.preloadMetric(entry, 'ready');
       entry.expiresAt = Date.now() + this.preloadTtlMs;
       entry.timer = setTimeout(() => {
         if (!current() || entry.status !== 'ready') return;
-        failed(new MediaError('The preloaded audio expired before playback.', 'MEDIA_UNAVAILABLE'));
+        failed(new MediaError('The preloaded audio expired before playback.', 'MEDIA_UNAVAILABLE'), 'expired');
         this.syncPreloads();
       }, this.preloadTtlMs);
       entry.timer.unref?.();
-      raw.stream.pipe(buffer);
-      if (raw.stream.destroyed && !raw.stream.readableEnded) sourceClose();
+      if (buffer.destroyed) failed(new MediaError('The preloaded audio source closed early.', 'MEDIA_UNAVAILABLE'));
     }).catch(failed);
   }
 
@@ -482,7 +548,7 @@ export class MusicManager extends EventEmitter {
     try { this.logger[level]?.('Music operation failed.', { operation, code, type }); } catch {}
   }
 
-  cancelCurrent(state) {
+  cancelCurrent(state, { preserveTransition = false } = {}) {
     // Invalidate callbacks before stop/destroy, which can synchronously emit Idle/error events.
     ++state.generation;
     state.abort?.abort();
@@ -493,6 +559,7 @@ export class MusicManager extends EventEmitter {
     state.opening = false;
     state.paused = false;
     state.retryingTrackId = null;
+    if (!preserveTransition || !state.tracks.length) state.transitionStartedAt = null;
     try { state.transport?.stop(); } catch (error) { this.logFailure('audio-stop', error, 'AUDIO_STOP_FAILED'); }
     this.cleanup(opened);
   }

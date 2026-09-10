@@ -1,8 +1,8 @@
 # Audio worker hosting
 
-## Recommendation and evidence
+## Initial hosting shortlist
 
-Checked September 9, 2026. The present Render host receives `YOUTUBE_REQUEST_BLOCKED`. Public audio extraction worked on the owner's Windows connection. Spotify supplies metadata and still depends on YouTube audio, so changing Spotify credentials will not resolve that host failure.
+The original sub-$5 shortlist was checked September 9, 2026 after Render returned `YOUTUBE_REQUEST_BLOCKED`. The deployed worker now runs on RamNode Premium; see its configuration below. Spotify supplies metadata and still depends on YouTube audio, so changing Spotify credentials does not resolve a YouTube host restriction.
 
 | Candidate | Monthly price before tax/extras | Memory | Why consider it |
 | --- | --- | --- | --- |
@@ -12,7 +12,7 @@ Checked September 9, 2026. The present Render host receives `YOUTUBE_REQUEST_BLO
 
 RamNode includes 15GB NVMe and 500GB transfer with that Lite plan. Its [billing FAQ](https://ramnode.com/support/documentation/cloud-vps/billing-faq) describes card auto-pay and prepaid credit; prepaid has a $10 initial minimum. Checkout must confirm any initial charge, applicable tax, plan availability, and the IPv4 total. Do not enable backups, extra volumes, or other paid add-ons without accounting for the strict monthly budget. Monitor transfer usage.
 
-No candidate has been tested on its actual assigned IP yet. Datacenter addresses can also be blocked by YouTube. A successful short probe is a prerequisite, not a promise of uninterrupted future access. Do not migrate or describe the bot as fixed solely because a VM was created.
+Public YouTube audio and Spotify matching have passed probes on the assigned RamNode LAX IP. Datacenter addresses can still be blocked by YouTube later. Validate playback from the actual host before any future migration; a short probe does not establish uninterrupted access or listener audio quality.
 
 ## Account access
 
@@ -62,6 +62,6 @@ Deploy workers with session-storage support before updating the portal. A portal
 
 Open the portal's **PLAYBACK HOST** panel as a server manager or DJ to inspect the audio VM. The panel is served through the authenticated worker connection; it requires no additional inbound VM port. Keep `.host-metrics.json` with data backups to retain the last 24 hours of performance history across worker recreation. It contains aggregate counters and fixed error codes, with no song titles or user IDs.
 
-The current LAX host has 2 GB RAM and one vCPU; the worker's Compose limit is 768 MiB RAM and 1,536 MiB including swap. Observe those limits under actual listening, searches, and preloading before deciding to upgrade. Host CPU steal measures time denied by the hypervisor; container throttling measures quota pressure. Source startup waits measure the media opener, not Discord voice gaps.
+The current LAX host is **2 GB Premium: two shared vCPUs and an 80 GB disk**, upgraded with the owner's approval at a quoted **$14/month including the existing IPv4 address**. The worker's Compose limit remains 768 MiB RAM and 1,536 MiB including swap. Observe actual listening, searches, and preloading through the playback-host panel. Host CPU steal measures time denied by the hypervisor; container throttling measures quota pressure. The panel separates source/packet preparation, background preload failures, and natural-end-to-player-ready transitions. These timings do not measure audible gaps at listeners.
 
 Set `MAX_QUEUE_SIZE=2000` and `MAX_TRACK_DURATION_SEC=3600` in the private worker environment. The current track counts toward queue capacity; playlist imports remain capped separately at 50 entries by default. A worker restart preserves songs and sign-ins but requires `/join` to resume voice.

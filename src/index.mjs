@@ -17,7 +17,6 @@ const configured = !config.setupMode && Boolean(config.discordClientId &&
 const bridge = remotePortal ? createWorkerBridge({ secret: config.workerSecret, trustProxy: config.production }) : null;
 const metrics = !remotePortal && !config.demo && configured ? createHostMetrics({ dataDir: config.dataDir }) : null;
 const bot = bridge?.bot || (config.demo ? createDemoBot() : configured ? createBot({ config, media: createMedia(config), metrics }) : { isReady: () => false, shutdown: async () => {} });
-bot.music?.on('playbackMetric', sample => metrics?.recordPlayback(sample));
 const durableSessions = workerOnly || (config.production && !remotePortal && !config.setupMode)
   ? new FileSessionStorage({ dataDir: config.dataDir }) : null;
 const sessionStore = remotePortal && !config.setupMode
@@ -27,6 +26,9 @@ let server;
 let appResources;
 let connection;
 let stopping = false;
+bot.music?.on('playbackMetric', sample => { if (!stopping) metrics?.recordPlayback(sample); });
+bot.music?.on('preloadMetric', sample => { if (!stopping) metrics?.recordPreload(sample); });
+bot.music?.on('transitionMetric', sample => { if (!stopping) metrics?.recordTransition(sample); });
 async function shutdown(code = 0) {
   if (stopping) return;
   stopping = true;

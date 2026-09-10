@@ -4,7 +4,8 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
-import { AudioPlayerError } from '@discordjs/voice';
+import { AudioPlayerError, StreamType } from '@discordjs/voice';
+import { prepareAudio } from '../src/audio-pipeline.mjs';
 import { MusicManager } from '../src/music.mjs';
 import { MediaError } from '../src/media.mjs';
 import { authorizeControl, authorizeJoin, createBot, formatRequestReply } from '../src/discord.mjs';
@@ -748,4 +749,173 @@ test('foreground metrics classify safe provider errors and exclude speculative a
   assert.equal(metrics[0].code, 'SPOTIFY_QUOTA_EXCEEDED');
   assert.equal(metrics[0].preloaded, false);
   assert.doesNotMatch(JSON.stringify(metrics), /Private title|guild|user-a|https/);
+});
+
+test('prepared preloads retain packet boundaries and reuse the exact ready resource at transition', async t => {
+  const sources = [];
+  const media = { async open(item) {
+    const stream = new PassThrough({ objectMode: true });
+    const opened = { stream, cleanupCount: 0, cleanup() { this.cleanupCount++; stream.destroy(); } };
+    sources.push(opened);
+    for (let i = 0; i < 40; i++) stream.write(Buffer.from([0xf8, item.title.charCodeAt(0), i]));
+    return opened;
+  } };
+  const { manager } = await fixture(t, media, { preloadCount: 2 });
+  const voice = fakeTransport();
+  let preparations = 0;
+  voice.prepare = async (raw, options) => {
+    preparations++;
+    return prepareAudio(raw, options, { demuxProbe: async stream => ({ stream, type: StreamType.Opus }) });
+  };
+  voice.play = function(opened, end, error, started) { this.plays.push({ opened, end, error, started }); started(); };
+  const preload = [], transitions = [];
+  manager.on('preloadMetric', value => preload.push(value));
+  manager.on('transitionMetric', value => transitions.push(value));
+  await manager.enqueue('guild', ['A', 'B', 'C'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  assert.equal(preparations, 3);
+  assert.equal(preload.filter(value => value.outcome === 'ready').length, 2);
+  const next = manager.state('guild').preloads.get(manager.state('guild').tracks[0].id).opened;
+  const resource = next.resource;
+  assert.equal(next.stream.readableObjectMode, true);
+  assert.equal(resource.playStream, next.stream);
+  assert.equal(resource.started, true);
+  assert.equal(transitions.length, 0);
+  voice.plays[0].end();
+  await settle();
+  assert.equal(voice.plays[1].opened, next);
+  assert.equal(voice.plays[1].opened.resource, resource);
+  assert.equal(preparations, 3, 'A warmed resource must not be re-created at handoff');
+  assert.deepEqual(next.stream.read(), Buffer.from([0xf8, 'B'.charCodeAt(0), 0]));
+  assert.equal(transitions.length, 1);
+  assert.equal(transitions[0].preloaded, true);
+  assert.ok(transitions[0].durationMs >= 0);
+  voice.plays[1].started();
+  assert.equal(transitions.length, 1, 'Repeated Playing events cannot duplicate the transition');
+  await manager.control('guild', 'stop');
+  assert.ok(sources.every(value => value.cleanupCount === 1));
+  assert.ok(sources.every(value => value.stream.destroyed));
+});
+
+test('a cancelled packet preparation is cleaned before a late result can reach playback', async t => {
+  const media = warmMedia();
+  const pending = deferred();
+  const { manager } = await fixture(t, media, { preloadCount: 2 });
+  const voice = fakeTransport();
+  const preparing = [];
+  voice.prepare = async (raw, { signal }) => {
+    preparing.push({ raw, signal });
+    if (preparing.length === 2) return pending.promise;
+    return raw;
+  };
+  const added = await manager.enqueue('guild', ['A', 'B'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  assert.equal(preparing.length, 2);
+  const events = [];
+  manager.on('preloadMetric', value => events.push(value));
+  await manager.control('guild', 'remove', added[1].id);
+  assert.equal(preparing[1].signal.aborted, true);
+  pending.resolve(preparing[1].raw);
+  await settle();
+  assert.equal(media.calls[1].opened.cleanupCount, 1);
+  assert.equal(voice.plays.length, 1);
+  assert.equal(events.filter(value => value.outcome === 'cancelled').length, 1);
+});
+
+test('natural transition timing survives unavailable queued tracks and explicit skip clears it', async t => {
+  for (const skip of [false, true]) {
+    const last = deferred();
+    const { manager } = await fixture(t, { async open(item) {
+      if (item.title === 'B') throw new MediaError('Unavailable recording.', 'UNSUPPORTED_MEDIA');
+      if (item.title === 'C') return last.promise;
+      return openedAudio();
+    } });
+    const voice = fakeTransport();
+    voice.play = function(opened, end, error, started) { this.plays.push({ opened, end, error }); started(); };
+    const transitions = [];
+    manager.on('transitionMetric', value => transitions.push(value));
+    await manager.enqueue('guild', ['A', 'B', 'C', 'D'].map(track), requester);
+    manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+    await settle();
+    voice.plays[0].end();
+    await settle();
+    assert.equal(manager.snapshot('guild').nowPlaying.title, 'C');
+    assert.equal(typeof manager.state('guild').transitionStartedAt, 'number');
+    if (skip) await manager.control('guild', 'skip');
+    last.resolve(openedAudio());
+    await settle();
+    assert.equal(transitions.length, skip ? 0 : 1);
+    assert.equal(manager.state('guild').transitionStartedAt, null);
+  }
+});
+
+test('resume after parked sources expire allows one new preload attempt', async t => {
+  const media = warmMedia();
+  const { manager } = await fixture(t, media, { preloadCount: 2, preloadTtlMs: 25 });
+  const voice = fakeTransport();
+  await manager.enqueue('guild', ['A', 'B'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  await manager.control('guild', 'pause');
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.equal(media.calls.filter(call => call.title === 'B').length, 1);
+  assert.equal(manager.preloadEntries.size, 0);
+  await manager.control('guild', 'resume');
+  await settle();
+  assert.equal(media.calls.filter(call => call.title === 'B').length, 2);
+  manager.syncPreloads();
+  await settle();
+  assert.equal(media.calls.filter(call => call.title === 'B').length, 2);
+});
+
+test('an exhausted failed queue does not count later idle time as a transition', async t => {
+  const { manager } = await fixture(t, { async open(item) {
+    if (item.title === 'B') throw new MediaError('Unavailable recording.', 'UNSUPPORTED_MEDIA');
+    return openedAudio();
+  } });
+  const voice = fakeTransport();
+  voice.play = function(opened, end, error, started) { this.plays.push({ opened, end, error }); started(); };
+  const transitions = [];
+  manager.on('transitionMetric', value => transitions.push(value));
+  await manager.enqueue('guild', ['A', 'B'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  voice.plays[0].end();
+  await settle();
+  assert.equal(manager.state('guild').transitionStartedAt, null);
+  await manager.enqueue('guild', [track('C')], requester);
+  await settle();
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'C');
+  assert.equal(transitions.length, 0);
+});
+
+test('a failed cold next track preserves the following prepared resource when capacity permits', async t => {
+  const calls = [];
+  const media = { async open(item) {
+    calls.push(item.title);
+    if (item.title === 'B') throw new MediaError('No suitable studio recording.', 'UNSUPPORTED_MEDIA');
+    const stream = new PassThrough({ objectMode: true });
+    for (let i = 0; i < 35; i++) stream.write(Buffer.from([0xf8, i]));
+    return { stream, cleanup() { stream.destroy(); } };
+  } };
+  const { manager } = await fixture(t, media, { preloadCount: 2 });
+  const voice = fakeTransport();
+  voice.prepare = (raw, options) => prepareAudio(raw, options, { demuxProbe: async stream => ({ stream, type: StreamType.Opus }) });
+  const metrics = [];
+  manager.on('playbackMetric', metric => metrics.push(metric));
+  const added = await manager.enqueue('guild', ['A', 'B', 'C'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  const prepared = manager.state('guild').preloads.get(added[2].id).opened;
+  assert.equal(prepared.resource.started, true);
+  voice.plays[0].end();
+  await settle();
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'C');
+  assert.equal(voice.plays[1].opened.resource, prepared.resource);
+  assert.equal(voice.plays[1].opened, prepared);
+  assert.equal(calls.filter(title => title === 'B').length, 2);
+  assert.equal(calls.filter(title => title === 'C').length, 1);
+  assert.deepEqual(metrics.map(metric => [metric.outcome, metric.preloaded]), [['ready', false], ['error', false], ['ready', true]]);
 });

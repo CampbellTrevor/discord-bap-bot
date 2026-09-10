@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#eee7d8">
   <meta name="description" content="Request songs and playlists from Spotify or YouTube for your Discord voice channel.">
   <title>Turntable — Discord music queue</title>
-  <link rel="stylesheet" href="/styles.css?v=host-performance-1">
-  <script src="/app.js?v=host-performance-1" defer></script>
+  <link rel="stylesheet" href="/styles.css?v=playback-timing-2">
+  <script src="/app.js?v=playback-timing-2" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to player</a>
@@ -76,14 +76,17 @@
         <div class="performance-meta"><span>LIVE HOST · 5 SEC SAMPLES</span><span id="performance-status" role="status" aria-live="polite">Loading host metrics…</span></div>
         <div class="performance-content" id="performance-content" hidden>
           <div class="performance-grid" id="performance-grid"></div>
+          <p class="performance-explanation" id="performance-legacy" hidden>Older foreground samples measure source opening only.</p>
           <section class="performance-chart-wrap" aria-label="Host pressure history">
             <div class="performance-chart-heading"><h3>24H PRESSURE</h3><span>5 MIN PEAKS</span></div>
             <div class="performance-legend"><span class="legend-cpu">CPU BUSY</span><span class="legend-steal">CPU STEAL</span><span class="legend-memory">VM RAM USED</span><span class="legend-worker">WORKER RAM / LIMIT</span></div>
             <svg class="performance-chart" id="performance-chart" viewBox="0 0 720 180" role="img" aria-label="Five-minute peaks for CPU use, CPU steal, VM memory use and worker memory use over the last 24 hours"></svg>
             <p class="performance-chart-empty" id="performance-chart-empty" hidden>Collecting history…</p>
           </section>
-          <div class="performance-source-note"><span>SOURCE STARTUP · 24H</span><span>Voice gaps are not measured</span></div>
-          <div class="performance-errors" id="performance-errors" aria-label="Source startup errors in the last 24 hours"></div>
+          <div class="performance-source-note"><span>PREPARATION · 24H</span><span>Network, client and audible gaps are not measured</span></div>
+          <div class="performance-errors" id="performance-errors" aria-label="Foreground preparation errors in the last 24 hours"></div>
+          <div class="performance-errors" id="performance-preload-errors" aria-label="Background preload preparation errors in the last 24 hours"></div>
+          <p class="performance-explanation">Preload counts are lifecycle events; ready streams can later expire or be cancelled.</p>
           <p class="performance-storage" id="performance-storage" hidden>History storage unavailable · live readings continue</p>
         </div>
       </div>

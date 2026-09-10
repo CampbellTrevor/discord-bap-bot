@@ -11,6 +11,8 @@ const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_PROCESSES = 4;
 const SEARCH_LIMIT = 5;
 const SEARCH_CANDIDATES = 10;
+const MATCH_CACHE_LIMIT = 200;
+const MATCH_CACHE_TTL_MS = 10 * 60_000;
 const EXTRACTOR_FAILURE_CODES = new Set(['YOUTUBE_REQUEST_BLOCKED', 'YOUTUBE_RATE_LIMITED', 'YOUTUBE_RESTRICTED', 'YOUTUBE_FORMAT_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'EXTRACTOR_UNAVAILABLE']);
 
 export class MediaError extends Error {
@@ -130,27 +132,86 @@ function studioScore(info) {
     + (/\bofficial\s+(?:music\s+)?video\b/iu.test(title) ? 3 : 0);
 }
 
-function spotifyMatchScore(info, track, allowLive) {
+function matchText(value) {
+  // Keep articles and the complete name: "An artist" and "Another artist"
+  // must not become equivalent after discarding common search words.
+  // Fold Latin accents only; Japanese dakuten distinguish different titles.
+  return safeText(value).normalize('NFKC')
+    .replace(/[♡♥❤]\uFE0F?|[<ᐸ]3/gu, ' <3 ')
+    .replace(/\p{Script=Latin}\p{M}*/gu, letters => letters.normalize('NFKD').replace(/\p{M}/gu, ''))
+    .toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+function namePattern(value) {
+  const name = matchText(value);
+  return name ? new RegExp(`(^| )${name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}(?= |$)`, 'gu') : null;
+}
+
+function containsName(value, name) {
+  const pattern = namePattern(name);
+  return Boolean(pattern && pattern.test(matchText(value)));
+}
+
+function removeName(value, name) {
+  const pattern = namePattern(name);
+  return pattern ? value.replace(pattern, ' ').replace(/\s+/gu, ' ').trim() : value;
+}
+
+function titleRemainder(title, wantedTitle, artists, durationKnown) {
+  // Translated titles/artist aliases are decorations only when the requested
+  // title AND artist are already present elsewhere and duration can be checked.
+  // Do not strip arbitrary prose outside a clearly delimited annotation.
+  const hasJapanese = value => /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(value);
+  const hasLatin = value => /\p{Script=Latin}/u.test(value);
+  const expected = `${wantedTitle} ${artists.join(' ')}`;
+  let reduced = safeText(title).normalize('NFKC').replace(/\([^()]*\)|\[[^\[\]]*\]|【[^【】]*】|「[^「」]*」|『[^『』]*』/gu, group => {
+    if (containsName(group, wantedTitle) || artists.some(artist => containsName(group, artist))) return group;
+    if (/\b(?:official|music video|lyrics?|visuali[sz]er|hd|hq|4k|album|single|anime|opening|ending|release)\b|TVアニメ|主題歌|発売|リリース/iu.test(group)) return ' ';
+    if (durationKnown && (hasJapanese(expected) && hasLatin(group) || hasLatin(expected) && hasJapanese(group))) return ' ';
+    return group;
+  });
+  reduced = removeName(matchText(reduced), wantedTitle);
+  for (const artist of artists) reduced = removeName(reduced, artist);
+  return reduced.split(/\s+/u).filter(Boolean).filter(word => !/^(?:official|music|audio|video|mv|m|v|lyric|lyrics|visuali[sz]er|original|studio|recording|version|album|track|full|only|hd|hq|4k|remaster(?:ed)?|(?:19|20)\d{2}|\d{3,4}p)$/u.test(word));
+}
+
+function spotifyMatchScore(info, track, allowLive, { catalog = false } = {}) {
   if (allowLive !== liveRecording(info)) return null;
   const title = safeText(info?.title);
-  const artistText = `${title} ${safeText(info?.artist)} ${safeText(info?.uploader)} ${safeText(info?.channel)}`;
+  const structuredArtists = [info?.artist, info?.creator, ...(Array.isArray(info?.artists) ? info.artists.slice(0, 10) : []),
+    ...(Array.isArray(info?.creators) ? info.creators.slice(0, 10) : [])].map(value => safeText(value)).filter(Boolean);
+  const channelNames = [info?.uploader, info?.channel].map(value => safeText(value)
+    .replace(/(?:\s*-\s*Topic|\s*VEVO|\s*Official(?:\s*YouTube)?(?:\s*Channel)?)$/iu, '').trim()).filter(Boolean);
+  const artistFields = [title, ...structuredArtists, ...channelNames];
   const withoutLiveAnnotation = value => safeText(value).replace(/\s*(?:\(|\[|[-–—])\s*live\b.*$/iu, '').replace(/\s+live\s+(?:at|from|in|on)\b.*$/iu, '');
   const wantedTitle = allowLive ? withoutLiveAnnotation(track.title) : track.title;
   const matchedTitle = allowLive ? withoutLiveAnnotation(title) : title;
-  const titleMatch = overlap(wantedTitle, matchedTitle);
-  const artistMatch = overlap(safeText(track.artist).split(',')[0], artistText);
-  if (titleMatch < 0.8 || artistMatch < 0.5) return null;
-  const expectedWords = new Set([...matchWords(wantedTitle), ...matchWords(track.artist)]);
-  const decorations = /^(?:music|mv|m|v|lyric|visuali[sz]er|original|studio|recording|version|album|track|full|only|\d{3,4}p)$/u;
-  if (matchWords(matchedTitle).some(word => !expectedWords.has(word) && !decorations.test(word))) return null;
+  const artists = safeText(track.artist).split(',').map(value => value.trim()).filter(Boolean);
+  const titleMatch = containsName(matchedTitle, wantedTitle);
+  const artistMatch = artists.length && artistFields.some(value => containsName(value, artists[0]));
+  if (!titleMatch || !artists.length) return null;
+  if (structuredArtists.length && !structuredArtists.some(value => containsName(value, artists[0]))) return null;
+  const japanese = value => /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(value);
+  const latin = value => /\p{Script=Latin}/u.test(value);
+  const aliases = channelNames.filter(value => japanese(artists[0]) && !japanese(value) && latin(value)
+    || !japanese(artists[0]) && latin(artists[0]) && japanese(value));
+  // Flat catalog entries often omit structured artist credits. A cross-script
+  // channel may be a transliteration; inspect it only after stronger matches,
+  // then require actual artist evidence in the full metadata before playback.
+  const needsArtistValidation = catalog && !artistMatch && !structuredArtists.length && aliases.length && Number.isFinite(info.duration);
+  if (!artistMatch && !needsArtistValidation) return null;
   // A cover/remix should not displace the requested studio recording merely
   // because it repeats the title and artist in its description.
-  for (const variant of ['cover', 'karaoke', 'instrumental', 'remix', 'nightcore', 'slowed', 'sped up']) {
-    if (` ${matchWords(title).join(' ')} `.includes(` ${variant} `) && !` ${matchWords(track.title).join(' ')} `.includes(` ${variant} `)) return null;
+  for (const variant of ['cover', 'karaoke', 'instrumental', 'remix', 'nightcore', 'slowed', 'sped up', 'acoustic', 'piano', 'orchestral', '8d', 'the first take']) {
+    if (containsName(title, variant) && !containsName(track.title, variant)) return null;
   }
-  const difference = typeof info.duration === 'number' ? Math.abs(info.duration - track.durationSec) : null;
+  for (const variant of ['カバー', '歌ってみた', '弾き語り', 'ライブ', 'アコースティック', 'ピアノ']) {
+    if (title.includes(variant) && !safeText(track.title).includes(variant)) return null;
+  }
+  const difference = Number.isFinite(info.duration) ? Math.abs(info.duration - track.durationSec) : null;
   if (difference !== null && difference > Math.max(15, track.durationSec * 0.15)) return null;
-  return titleMatch * 30 + artistMatch * 20 + (allowLive ? (liveRecording(info) ? 12 : -12) : studioScore(info))
+  if (titleRemainder(matchedTitle, wantedTitle, [...artists, ...aliases], difference !== null).length) return null;
+  return (artistMatch ? 50 : 0) + (allowLive ? (liveRecording(info) ? 12 : -12) : studioScore(info))
     + (difference === null ? -10 : 15 - Math.min(15, difference));
 }
 
@@ -217,6 +278,7 @@ export function createMedia(config = {}, dependencies = {}) {
   const fetch = dependencies.fetch ?? globalThis.fetch;
   const terminate = dependencies.terminate ?? terminateProcess;
   const logger = dependencies.logger ?? console;
+  const now = dependencies.now ?? Date.now;
   const resolveTimeoutMs = dependencies.resolveTimeoutMs ?? 30_000;
   const startupTimeoutMs = dependencies.startupTimeoutMs ?? 45_000;
   const playlistTimeoutMs = dependencies.playlistTimeoutMs ?? 90_000;
@@ -238,6 +300,7 @@ export function createMedia(config = {}, dependencies = {}) {
   let spotifyUserTokenRequest;
   let spotifyRefreshLoaded;
   const spotifyCache = new Map();
+  const spotifyMatches = new Map();
 
   function logExtractorFailure(error, operation) {
     if (!EXTRACTOR_FAILURE_CODES.has(error.code)) return;
@@ -356,7 +419,7 @@ export function createMedia(config = {}, dependencies = {}) {
   async function resolveYoutubeSearch(query, signal, reference) {
     const allowLive = reference?.recordingKind === 'live' || liveAnnotation(reference?.title || query);
     const candidates = (await youtubeCandidates(query, signal)).map(info => ({ info,
-      score: reference ? spotifyMatchScore(info, reference, allowLive)
+      score: reference ? spotifyMatchScore(info, reference, allowLive, { catalog: true })
         : !allowLive && liveRecording(info) ? null : overlap(query, `${info.title} ${info.uploader || info.channel || ''}`) * 50 + studioScore(info),
     })).filter(candidate => candidate.score !== null).sort((a, b) => b.score - a.score);
     // At most two full validations after one bounded catalog query. Never
@@ -660,7 +723,10 @@ export function createMedia(config = {}, dependencies = {}) {
 
   function streamYoutube(track, startupSignal, externalSignal) {
     startupSignal.throwIfAborted();
-    const child = startExtractor(['--format', 'bestaudio/best', '--output', '-'], track.playbackUrl);
+    // Prefer Discord's native codec when the public source offers it. The
+    // playback pipeline still verifies the actual stream and converts fallback
+    // formats; a provider format label is not trusted as an audio header.
+    const child = startExtractor(['--format', 'bestaudio[acodec=opus][asr=48000]/bestaudio/best', '--output', '-'], track.playbackUrl);
     return new Promise((resolve, reject) => {
       let stderr = '';
       let ready = false;
@@ -723,17 +789,41 @@ export function createMedia(config = {}, dependencies = {}) {
     }
     return withDeadline(signal, startupTimeoutMs, async deadline => {
       let playable;
+      let matchKey;
       if (track.source === 'spotify') {
         const parsed = parseQuery(track.sourceUrl);
         if (parsed.source !== 'spotify' || parsed.kind !== 'track') throw new MediaError('This Spotify track link is invalid.', 'INVALID_MEDIA');
         const query = safeText(track.searchQuery) || `${safeText(track.title)} ${safeText(track.artist)} ${track.recordingKind === 'live' || liveAnnotation(track.title) ? 'live' : 'official audio'}`;
-        playable = await resolveYoutubeSearch(query, deadline, track);
+        matchKey = JSON.stringify([parsed.id, safeText(track.title), safeText(track.artist), track.durationSec, track.recordingKind]);
+        const cached = spotifyMatches.get(matchKey);
+        if (cached) spotifyMatches.delete(matchKey);
+        if (cached && cached.expires > now()) {
+          playable = cached.track;
+          spotifyMatches.set(matchKey, cached);
+        } else {
+          playable = await resolveYoutubeSearch(query, deadline, track);
+          if (spotifyMatches.size >= MATCH_CACHE_LIMIT) spotifyMatches.delete(spotifyMatches.keys().next().value);
+          // Store only a fully validated public video ID/metadata, never a CDN
+          // URL or stream. Each open still performs normal audio extraction.
+          spotifyMatches.set(matchKey, { track: playable, expires: now() + MATCH_CACHE_TTL_MS });
+        }
       } else {
         const parsed = parseQuery(track.playbackUrl || track.sourceUrl);
         if (parsed.source !== 'youtube' || parsed.kind !== 'track') throw new MediaError('This playback link is not a YouTube video.', 'INVALID_MEDIA');
         playable = track.needsValidation ? { ...await resolveYoutube(parsed.url, deadline), needsValidation: false } : { ...track, playbackUrl: parsed.url };
       }
-      const opened = await streamYoutube(playable, deadline, signal);
+      let opened;
+      const invalidate = () => {
+        if (matchKey && spotifyMatches.get(matchKey)?.track === playable) spotifyMatches.delete(matchKey);
+      };
+      try { opened = await streamYoutube(playable, deadline, signal); }
+      catch (error) {
+        // Queue edits commonly cancel a valid preload. Keep its mapping for a
+        // later attempt, but re-search after an actual unavailable audio source.
+        if (!signal?.aborted && error.code !== 'MEDIA_BUSY') invalidate();
+        throw error;
+      }
+      if (matchKey) opened.stream.once('error', () => { if (!signal?.aborted) invalidate(); });
       return track.source === 'youtube' && track.needsValidation ? { ...opened, track: playable } : opened;
     });
   }

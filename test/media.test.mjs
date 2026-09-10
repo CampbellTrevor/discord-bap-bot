@@ -278,7 +278,7 @@ test('open returns all first audio bytes and idempotent cleanup terminates its e
   const opened = await media.open({ source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`, durationSec: 120 });
   assert.deepEqual(opened.stream.read(), audio);
   assert.equal(fake.calls[0].args.at(-1), `https://www.youtube.com/watch?v=${VIDEO}`);
-  assert.ok(fake.calls[0].args.includes('bestaudio/best'));
+  assert.ok(fake.calls[0].args.includes('bestaudio[acodec=opus][asr=48000]/bestaudio/best'));
   opened.cleanup();
   opened.cleanup();
   assert.equal(fake.stopped.length, 1);
@@ -406,7 +406,7 @@ test('unknown-duration playlist tracks are validated before audio and return cor
   assert.equal(opened.track.title, 'Validated title');
   assert.equal(opened.track.needsValidation, false);
   assert.ok(fake.calls[1].args.includes('--dump-single-json'));
-  assert.ok(fake.calls[2].args.includes('bestaudio/best'));
+  assert.ok(fake.calls[2].args.includes('bestaudio[acodec=opus][asr=48000]/bestaudio/best'));
   opened.cleanup();
 });
 
@@ -828,4 +828,146 @@ test('Spotify candidate validation keeps cancellation and duration limits', asyn
   const stalled = extractor([metadata({ entries: [first] }), () => controller.abort(new Error('skip cancelled matching'))]);
   await assert.rejects(createMedia({}, stalled).open(track, { signal: controller.signal }), /skip cancelled/);
   assert.equal(stalled.stopped.length, 1);
+});
+
+test('Spotify matching accepts Japanese song titles, redundant translations and release credits', async () => {
+  const examples = [
+    { title: 'Ref:rain', artist: 'Aimer', durationSec: 290,
+      recording: 'Aimer 『Ref:rain』MUSIC VIDEO（5th album「Sun Dance」収録）' },
+    { title: 'イマジネーション', artist: 'SPYAIR', durationSec: 177,
+      recording: 'SPYAIR「イマジネーション」(Imagination) [TVアニメ「ハイキュー!!」オープニングテーマ]' },
+    { title: 'カワキヲアメク', artist: '美波', durationSec: 252,
+      recording: '美波 (Minami) - カワキヲアメク (Kawaki wo Ameku) [Official MV]' },
+  ];
+  for (const example of examples) {
+    const full = video(1, { title: example.recording, uploader: example.artist, duration: example.durationSec });
+    const fake = extractor([metadata({ entries: [full] }), metadata(full), child => child.stdout.write('audio')]);
+    const opened = await createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`, ...example });
+    assert.equal(fake.calls.length, 3);
+    assert.equal(fake.calls[2].args.at(-1), `https://www.youtube.com/watch?v=${full.id}`);
+    opened.cleanup();
+  }
+});
+
+test('missing flat artist credits are checked in full metadata, never guessed from a transliteration', async () => {
+  const flat = video(1, { title: 'Minami「カワキヲアメク」MV', uploader: 'Minami - Topic', duration: 252 });
+  const track = { source: 'spotify', sourceUrl: `spotify:track:${TRACK}`, title: 'カワキヲアメク', artist: '美波', durationSec: 252 };
+  for (const artist of ['美波', '別の歌手', undefined]) {
+    const full = { ...flat, artist };
+    const fake = extractor([metadata({ entries: [flat] }), metadata(full), child => child.stdout.write('audio')]);
+    const pending = createMedia({}, fake).open(track);
+    if (artist === '美波') {
+      const opened = await pending;
+      assert.equal(fake.calls.length, 3);
+      opened.cleanup();
+    } else {
+      await assert.rejects(pending, { code: 'UNSUPPORTED_MEDIA' });
+      assert.equal(fake.calls.length, 2, 'Missing or contradictory full artist credits never start audio.');
+    }
+  }
+});
+
+test('matching folds Latin accents without conflating Japanese voiced characters', async () => {
+  const recording = video(1, { title: 'Beyonce - Halo (Official Audio)', uploader: 'BeyonceVEVO', duration: 261 });
+  const fake = extractor([metadata({ entries: [recording] }), metadata(recording), child => child.stdout.write('audio')]);
+  const opened = await createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
+    title: 'Halo', artist: 'Beyoncé', durationSec: 261 });
+  assert.equal(fake.calls.length, 3);
+  opened.cleanup();
+
+  const wrong = video(2, { title: '歌手 - カラス (Official Audio)', uploader: '歌手', duration: 240 });
+  const japanese = extractor([metadata({ entries: [wrong] })]);
+  await assert.rejects(createMedia({}, japanese).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
+    title: 'ガラス', artist: '歌手', durationSec: 240 }), { code: 'UNSUPPORTED_MEDIA' });
+  assert.equal(japanese.calls.length, 1);
+});
+
+test('verified provider heart spellings match Spotify artist names without dropping artist numbers', async () => {
+  const flat = { id: 'shtzavAquGs', title: 'dopamine crash!', uploader: 'han.irl♡', channel: 'han.irl♡', duration: 156 };
+  const full = { ...flat, artist: 'han.irl ᐸ3', artists: ['han.irl ᐸ3'], creator: 'han.irl ᐸ3', creators: ['han.irl ᐸ3'], duration: 155, availability: 'public' };
+  const fake = extractor([metadata({ entries: [flat] }), metadata(full), child => child.stdout.write('audio')]);
+  const opened = await createMedia({}, fake).open({ source: 'spotify', sourceUrl: 'spotify:track:4d8CJ0PFqz8jWr2nZWT7ik',
+    title: 'dopamine crash!', artist: 'han.irl <3', durationSec: 156 });
+  assert.equal(fake.calls.at(-1).args.at(-1), 'https://www.youtube.com/watch?v=shtzavAquGs');
+  opened.cleanup();
+
+  const otherArtist = video(1, { title: 'Artist 3 - A song', uploader: 'Artist 3' });
+  const mismatch = extractor([metadata({ entries: [otherArtist] })]);
+  await assert.rejects(createMedia({}, mismatch).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
+    title: 'A song', artist: 'Artist 4', durationSec: 120 }), { code: 'UNSUPPORTED_MEDIA' });
+  assert.equal(mismatch.calls.length, 1);
+});
+
+test('verified Falling Slowly official metadata matches the requested Vwillz recording', async () => {
+  const flat = { id: 'I0a8pO-4JxQ', title: 'Vwillz - Falling Slowly (Official Audio)', uploader: 'Vwillz', channel: 'Vwillz', duration: 120 };
+  const fake = extractor([metadata({ entries: [flat] }), metadata({ ...flat, creators: null, duration: 119, availability: 'public' }), child => child.stdout.write('audio')]);
+  const opened = await createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
+    title: 'Falling Slowly', artist: 'Vwillz', durationSec: 119 });
+  assert.equal(fake.calls.at(-1).args.at(-1), 'https://www.youtube.com/watch?v=I0a8pO-4JxQ');
+  opened.cleanup();
+});
+
+test('Japanese title translations cannot hide a First Take recording annotation', async () => {
+  const recording = video(1, { title: '美波 - カワキヲアメク (THE FIRST TAKE)', uploader: '美波', duration: 252 });
+  const fake = extractor([metadata({ entries: [recording] })]);
+  await assert.rejects(createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
+    title: 'カワキヲアメク', artist: '美波', durationSec: 252 }), { code: 'UNSUPPORTED_MEDIA' });
+  assert.equal(fake.calls.length, 1);
+});
+
+test('matching rejects different tracks, different artists and alternate recordings despite shared title words', async () => {
+  for (const title of ['An artist - A song 2', 'An artist - Another song', 'Another artist - A song',
+    'An artist - A song (Acoustic)', 'An artist - A song (Piano Version)', 'An artist - A song / THE FIRST TAKE',
+    'An artist - A song (THE FIRST TAKE Official Video)', 'An artist - A song [The First Take - Official Music Video]',
+    'An artist - A song (カバー)', 'An artist - A song (歌ってみた)', 'An artist - A song (Official Remix)']) {
+    const info = video(1, { title, uploader: title.startsWith('Another artist') ? 'Another artist' : 'An artist' });
+    const fake = extractor([metadata({ entries: [info] })]);
+    await assert.rejects(createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
+      title: 'A song', artist: 'An artist', durationSec: 120 }), { code: 'UNSUPPORTED_MEDIA' });
+    assert.equal(fake.calls.length, 1, title);
+  }
+});
+
+test('validated Spotify mappings survive preload cancellation but still open fresh audio each time', async () => {
+  const controller = new AbortController();
+  const fake = extractor([metadata({ entries: [youtube] }), metadata(youtube), () => controller.abort(new Error('preload moved')),
+    child => child.stdout.write('fresh audio')]);
+  const media = createMedia({}, fake);
+  const track = { source: 'spotify', sourceUrl: `spotify:track:${TRACK}`, title: 'A song', artist: 'An artist', durationSec: 120 };
+  await assert.rejects(media.open(track, { signal: controller.signal }), /preload moved/);
+  const opened = await media.open(track);
+  assert.equal(fake.calls.length, 4);
+  assert.equal(fake.calls[3].args.at(-1), `https://www.youtube.com/watch?v=${VIDEO}`);
+  assert.equal(opened.stream.read().toString(), 'fresh audio');
+  opened.cleanup();
+});
+
+test('Spotify mapping cache expires and is invalidated when audio becomes unavailable', async () => {
+  let now = 0;
+  const fresh = () => [metadata({ entries: [youtube] }), metadata(youtube), child => child.stdout.write('audio')];
+  const failedAudio = child => { child.stderr.end('ERROR: Video unavailable'); child.emit('close', 1); };
+  const fake = extractor([...fresh(), ...fresh(), failedAudio, ...fresh()]);
+  const media = createMedia({}, { ...fake, now: () => now });
+  const track = { source: 'spotify', sourceUrl: `spotify:track:${TRACK}`, title: 'A song', artist: 'An artist', durationSec: 120 };
+  (await media.open(track)).cleanup();
+  now = 10 * 60_000;
+  (await media.open(track)).cleanup();
+  assert.equal(fake.calls.length, 6, 'Expired mappings require catalog and full metadata again.');
+  await assert.rejects(media.open(track), { code: 'YOUTUBE_UNAVAILABLE' });
+  assert.equal(fake.calls.length, 7, 'Cached mappings still perform a normal public audio extraction.');
+  (await media.open(track)).cleanup();
+  assert.equal(fake.calls.length, 10, 'Unavailable mappings are not reused on the next attempt.');
+});
+
+test('Spotify validated mapping cache remains bounded and metadata-sensitive', async () => {
+  const tracks = Array.from({ length: 201 }, (_, index) => ({ source: 'spotify', sourceUrl: `spotify:track:${String(index).padStart(22, '0')}`,
+    title: 'A song', artist: 'An artist', durationSec: 120 }));
+  const fresh = () => [metadata({ entries: [youtube] }), metadata(youtube), child => child.stdout.write('audio')];
+  const fake = extractor([...tracks.flatMap(fresh), ...fresh(), ...fresh()]);
+  const media = createMedia({}, fake);
+  for (const track of tracks) (await media.open(track)).cleanup();
+  (await media.open(tracks[0])).cleanup();
+  assert.equal(fake.calls.length, 202 * 3, 'The oldest mapping is evicted after 200 entries.');
+  (await media.open({ ...tracks[0], durationSec: 121 })).cleanup();
+  assert.equal(fake.calls.length, 203 * 3, 'Changed track metadata cannot reuse an earlier validation.');
 });
