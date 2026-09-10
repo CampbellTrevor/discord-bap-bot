@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createWorkerBridge, connectWorker } from '../src/worker-bridge.mjs';
 import { MediaError } from '../src/media.mjs';
+import { MusicManager } from '../src/music.mjs';
 
 const SECRET = 'worker-test-secret-with-at-least-thirty-two-characters';
 const USER = '123456789012345678';
@@ -14,15 +15,27 @@ const CHANNEL = '323456789012345678';
 const SID = 'test-session-identifier-with-32-characters';
 const silent = { warn() {} };
 
-test('2,000 Unicode queue entries round trip without exceeding the bounded frame', async t => {
-  const tracks = Array.from({ length: 2000 }, (_, index) => ({ id: randomUUID(), title: `${index} ${'音'.repeat(300)}`, artist: '楽'.repeat(300),
-    requestedBy: { id: USER, username: 'Listener' }, durationSec: 3600, source: 'youtube', sourceUrl: 'https://www.youtube.com/watch?v=abcdefghijk' }));
-  const detail = { guild: { id: GUILD }, queue: { nowPlaying: null, tracks } };
+test('2,000 Unicode Spotify entries round trip without internal resolution metadata', async t => {
+  const tracks = Array.from({ length: 2000 }, () => ({ id: randomUUID(), title: '\u97f3'.repeat(250), artist: '\u697d'.repeat(250),
+    requestedBy: { id: USER, username: '\u97f3'.repeat(32) }, durationSec: 3600, source: 'spotify', sourceUrl: 'https://open.spotify.com/track/1234567890123456789012',
+    searchQuery: '\u97f3'.repeat(500), thumbnail: 'https://i.scdn.co/image/' + 'a'.repeat(40),
+    validation: { status: 'ready', checkedAt: 1789011000000 },
+    playbackMapping: { videoId: 'abcdefghijk', title: '\u97f3'.repeat(250), artist: '\u697d'.repeat(250), durationSec: 3600, checkedAt: 1789011000000, referenceHash: 'a'.repeat(64) } }));
+  const music = new MusicManager({ media: {}, dataDir: '.' });
+  music.state(GUILD).tracks = tracks;
+  const detail = { guild: { id: GUILD }, queue: music.snapshot(GUILD) };
+  assert.ok(Buffer.byteLength(JSON.stringify(tracks)) > 8 * 1024 * 1024);
+  assert.equal(detail.queue.tracks[0].playbackMapping, undefined);
+  assert.equal(detail.queue.tracks[0].searchQuery, undefined);
   assert.ok(Buffer.byteLength(JSON.stringify(detail)) > 1024 * 1024);
+  assert.ok(Buffer.byteLength(JSON.stringify(detail)) < 8 * 1024 * 1024);
+  const request = { added: tracks.slice(0, 100), queue: detail.queue, import: { accepted: 100, inspected: 100, warnings: [] } };
+  assert.ok(Buffer.byteLength(JSON.stringify(request)) < 8 * 1024 * 1024);
   const { bridge, connect } = await fixture(t);
-  connect(fakeBot({ detail: async () => detail }));
+  connect(fakeBot({ detail: async () => detail, request: async () => request }));
   await until(() => bridge.bot.isReady());
   assert.deepEqual(await bridge.bot.detail(GUILD, USER), detail);
+  assert.deepEqual(await bridge.bot.request(GUILD, USER, 'playlist'), request);
   assert.equal(bridge.bot.isReady(), true);
 });
 
@@ -208,6 +221,8 @@ test('worker membership failures and trusted provider codes survive without leak
   connect(fakeBot({
     detail: async () => { throw Object.assign(new Error('You must be a member of that server.'), { status: 403 }); },
     search: async (guildId, userId, query) => {
+      if (query === 'no-match') throw new MediaError('No suitable studio recording was found.', 'NO_PLAYBACK_MATCH');
+      if (query === 'removed') throw new MediaError('This YouTube recording has been removed.', 'YOUTUBE_VIDEO_UNAVAILABLE');
       if (query === 'restricted') throw new MediaError('YouTube is refusing requests from the bot host. Playback is unavailable while that restriction remains.', 'YOUTUBE_REQUEST_BLOCKED');
       if (query === 'playlist') throw new MediaError('Spotify playlist access requires owner authorization.', 'SPOTIFY_PLAYLIST_ACCESS');
       if (query === 'unsafe-typed') throw new MediaError('Raw https://provider.example/audio?token=private-token', 'YOUTUBE_UNAVAILABLE');
@@ -218,6 +233,8 @@ test('worker membership failures and trusted provider codes survive without leak
   await assert.rejects(bridge.bot.detail(GUILD, USER), { status: 403, message: 'You must be a member of that server.' });
   await assert.rejects(bridge.bot.search(GUILD, USER, 'restricted', 'youtube'), { code: 'YOUTUBE_REQUEST_BLOCKED', status: 503 });
   await assert.rejects(bridge.bot.search(GUILD, USER, 'playlist', 'spotify'), { code: 'SPOTIFY_PLAYLIST_ACCESS', message: 'Spotify playlist access requires owner authorization.' });
+  await assert.rejects(bridge.bot.search(GUILD, USER, 'no-match', 'spotify'), { code: 'NO_PLAYBACK_MATCH', status: 400, message: 'No suitable studio recording was found.' });
+  await assert.rejects(bridge.bot.search(GUILD, USER, 'removed', 'youtube'), { code: 'YOUTUBE_VIDEO_UNAVAILABLE', status: 400 });
   for (const query of ['unsafe-typed', 'untyped']) {
     await assert.rejects(bridge.bot.search(GUILD, USER, query, 'youtube'), error => {
       assert.doesNotMatch(error.message, /provider|private-token|Raw token/);

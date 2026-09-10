@@ -13,15 +13,21 @@ const SEARCH_LIMIT = 5;
 const SEARCH_CANDIDATES = 10;
 const MATCH_CACHE_LIMIT = 200;
 const MATCH_CACHE_TTL_MS = 10 * 60_000;
-const EXTRACTOR_FAILURE_CODES = new Set(['YOUTUBE_REQUEST_BLOCKED', 'YOUTUBE_RATE_LIMITED', 'YOUTUBE_RESTRICTED', 'YOUTUBE_FORMAT_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'EXTRACTOR_UNAVAILABLE']);
+const EXTRACTOR_FAILURE_CODES = new Set(['YOUTUBE_REQUEST_BLOCKED', 'YOUTUBE_RATE_LIMITED', 'YOUTUBE_RESTRICTED', 'YOUTUBE_FORMAT_UNAVAILABLE', 'YOUTUBE_VIDEO_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'EXTRACTOR_UNAVAILABLE']);
+const PERMANENT_MEDIA_CODES = new Set(['INVALID_QUERY', 'UNSUPPORTED_MEDIA', 'TRACK_TOO_LONG', 'NO_PLAYBACK_MATCH', 'YOUTUBE_VIDEO_UNAVAILABLE', 'YOUTUBE_RESTRICTED', 'SPOTIFY_NOT_FOUND', 'EMPTY_PLAYLIST']);
 
 export class MediaError extends Error {
   constructor(message, code = 'MEDIA_UNAVAILABLE') {
     super(message);
     this.name = 'MediaError';
     this.code = code;
-    this.status = ['INVALID_QUERY', 'UNSUPPORTED_MEDIA', 'INVALID_MEDIA', 'TRACK_TOO_LONG', 'SPOTIFY_NOT_FOUND', 'MEDIA_CANCELLED', 'EMPTY_PLAYLIST'].includes(code) ? 400 : 503;
+    this.status = ['INVALID_QUERY', 'UNSUPPORTED_MEDIA', 'INVALID_MEDIA', 'TRACK_TOO_LONG', 'NO_PLAYBACK_MATCH', 'YOUTUBE_VIDEO_UNAVAILABLE', 'SPOTIFY_NOT_FOUND', 'MEDIA_CANCELLED', 'EMPTY_PLAYLIST'].includes(code) ? 400 : 503;
   }
+}
+
+export function isPermanentMediaError(error) {
+  const media = error instanceof MediaError ? error : error?.cause instanceof MediaError ? error.cause : null;
+  return Boolean(media && PERMANENT_MEDIA_CODES.has(media.code));
 }
 
 function abortReason(signal) {
@@ -232,6 +238,9 @@ function youtubeFailure(stderr) {
   if (/\b429\b|too many requests|rate.?limit|This content isn(?:'|\u2019)t available,? try again later/i.test(stderr)) {
     return new MediaError('YouTube is rate limiting this bot. Please wait before trying again.', 'YOUTUBE_RATE_LIMITED');
   }
+  if (/\bHTTP(?:\/[\d.]+)?(?:\s+(?:Error|status(?: code)?))?\s*:?\s*5\d\d\b|\b(?:connection|read|connect)timeout\b|\btimed? out\b|\bconnection (?:reset|refused|aborted)\b|\btemporary failure\b/i.test(stderr)) {
+    return new MediaError('YouTube could not provide this track. Please try again when the provider connection recovers.', 'YOUTUBE_UNAVAILABLE');
+  }
   if (/no supported JavaScript runtime|JavaScript runtime[^\n]*(?:not found|unavailable|unsupported)|(?:yt-dlp-ejs|challenge solver)[^\n]*(?:not installed|missing|unavailable|unsupported)|n?sig(?:nature)? extraction failed/i.test(stderr)) {
     return new MediaError('The bot host could not run the YouTube extractor correctly. The owner needs to check yt-dlp and its JavaScript dependencies.', 'EXTRACTOR_RUNTIME_UNAVAILABLE');
   }
@@ -243,6 +252,9 @@ function youtubeFailure(stderr) {
   }
   if (/requested format is not available|no (?:video|audio|playable) formats|only images are available/i.test(stderr)) {
     return new MediaError('YouTube did not offer a playable audio format. The owner should check the extractor version; this recording may be unavailable.', 'YOUTUBE_FORMAT_UNAVAILABLE');
+  }
+  if (/\bvideo(?:\s+is|\s+was|\s+has been)?\s+(?:unavailable|not available|no longer available|removed|deleted)\b|\b(?:removed|deleted)\s+video\b|\bhas been (?:removed|deleted)\b|\bcopyright\b/i.test(stderr)) {
+    return new MediaError('This YouTube recording is unavailable or has been removed. Choose another public recording.', 'YOUTUBE_VIDEO_UNAVAILABLE');
   }
   if (/unavailable|not available|removed|deleted|copyright/i.test(stderr)) {
     return new MediaError('This YouTube recording is unavailable or has been removed. Choose another public recording.', 'YOUTUBE_UNAVAILABLE');
@@ -309,8 +321,8 @@ export function createMedia(config = {}, dependencies = {}) {
     try { logger.warn?.('YouTube extractor failed.', { operation, code: error.code }); } catch {}
   }
 
-  function startExtractor(extraArgs, target, { playlist = false } = {}) {
-    if (activeProcesses >= MAX_PROCESSES) throw new MediaError('The music provider is busy. Try again in a moment.', 'MEDIA_BUSY');
+  function startExtractor(extraArgs, target, { playlist = false, background = false } = {}) {
+    if (activeProcesses >= (background ? MAX_PROCESSES - 1 : MAX_PROCESSES)) throw new MediaError('The music provider is busy. Try again in a moment.', 'MEDIA_BUSY');
     const args = ['--ignore-config', '--no-cache-dir', playlist ? '--yes-playlist' : '--no-playlist', '--no-progress', '--no-colors', '--js-runtimes', 'node', '--socket-timeout', '10', '--retries', '1', '--extractor-retries', '1', ...extraArgs, '--', target];
     let child;
     try {
@@ -331,7 +343,7 @@ export function createMedia(config = {}, dependencies = {}) {
     if (runningProcesses.has(child)) terminate(child);
   }
 
-  function extractMetadata(target, signal, { playlist = false, search = false } = {}) {
+  function extractMetadata(target, signal, { playlist = false, search = false, background = false } = {}) {
     signal.throwIfAborted();
     const extraArgs = ['--dump-single-json', '--skip-download'];
     // Flat, lazy extraction fetches only bounded playlist metadata, never one
@@ -339,7 +351,7 @@ export function createMedia(config = {}, dependencies = {}) {
     if (playlist) extraArgs.push('--flat-playlist', '--lazy-playlist', '--playlist-items', `1:${maxPlaylistTracks + 1}`);
     // Search lists catalog metadata without resolving audio for every candidate.
     if (search) extraArgs.push('--flat-playlist', '--lazy-playlist', '--playlist-items', `1:${SEARCH_CANDIDATES}`);
-    const child = startExtractor(extraArgs, target, { playlist: playlist || search });
+    const child = startExtractor(extraArgs, target, { playlist: playlist || search, background });
     return new Promise((resolve, reject) => {
       const stdout = [];
       let stderr = '';
@@ -382,6 +394,10 @@ export function createMedia(config = {}, dependencies = {}) {
       || info.ie_key && !/^youtube$/i.test(info.ie_key)) {
       throw new MediaError('This YouTube recording is private, deleted or unavailable.', 'UNSUPPORTED_MEDIA');
     }
+    if (!flat && Array.isArray(info.formats) && !info.formats.some(format => format && typeof format.acodec === 'string'
+      && format.acodec !== 'none' && format.acodec !== 'unknown' && format.acodec.length > 0)) {
+      throw new MediaError('YouTube did not offer a playable audio format. The owner should check the extractor version; this recording may be unavailable.', 'YOUTUBE_FORMAT_UNAVAILABLE');
+    }
     const playbackUrl = youtubeUrl(info.id);
     const title = safeText(info.title);
     if (!title) throw new MediaError('YouTube did not return a track title.', 'INVALID_MEDIA');
@@ -397,13 +413,14 @@ export function createMedia(config = {}, dependencies = {}) {
     };
   }
 
-  async function resolveYoutube(target, signal) {
-    const result = await extractMetadata(target, signal);
-    return youtubeTrack(Array.isArray(result?.entries) ? result.entries.find(Boolean) : result);
+  async function resolveYoutube(target, signal, { background = false } = {}) {
+    const result = await extractMetadata(target, signal, { background });
+    const track = youtubeTrack(Array.isArray(result?.entries) ? result.entries.find(Boolean) : result);
+    return enrich(track, track, now());
   }
 
-  async function youtubeCandidates(query, signal) {
-    const result = await extractMetadata(`ytsearch${SEARCH_CANDIDATES}:${query}`, signal, { search: true });
+  async function youtubeCandidates(query, signal, { background = false } = {}) {
+    const result = await extractMetadata(`ytsearch${SEARCH_CANDIDATES}:${query}`, signal, { search: true, background });
     if (!Array.isArray(result?.entries)) throw new MediaError('YouTube returned invalid search results.', 'INVALID_MEDIA');
     const seen = new Set();
     return result.entries.slice(0, SEARCH_CANDIDATES).filter(info => {
@@ -416,23 +433,27 @@ export function createMedia(config = {}, dependencies = {}) {
     });
   }
 
-  async function resolveYoutubeSearch(query, signal, reference) {
+  async function resolveYoutubeSearch(query, signal, reference, { background = false, maxValidations = 2, excludedVideoId } = {}) {
     const allowLive = reference?.recordingKind === 'live' || liveAnnotation(reference?.title || query);
-    const candidates = (await youtubeCandidates(query, signal)).map(info => ({ info,
-      score: reference ? spotifyMatchScore(info, reference, allowLive, { catalog: true })
+    const candidates = (await youtubeCandidates(query, signal, { background })).map(info => ({ info,
+      score: info.id === excludedVideoId ? null : reference ? spotifyMatchScore(info, reference, allowLive, { catalog: true })
         : !allowLive && liveRecording(info) ? null : overlap(query, `${info.title} ${info.uploader || info.channel || ''}`) * 50 + studioScore(info),
     })).filter(candidate => candidate.score !== null).sort((a, b) => b.score - a.score);
     // At most two full validations after one bounded catalog query. Never
     // silently fall back to a known live or mismatched recording.
-    for (const { info } of candidates.slice(0, 2)) {
-      const full = await extractMetadata(youtubeUrl(info.id), signal);
+    for (const { info } of candidates.slice(0, maxValidations)) {
+      let full;
+      try { full = await extractMetadata(youtubeUrl(info.id), signal, { background }); }
+      catch (error) { if (isPermanentMediaError(error)) continue; throw error; }
+      let playable;
+      try { playable = youtubeTrack(full); }
+      catch (error) { if (isPermanentMediaError(error)) continue; throw error; }
       if (!allowLive && liveRecording(full)) continue;
       if (reference && spotifyMatchScore(full, reference, allowLive) === null) continue;
-      try { return youtubeTrack(full); }
-      catch (error) { if (!(error instanceof MediaError)) throw error; }
+      return reference ? playable : enrich(playable, playable, now());
     }
     throw new MediaError(allowLive ? 'No suitable recording was found. Choose a specific YouTube link.'
-      : 'No suitable studio recording was found. Choose a specific YouTube link.', 'UNSUPPORTED_MEDIA');
+      : 'No suitable studio recording was found. Choose a specific YouTube link.', 'NO_PLAYBACK_MATCH');
   }
 
   function playlistResult(tracks, { source, title, total, inspected, limitReached, warnings = [] }) {
@@ -776,9 +797,116 @@ export function createMedia(config = {}, dependencies = {}) {
     });
   }
 
-  async function open(track, { signal } = {}) {
+  function validatePlaybackInput(track) {
     if (!track || !['youtube', 'spotify'].includes(track.source)) throw new MediaError('This track has an unsupported source.', 'UNSUPPORTED_MEDIA');
     if (!(track.source === 'youtube' && track.needsValidation === true && track.durationSec == null)) durationSeconds(track.durationSec, maxDuration);
+  }
+
+  function referenceKey(track) {
+    const parsed = parseQuery(track.source === 'spotify' ? track.sourceUrl : track.playbackUrl || track.sourceUrl);
+    if (parsed.source !== track.source || parsed.kind !== 'track') throw new MediaError('This track has an invalid playback link.', 'INVALID_MEDIA');
+    return JSON.stringify([track.source, parsed.id || parsed.url, safeText(track.title), safeText(track.artist), track.durationSec, track.recordingKind]);
+  }
+
+  const referenceHash = track => createHash('sha256').update(referenceKey(track)).digest('hex');
+
+  function readMapping(track) {
+    const mapping = track.playbackMapping;
+    if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping) || !VIDEO_ID.test(mapping.videoId ?? '')
+      || !Number.isSafeInteger(mapping.checkedAt) || mapping.checkedAt < 0 || mapping.checkedAt > now()
+      || typeof mapping.title !== 'string' || !mapping.title || mapping.title !== safeText(mapping.title)
+      || typeof mapping.artist !== 'string' || !mapping.artist || mapping.artist !== safeText(mapping.artist)
+      || !Number.isFinite(mapping.durationSec) || mapping.durationSec <= 0 || mapping.durationSec > maxDuration
+      || mapping.referenceHash !== referenceHash(track)) return null;
+    const url = youtubeUrl(mapping.videoId);
+    if (track.source === 'youtube' && parseQuery(track.playbackUrl || track.sourceUrl).url !== url) return null;
+    // A persisted mapping contains only a public video ID and bounded metadata.
+    // Reconstruct the canonical link; never accept an embedded stream/CDN URL.
+    return { checkedAt: mapping.checkedAt, playable: { source: 'youtube', sourceUrl: url, playbackUrl: url,
+      title: mapping.title, artist: mapping.artist, durationSec: mapping.durationSec,
+      thumbnail: `https://i.ytimg.com/vi/${mapping.videoId}/hqdefault.jpg` } };
+  }
+
+  function enrich(track, playable, checkedAt) {
+    const result = { ...track };
+    if (track.source === 'youtube') {
+      for (const key of ['title', 'artist', 'durationSec', 'thumbnail']) if (Object.hasOwn(playable, key)) result[key] = playable[key];
+      result.playbackUrl = playable.playbackUrl;
+      result.needsValidation = false;
+    }
+    const videoId = new URL(playable.playbackUrl).searchParams.get('v');
+    result.playbackMapping = { videoId, title: safeText(playable.title, 'YouTube recording'), artist: safeText(playable.artist, 'YouTube'),
+      durationSec: playable.durationSec, checkedAt, referenceHash: referenceHash(result) };
+    result.validation = { status: 'ready', checkedAt };
+    return result;
+  }
+
+  function rememberMatch(key, value) {
+    spotifyMatches.delete(key);
+    if (spotifyMatches.size >= MATCH_CACHE_LIMIT) spotifyMatches.delete(spotifyMatches.keys().next().value);
+    spotifyMatches.set(key, value);
+  }
+
+  async function resolvePlayback(track, signal, { background = false, verifyMissing = false } = {}) {
+    const key = referenceKey(track);
+    const mapped = readMapping(track);
+    if (track.source === 'youtube') {
+      const parsed = parseQuery(track.playbackUrl || track.sourceUrl);
+      const fresh = mapped && mapped.checkedAt + MATCH_CACHE_TTL_MS > now();
+      const playable = fresh ? mapped.playable : track.needsValidation || mapped || verifyMissing
+        ? await resolveYoutube(parsed.url, signal, { background }) : { ...track, playbackUrl: parsed.url };
+      const checkedAt = fresh ? mapped.checkedAt : now();
+      return { playable, track: enrich(track, playable, checkedAt) };
+    }
+    let cached = spotifyMatches.get(key);
+    if (cached && cached.expires <= now()) { spotifyMatches.delete(key); cached = null; }
+    if (cached?.track) {
+      rememberMatch(key, cached);
+      return { playable: cached.track, track: enrich(track, cached.track, cached.checkedAt), matchKey: key };
+    }
+    let playable, checkedAt, excludedVideoId, maxValidations = 2;
+    if (mapped && cached?.rejectedVideoId !== track.playbackMapping.videoId) {
+      if (mapped.checkedAt + MATCH_CACHE_TTL_MS > now()) { playable = mapped.playable; checkedAt = mapped.checkedAt; }
+      else {
+        // Long queues/restarts keep their chosen recording. Recheck that public
+        // ID first; if it disappeared, one full candidate validation remains.
+        maxValidations--;
+        try {
+          const full = await extractMetadata(mapped.playable.playbackUrl, signal, { background });
+          const candidate = youtubeTrack(full);
+          const allowLive = track.recordingKind === 'live' || liveAnnotation(track.title);
+          if (spotifyMatchScore(full, track, allowLive) !== null) { playable = candidate; checkedAt = now(); }
+        } catch (error) { if (!isPermanentMediaError(error)) throw error; }
+        if (!playable) excludedVideoId = track.playbackMapping.videoId;
+      }
+    }
+    if (!playable) {
+      const query = safeText(track.searchQuery) || `${safeText(track.title)} ${safeText(track.artist)} ${track.recordingKind === 'live' || liveAnnotation(track.title) ? 'live' : 'official audio'}`;
+      playable = await resolveYoutubeSearch(query, signal, track, { background, maxValidations, excludedVideoId });
+      checkedAt = now();
+    }
+    rememberMatch(key, { track: playable, checkedAt, expires: checkedAt + MATCH_CACHE_TTL_MS });
+    return { playable, track: enrich(track, playable, checkedAt), matchKey: key };
+  }
+
+  async function preflight(track, { signal, background = false } = {}) {
+    validatePlaybackInput(track);
+    signal?.throwIfAborted();
+    if (activeResolutions >= MAX_PROCESSES || activeProcesses >= (background ? MAX_PROCESSES - 1 : MAX_PROCESSES)) {
+      throw new MediaError('The music provider is busy. Try again in a moment.', 'MEDIA_BUSY');
+    }
+    activeResolutions++;
+    try {
+      return await withDeadline(signal, resolveTimeoutMs, async deadline => {
+        const result = await resolvePlayback(track, deadline, { background, verifyMissing: true });
+        deadline.throwIfAborted();
+        return result.track;
+      });
+    } finally { activeResolutions--; }
+  }
+
+  async function open(track, { signal } = {}) {
+    validatePlaybackInput(track);
     signal?.throwIfAborted();
     if (activeProcesses >= MAX_PROCESSES) {
       const error = new MediaError('The music provider is busy. Try again in a moment.', 'MEDIA_BUSY');
@@ -788,33 +916,11 @@ export function createMedia(config = {}, dependencies = {}) {
       throw error;
     }
     return withDeadline(signal, startupTimeoutMs, async deadline => {
-      let playable;
-      let matchKey;
-      if (track.source === 'spotify') {
-        const parsed = parseQuery(track.sourceUrl);
-        if (parsed.source !== 'spotify' || parsed.kind !== 'track') throw new MediaError('This Spotify track link is invalid.', 'INVALID_MEDIA');
-        const query = safeText(track.searchQuery) || `${safeText(track.title)} ${safeText(track.artist)} ${track.recordingKind === 'live' || liveAnnotation(track.title) ? 'live' : 'official audio'}`;
-        matchKey = JSON.stringify([parsed.id, safeText(track.title), safeText(track.artist), track.durationSec, track.recordingKind]);
-        const cached = spotifyMatches.get(matchKey);
-        if (cached) spotifyMatches.delete(matchKey);
-        if (cached && cached.expires > now()) {
-          playable = cached.track;
-          spotifyMatches.set(matchKey, cached);
-        } else {
-          playable = await resolveYoutubeSearch(query, deadline, track);
-          if (spotifyMatches.size >= MATCH_CACHE_LIMIT) spotifyMatches.delete(spotifyMatches.keys().next().value);
-          // Store only a fully validated public video ID/metadata, never a CDN
-          // URL or stream. Each open still performs normal audio extraction.
-          spotifyMatches.set(matchKey, { track: playable, expires: now() + MATCH_CACHE_TTL_MS });
-        }
-      } else {
-        const parsed = parseQuery(track.playbackUrl || track.sourceUrl);
-        if (parsed.source !== 'youtube' || parsed.kind !== 'track') throw new MediaError('This playback link is not a YouTube video.', 'INVALID_MEDIA');
-        playable = track.needsValidation ? { ...await resolveYoutube(parsed.url, deadline), needsValidation: false } : { ...track, playbackUrl: parsed.url };
-      }
+      const { playable, track: validated, matchKey } = await resolvePlayback(track, deadline);
       let opened;
       const invalidate = () => {
-        if (matchKey && spotifyMatches.get(matchKey)?.track === playable) spotifyMatches.delete(matchKey);
+        if (matchKey && spotifyMatches.get(matchKey)?.track === playable) rememberMatch(matchKey, {
+          track: null, rejectedVideoId: validated.playbackMapping.videoId, expires: now() + MATCH_CACHE_TTL_MS });
       };
       try { opened = await streamYoutube(playable, deadline, signal); }
       catch (error) {
@@ -824,9 +930,9 @@ export function createMedia(config = {}, dependencies = {}) {
         throw error;
       }
       if (matchKey) opened.stream.once('error', () => { if (!signal?.aborted) invalidate(); });
-      return track.source === 'youtube' && track.needsValidation ? { ...opened, track: playable } : opened;
+      return { ...opened, track: validated };
     });
   }
 
-  return { resolve, search, open };
+  return { resolve, search, preflight, open };
 }

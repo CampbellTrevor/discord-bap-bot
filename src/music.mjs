@@ -3,11 +3,13 @@ import { randomInt, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import { MediaError } from './media.mjs';
+import { MediaError, isPermanentMediaError } from './media.mjs';
 
 const SAFE_RUNTIME_CODES = new Set(['ENOENT', 'EPIPE', 'ECONNRESET', 'ETIMEDOUT', 'ABORT_ERR', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END', 'ERR_MODULE_NOT_FOUND', 'ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_OUT_OF_RANGE']);
 const SAFE_ERROR_TYPES = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError', 'TimeoutError', 'AudioPlayerError']);
 const SOURCE_METRIC_CODES = new Set(['AUDIO_SOURCE_FAILED', 'MEDIA_CANCELLED', 'MEDIA_BUSY', 'MEDIA_TIMEOUT', 'MEDIA_UNAVAILABLE', 'INVALID_MEDIA', 'UNSUPPORTED_MEDIA', 'TRACK_TOO_LONG', 'YOUTUBE_REQUEST_BLOCKED', 'YOUTUBE_RATE_LIMITED', 'YOUTUBE_RESTRICTED', 'YOUTUBE_FORMAT_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'EXTRACTOR_UNAVAILABLE']);
+SOURCE_METRIC_CODES.add('NO_PLAYBACK_MATCH');
+SOURCE_METRIC_CODES.add('YOUTUBE_VIDEO_UNAVAILABLE');
 for (const code of ['SPOTIFY_NOT_FOUND', 'SPOTIFY_UNAVAILABLE', 'SPOTIFY_QUOTA_EXCEEDED', 'SPOTIFY_RATE_LIMITED', 'SPOTIFY_REAUTHORIZE', 'SPOTIFY_UNAUTHORIZED', 'SPOTIFY_FORBIDDEN', 'SPOTIFY_AUTH_STORAGE', 'SPOTIFY_NOT_CONFIGURED', 'SPOTIFY_PLAYLIST_ACCESS']) SOURCE_METRIC_CODES.add(code);
 
 function failureDetails(error, fallbackCode) {
@@ -34,7 +36,7 @@ export function musicError(message, status = 400) {
 
 /** Shared queue state. Voice and media adapters are injected so transitions can be tested offline. */
 export class MusicManager extends EventEmitter {
-  constructor({ media, dataDir, maxQueueSize = 2000, idleDisconnectMs = 300_000, logger = console, randomIndex = randomInt, preloadCount = 2, preloadLeadSec = 120, preloadTtlMs = 300_000 }) {
+  constructor({ media, dataDir, maxQueueSize = 2000, idleDisconnectMs = 300_000, logger = console, randomIndex = randomInt, preloadCount = 2, preloadLeadSec = 120, preloadTtlMs = 300_000, validationDelayMs = 1000, validationRetryMs = [30_000, 120_000, 600_000], validationCooldownMs = 30_000 }) {
     super();
     this.media = media;
     this.file = path.join(dataDir, 'queues.json');
@@ -52,6 +54,18 @@ export class MusicManager extends EventEmitter {
     this.preloadLeadSec = preloadLeadSec;
     this.preloadTtlMs = preloadTtlMs;
     this.preloadEntries = new Set();
+    this.validationDelayMs = validationDelayMs;
+    if (!Number.isSafeInteger(validationDelayMs) || validationDelayMs < 0 || !Number.isSafeInteger(validationCooldownMs) || validationCooldownMs < 1
+      || !Array.isArray(validationRetryMs) || !validationRetryMs.length || validationRetryMs.some(delay => !Number.isSafeInteger(delay) || delay < 1)) throw new Error('Validation timing values are invalid.');
+    this.validationRetryMs = validationRetryMs;
+    this.validationCooldownMs = validationCooldownMs;
+    this.validationEntry = null;
+    this.validationTimer = null;
+    this.validationPauses = 0;
+    this.validationCooldownUntil = 0;
+    this.validationAttempts = new Map();
+    this.validationLastGuild = null;
+    this.preloadCooldownUntil = 0;
   }
 
   state(guildId) {
@@ -85,15 +99,21 @@ export class MusicManager extends EventEmitter {
       if (restored.some(track => !track.id || typeof track.title !== 'string' || !track.requestedBy?.id)) {
         throw new Error('Invalid track in saved queue data.');
       }
-      this.state(guildId).tracks = restored;
+      this.state(guildId).tracks = restored.map(track => this.initializeValidation(track));
     }
+    this.scheduleValidation();
   }
 
   snapshot(guildId) {
     const state = this.state(guildId);
+    const publicTrack = track => {
+      if (!track) return track;
+      const { playbackMapping, searchQuery, ...visible } = track;
+      return visible;
+    };
     return structuredClone({
       guildId, channelId: state.channelId, channelName: state.channelName,
-      nowPlaying: state.nowPlaying, tracks: state.tracks,
+      nowPlaying: publicTrack(state.nowPlaying), tracks: state.tracks.map(publicTrack),
       paused: state.paused,
       playing: Boolean(state.nowPlaying && state.transport && !state.opening && !state.paused),
       lastError: state.lastError,
@@ -120,7 +140,7 @@ export class MusicManager extends EventEmitter {
     this.assertCapacity(guildId, tracks.length);
     // The capacity check and full-batch append happen before any await. Concurrent
     // requests therefore either reserve every accepted track or add nothing.
-    const added = tracks.map(track => ({ ...structuredClone(track), id: randomUUID(), requestedBy: { ...requestedBy } }));
+    const added = tracks.map(track => this.initializeValidation({ ...structuredClone(track), id: randomUUID(), requestedBy: { ...requestedBy } }));
     state.tracks.push(...added);
     this.clearIdle(state);
     await this.persist();
@@ -164,6 +184,7 @@ export class MusicManager extends EventEmitter {
 
   async control(guildId, action, trackId) {
     const state = this.state(guildId);
+    if (['shuffle', 'move-top', 'remove', 'stop', 'leave'].includes(action) && this.validationEntry?.state === state) this.cancelValidation();
     switch (action) {
       case 'pause':
         if (!state.nowPlaying) throw musicError('Nothing is playing.', 409);
@@ -198,6 +219,7 @@ export class MusicManager extends EventEmitter {
         break;
       }
       case 'stop':
+        for (const track of state.tracks) this.validationAttempts.delete(track.id);
         state.tracks = [];
         this.cancelCurrent(state);
         state.lastError = null;
@@ -209,6 +231,7 @@ export class MusicManager extends EventEmitter {
         const index = state.tracks.findIndex(track => track.id === trackId);
         if (index < 0) throw musicError('That song is no longer in the waiting queue.', 404);
         state.tracks.splice(index, 1);
+        this.validationAttempts.delete(trackId);
         break;
       }
       default:
@@ -229,6 +252,16 @@ export class MusicManager extends EventEmitter {
   schedule(state) {
     this.syncPreloads();
     if (this.shuttingDown || !state.transport || state.nowPlaying) return;
+    const firstPlayable = state.tracks.findIndex(track => track.validation?.status !== 'unavailable');
+    const skipped = firstPlayable < 0 ? state.tracks.length : firstPlayable;
+    if (skipped) {
+      const removed = state.tracks.splice(0, skipped);
+      for (const track of removed) this.validationAttempts.delete(track.id);
+      state.lastError = `Skipped ${skipped} unavailable queued track${skipped === 1 ? '' : 's'}.`;
+      this.persistBackground(state);
+      this.changed(state);
+      this.syncPreloads();
+    }
     if (!state.tracks.length) {
       if (!state.idleTimer && this.idleDisconnectMs > 0) {
         state.idleTimer = setTimeout(() => {
@@ -249,15 +282,20 @@ export class MusicManager extends EventEmitter {
   }
 
   async begin(state) {
+    // A preload failure can mark this row after schedule queued the immediate.
+    if (state.tracks[0]?.validation?.status === 'unavailable') { this.schedule(state); return; }
+    const cancelledValidation = Boolean(this.validationEntry);
+    this.cancelValidation();
     const generation = ++state.generation;
     const transport = state.transport;
     state.nowPlaying = state.tracks.shift();
     state.opening = true;
     state.paused = false;
     const track = state.nowPlaying;
+    this.validationAttempts.delete(track.id);
     const cached = state.preloads.get(track.id);
     const usePreload = cached?.status === 'ready' && !cached.opened.stream.destroyed && cached.expiresAt > Date.now() && state.retryingTrackId !== track.id;
-    let releasedSpeculation = false;
+    let releasedSpeculation = cancelledValidation;
     state.retryingTrackId = null;
     if (usePreload) {
       state.preloads.delete(track.id);
@@ -267,7 +305,7 @@ export class MusicManager extends EventEmitter {
       cached.status = 'playing';
       state.abort = cached.controller;
     } else {
-      if (cached) { releasedSpeculation = cached.status !== 'failed'; this.dropPreload(state, cached); }
+      if (cached) { releasedSpeculation ||= cached.status !== 'failed'; this.dropPreload(state, cached); }
       // Stop competing startup work, but retain already playable songs when
       // current playback plus speculation still leaves an interactive slot.
       for (const entry of [...this.preloadEntries]) {
@@ -277,7 +315,7 @@ export class MusicManager extends EventEmitter {
         }
       }
       const foreground = [...this.states.values()].filter(other => other.transport && other.nowPlaying).length;
-      const budget = Math.min(this.preloadCount, Math.max(0, 3 - foreground));
+      const budget = Math.min(this.preloadCount, Math.max(0, 3 - foreground - Number(Boolean(this.validationEntry))));
       while (this.preloadEntries.size > budget) {
         const entry = [...this.preloadEntries].at(-1);
         releasedSpeculation = true;
@@ -333,10 +371,10 @@ export class MusicManager extends EventEmitter {
       }
       if (opened.stream.destroyed) throw new MediaError('The audio source ended before playback could start.', 'MEDIA_UNAVAILABLE');
       metric('ready');
-      if (track.source === 'youtube' && track.needsValidation && opened.track) {
+      if (opened.track) {
         // Playlist discovery can omit duration. Media validates before playback;
         // enrich only display fields, retaining request ownership and source identity.
-        for (const key of ['title', 'artist', 'durationSec', 'thumbnail', 'needsValidation']) {
+        for (const key of ['title', 'artist', 'durationSec', 'thumbnail', 'needsValidation', 'playbackMapping', 'validation']) {
           if (Object.hasOwn(opened.track, key)) track[key] = opened.track[key];
         }
         this.persistBackground(state);
@@ -421,6 +459,126 @@ export class MusicManager extends EventEmitter {
     }
   }
 
+  initializeValidation(track) {
+    if (!this.media.preflight) return track;
+    const value = track.validation;
+    const fresh = Number.isFinite(value?.checkedAt) && value.checkedAt <= Date.now();
+    if (value?.status === 'ready' && fresh && Date.now() - value.checkedAt <= 600_000) return track;
+    if (value?.status === 'unavailable' && fresh && Date.now() - value.checkedAt <= 86_400_000) return track;
+    if (value?.status === 'retry' && Number.isFinite(value.retryAt)) return track;
+    track.validation = { status: 'pending' };
+    return track;
+  }
+
+  applyValidatedTrack(track, result) {
+    for (const key of ['title', 'artist', 'durationSec', 'thumbnail', 'needsValidation', 'playbackMapping']) {
+      if (Object.hasOwn(result, key)) track[key] = structuredClone(result[key]);
+    }
+    if (this.media.preflight) track.validation = { status: 'ready', checkedAt: Date.now() };
+    this.validationAttempts.delete(track.id);
+  }
+
+  validationFailure(track, error) {
+    const checkedAt = Date.now();
+    const details = failureDetails(error, 'AUDIO_SOURCE_FAILED');
+    const code = SOURCE_METRIC_CODES.has(details.code) ? details.code : 'AUDIO_SOURCE_FAILED';
+    if (isPermanentMediaError(error)) {
+      track.validation = { status: 'unavailable', checkedAt, code };
+      this.validationAttempts.delete(track.id);
+    } else {
+      const attempts = (this.validationAttempts.get(track.id) ?? 0) + 1;
+      this.validationAttempts.set(track.id, attempts);
+      const delay = this.validationRetryMs[Math.min(attempts - 1, this.validationRetryMs.length - 1)];
+      track.validation = { status: 'retry', checkedAt, code, retryAt: checkedAt + delay };
+    }
+  }
+
+  cancelValidation() {
+    const entry = this.validationEntry;
+    if (!entry || entry.controller.signal.aborted) return;
+    entry.controller.abort();
+    if (entry.state.tracks.includes(entry.track) && entry.track.validation === entry.marker) {
+      entry.track.validation = { status: 'pending' };
+      this.persistBackground(entry.state);
+      this.changed(entry.state);
+    }
+  }
+
+  pausePreflight() {
+    this.validationPauses++;
+    clearTimeout(this.validationTimer);
+    this.validationTimer = null;
+    this.cancelValidation();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.validationPauses--;
+      this.scheduleValidation();
+    };
+  }
+
+  scheduleValidation(delay = this.validationDelayMs) {
+    if (!this.media.preflight || this.shuttingDown || this.validationPauses || this.validationEntry || this.validationTimer) return;
+    if (![...this.states.values()].some(state => state.tracks.some(track => ['pending', 'checking', 'retry'].includes(track.validation?.status)))) return;
+    this.validationTimer = setTimeout(() => {
+      this.validationTimer = null;
+      this.startValidation();
+    }, Math.max(delay, this.validationCooldownUntil - Date.now(), 0));
+    this.validationTimer.unref?.();
+  }
+
+  startValidation() {
+    if (!this.media.preflight || this.shuttingDown || this.validationPauses || this.validationEntry) return;
+    const states = [...this.states.values()];
+    if (states.some(state => state.opening) || states.filter(state => state.transport && state.nowPlaying).length + this.preloadEntries.size >= 3) return;
+    const after = states.findIndex(state => state.guildId === this.validationLastGuild) + 1;
+    const ordered = [...states.slice(after), ...states.slice(0, after)];
+    let selected, nextRetry = Infinity;
+    for (const state of ordered) {
+      for (let index = 0; index < state.tracks.length; index++) {
+        const track = state.tracks[index], status = track.validation?.status;
+        if (state.preloads.has(track.id) || !['pending', 'checking', 'retry'].includes(status)) continue;
+        if (status === 'retry' && track.validation.retryAt > Date.now()) { nextRetry = Math.min(nextRetry, track.validation.retryAt); continue; }
+        if (!selected || index < selected.index) selected = { state, track, index };
+        break;
+      }
+    }
+    if (!selected) {
+      if (Number.isFinite(nextRetry)) this.scheduleValidation(Math.max(this.validationDelayMs, nextRetry - Date.now()));
+      return;
+    }
+    const { state, track } = selected;
+    const marker = { status: 'checking' };
+    const entry = { state, track, marker, controller: new AbortController() };
+    this.validationEntry = entry;
+    this.validationLastGuild = state.guildId;
+    track.validation = marker;
+    this.persistBackground(state);
+    this.changed(state);
+    const current = () => !this.shuttingDown && !entry.controller.signal.aborted && state.tracks.includes(track) && track.validation === marker;
+    void Promise.resolve().then(async () => {
+      entry.controller.signal.throwIfAborted();
+      const result = await this.media.preflight(structuredClone(track), { signal: entry.controller.signal, background: true });
+      if (!current()) return;
+      this.applyValidatedTrack(track, result);
+      this.persistBackground(state);
+      this.changed(state);
+    }).catch(error => {
+      if (!current()) return;
+      this.validationFailure(track, error);
+      if (!isPermanentMediaError(error)) this.validationCooldownUntil = Date.now() + (error?.code === 'MEDIA_BUSY' ? this.validationDelayMs : this.validationCooldownMs);
+      this.persistBackground(state);
+      this.changed(state);
+    }).finally(() => {
+      if (this.validationEntry === entry) this.validationEntry = null;
+      if (!this.shuttingDown) {
+        for (const value of this.states.values()) this.schedule(value);
+        this.scheduleValidation();
+      }
+    });
+  }
+
   preloadMetric(entry, outcome, error) {
     const code = failureDetails(error, 'AUDIO_SOURCE_FAILED').code;
     try { this.emit('preloadMetric', { outcome, durationMs: Math.max(0, performance.now() - entry.startedAt),
@@ -437,19 +595,32 @@ export class MusicManager extends EventEmitter {
     this.cleanup(entry.opened);
   }
 
+  preloadTracks(state) {
+    return state.tracks.filter(track => track.validation?.status !== 'unavailable'
+      && !(state.preloads.get(track.id)?.status === 'failed' && state.preloads.get(track.id).generation === state.generation)).slice(0, this.preloadCount);
+  }
+
   syncPreloads() {
     let foreground = 0;
     for (const state of this.states.values()) {
       if (state.transport && state.nowPlaying) foreground += 1;
       clearTimeout(state.preloadTimer);
       state.preloadTimer = null;
-      const wanted = new Set(!this.shuttingDown && state.transport ? state.tracks.slice(0, this.preloadCount).map(track => track.id) : []);
+      const wanted = new Set(!this.shuttingDown && state.transport ? this.preloadTracks(state).map(track => track.id) : []);
+      const queued = new Set(state.tracks.map(track => track.id));
       for (const entry of [...state.preloads.values()]) {
-        if (!wanted.has(entry.id) || entry.status === 'failed' && entry.generation !== state.generation) this.dropPreload(state, entry);
+        if (entry.status === 'failed') {
+          if (this.shuttingDown || !state.transport || !queued.has(entry.id) || entry.generation !== state.generation) this.dropPreload(state, entry);
+        } else if (!wanted.has(entry.id)) this.dropPreload(state, entry);
       }
     }
+    if (this.validationEntry && [...this.states.values()].some(state => {
+      if (!state.transport || !state.nowPlaying || state.opening || state.paused) return false;
+      const remaining = Number(state.nowPlaying.durationSec) - Math.max(0, state.transport.elapsedSec?.() || 0);
+      return (!Number.isFinite(remaining) || remaining <= this.preloadLeadSec) && this.preloadTracks(state).some(track => !state.preloads.has(track.id));
+    })) this.cancelValidation();
     // Reserve one of media's four extractor slots for interactive lookups.
-    const budget = Math.min(this.preloadCount, Math.max(0, 3 - foreground));
+    const budget = Math.min(this.preloadCount, Math.max(0, 3 - foreground - Number(Boolean(this.validationEntry))));
     while (this.preloadEntries.size > budget) {
       const entry = [...this.preloadEntries].at(-1);
       this.dropPreload(entry.state, entry);
@@ -463,12 +634,19 @@ export class MusicManager extends EventEmitter {
         state.preloadTimer.unref?.();
         continue;
       }
-      for (const track of state.tracks.slice(0, this.preloadCount)) {
+      if (this.preloadCooldownUntil > Date.now()) {
+        state.preloadTimer = setTimeout(() => this.syncPreloads(), this.preloadCooldownUntil - Date.now());
+        state.preloadTimer.unref?.();
+        continue;
+      }
+      for (const track of this.preloadTracks(state)) {
         if (this.preloadEntries.size >= budget) break;
         if (state.preloads.has(track.id)) continue;
+        if (this.validationEntry) { this.cancelValidation(); break; }
         this.startPreload(state, track);
       }
     }
+    this.scheduleValidation();
   }
 
   startPreload(state, track) {
@@ -476,7 +654,7 @@ export class MusicManager extends EventEmitter {
     const entry = { id: track.id, state, generation: state.generation, status: 'opening', controller: new AbortController(), opened: null, timer: null, expiresAt: 0, onError: null, startedAt: performance.now() };
     state.preloads.set(entry.id, entry);
     this.preloadEntries.add(entry);
-    const current = () => !this.shuttingDown && state.transport && state.preloads.get(entry.id) === entry && state.tracks.slice(0, this.preloadCount).some(item => item.id === entry.id);
+    const current = () => !this.shuttingDown && state.transport && state.preloads.get(entry.id) === entry && this.preloadTracks(state).some(item => item.id === entry.id);
     const failed = (error, outcome = 'error') => {
       if (!current() || ['cancelled', 'playing', 'failed'].includes(entry.status)) return;
       entry.status = 'failed';
@@ -487,12 +665,24 @@ export class MusicManager extends EventEmitter {
       this.cleanup(entry.opened);
       this.preloadMetric(entry, outcome, error);
       this.logFailure('audio-preload', error, 'AUDIO_SOURCE_FAILED');
+      if (outcome !== 'expired' && this.media.preflight && isPermanentMediaError(error)) {
+        this.validationFailure(track, error);
+        this.persistBackground(state);
+        this.changed(state);
+      }
+      if (outcome !== 'expired' && !isPermanentMediaError(error)) this.preloadCooldownUntil = Date.now() + (error?.code === 'MEDIA_BUSY' ? this.validationDelayMs : this.validationCooldownMs);
       // Keep the failed marker for this track/current-song pair. No retry loop.
+      setImmediate(() => { if (!this.shuttingDown) this.syncPreloads(); });
     };
     void Promise.resolve().then(async () => {
       entry.controller.signal.throwIfAborted();
       const raw = await this.media.open(track, { signal: entry.controller.signal });
       if (!current() || entry.status !== 'opening') { this.cleanup(raw); return; }
+      if (raw.track) {
+        this.applyValidatedTrack(track, raw.track);
+        this.persistBackground(state);
+        this.changed(state);
+      }
       let buffer;
       if (transport.prepare) {
         // This is an object-mode Opus packet stream and its exact resource.
@@ -604,6 +794,9 @@ export class MusicManager extends EventEmitter {
 
   async shutdown() {
     this.shuttingDown = true;
+    clearTimeout(this.validationTimer);
+    this.validationTimer = null;
+    this.cancelValidation();
     this.syncPreloads();
     for (const state of this.states.values()) {
       if (state.nowPlaying) state.tracks.unshift(state.nowPlaying);

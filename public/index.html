@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#eee7d8">
   <meta name="description" content="Request songs and playlists from Spotify or YouTube for your Discord voice channel.">
   <title>Turntable — Discord music queue</title>
-  <link rel="stylesheet" href="/styles.css?v=audio-health-3">
-  <script src="/app.js?v=audio-health-3" defer></script>
+  <link rel="stylesheet" href="/styles.css?v=queue-validation-4">
+  <script src="/app.js?v=queue-validation-4" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to player</a>
@@ -66,7 +66,7 @@
         <div class="queue-empty" id="queue-empty"><strong>THE QUEUE IS EMPTY</strong><p id="queue-empty-copy">Connect Discord, select your server, and add a song.</p></div>
         <ol class="queue" id="queue-list" aria-label="Upcoming tracks; scroll for more songs" tabindex="0" hidden></ol>
         <footer class="queue-footer"><span>TOTAL RUN TIME</span><strong id="queue-duration">0:00</strong></footer>
-        <p class="queue-note" id="queue-note" hidden>Move ↑ and shuffle reorder upcoming tracks.</p>
+        <p class="queue-note" id="queue-note" hidden>Move ↑ and shuffle reorder upcoming tracks. Matched means playback metadata was checked.</p>
       </div>
     </section>
 

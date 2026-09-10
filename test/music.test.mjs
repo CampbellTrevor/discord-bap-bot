@@ -15,6 +15,13 @@ const quiet = { info() {}, warn() {}, error() {} };
 const track = title => ({ title, artist: 'Artist', source: 'youtube', sourceUrl: 'https://www.youtube.com/watch?v=abcdefghijk', durationSec: 120 });
 const turn = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
+async function until(predicate) {
+  const deadline = Date.now() + 2000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) assert.fail('Timed out waiting for the bounded test operation.');
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
 
 function openedAudio() {
   const value = { stream: new PassThrough(), cleanupCount: 0 };
@@ -918,4 +925,198 @@ test('a failed cold next track preserves the following prepared resource when ca
   assert.equal(calls.filter(title => title === 'B').length, 2);
   assert.equal(calls.filter(title => title === 'C').length, 1);
   assert.deepEqual(metrics.map(metric => [metric.outcome, metric.preloaded]), [['ready', false], ['error', false], ['ready', true]]);
+});
+
+test('playlist admission returns before serial background checks and removed rows cannot return through late results', async t => {
+  const checks = [];
+  const { manager } = await fixture(t, { async preflight(item, options) {
+    const pending = deferred(); checks.push({ item, options, pending }); return pending.promise;
+  } }, { validationDelayMs: 10 });
+  const added = await manager.enqueue('guild', Array.from({ length: 50 }, (_, index) => track(`Track ${index}`)), requester);
+  assert.equal(added.length, 50);
+  assert.equal(checks.length, 0);
+  assert.ok(added.every(item => item.validation.status === 'pending'));
+  await until(() => checks.length === 1);
+  assert.equal(checks[0].options.background, true);
+  assert.equal(manager.snapshot('guild').tracks[0].validation.status, 'checking');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(checks.length, 1);
+  checks[0].pending.resolve({ ...checks[0].item, id: 'must-not-replace-request-id', requestedBy: { id: 'other' }, validation: { status: 'ready' }, playbackMapping: { videoId: 'abcdefghijk' } });
+  await until(() => checks.length === 2);
+  assert.equal(manager.snapshot('guild').tracks[0].id, added[0].id);
+  assert.equal(manager.snapshot('guild').tracks[0].requestedBy.id, requester.id);
+  assert.equal(manager.snapshot('guild').tracks[0].validation.status, 'ready');
+  await manager.control('guild', 'stop');
+  assert.equal(checks[1].options.signal.aborted, true);
+  checks[1].pending.resolve(checks[1].item);
+  await settle();
+  assert.equal(manager.snapshot('guild').tracks.length, 0);
+  assert.equal(manager.validationEntry, null);
+});
+
+test('known unavailable rows stay visible until the head, then skip in a batch without foreground opening', async t => {
+  const opened = [];
+  const media = { async preflight(item) {
+    if (item.title.startsWith('Bad')) throw new MediaError('No suitable recording.', 'NO_PLAYBACK_MATCH');
+    return item;
+  }, async open(item) { opened.push(item.title); return openedAudio(); } };
+  const { manager } = await fixture(t, media, { validationDelayMs: 5 });
+  await manager.enqueue('guild', ['Bad A', 'Bad B', 'Good'].map(track), requester);
+  await until(() => manager.snapshot('guild').tracks.every(item => ['unavailable', 'ready'].includes(item.validation.status)));
+  assert.equal(manager.snapshot('guild').tracks.length, 3);
+  manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
+  await settle();
+  assert.deepEqual(opened, ['Good']);
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'Good');
+  assert.equal(manager.snapshot('guild').tracks.length, 0);
+});
+
+test('an entirely unavailable queue becomes empty and idle without retrying its tracks', async t => {
+  const { manager } = await fixture(t, { async preflight() { throw new MediaError('No suitable recording.', 'NO_PLAYBACK_MATCH'); },
+    open() { assert.fail('Known unavailable tracks must not open'); } }, { validationDelayMs: 5 });
+  await manager.enqueue('guild', ['Bad A', 'Bad B'].map(track), requester);
+  await until(() => manager.snapshot('guild').tracks.every(item => item.validation.status === 'unavailable'));
+  manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
+  await settle();
+  assert.equal(manager.snapshot('guild').nowPlaying, null);
+  assert.deepEqual(manager.snapshot('guild').tracks, []);
+});
+
+test('a transient background outage backs off globally instead of checking the whole playlist', async t => {
+  let checks = 0;
+  const { manager } = await fixture(t, { async preflight() { checks++; throw new MediaError('Provider timed out.', 'MEDIA_TIMEOUT'); } },
+    { validationDelayMs: 5, validationCooldownMs: 100, validationRetryMs: [150, 300, 500] });
+  const added = await manager.enqueue('guild', Array.from({ length: 50 }, (_, index) => track(`Track ${index}`)), requester);
+  await until(() => manager.snapshot('guild').tracks[0].validation.status === 'retry');
+  const status = manager.snapshot('guild').tracks[0].validation;
+  assert.equal(status.code, 'MEDIA_TIMEOUT');
+  assert.ok(status.retryAt > status.checkedAt);
+  await new Promise(resolve => setTimeout(resolve, 35));
+  assert.equal(checks, 1);
+  assert.equal(manager.snapshot('guild').tracks.length, 50);
+  await manager.control('guild', 'remove', added[0].id);
+  assert.equal(manager.validationAttempts.size, 0);
+  await manager.control('guild', 'stop');
+});
+
+test('restore backfills checking and old validation while keeping fresh terminal statuses', async t => {
+  const { manager, dataDir } = await fixture(t);
+  await manager.enqueue('guild', ['Checking', 'Ready', 'Unavailable', 'Legacy'].map(track), requester);
+  const rows = manager.state('guild').tracks;
+  rows[0].validation = { status: 'checking' };
+  rows[1].validation = { status: 'ready', checkedAt: Date.now() };
+  rows[2].validation = { status: 'unavailable', checkedAt: Date.now(), code: 'NO_PLAYBACK_MATCH' };
+  await manager.persist();
+  const checks = [];
+  const restored = new MusicManager({ media: { async preflight(item) { checks.push(item.title); return item; } }, dataDir,
+    logger: quiet, validationDelayMs: 5 });
+  await restored.restore();
+  assert.deepEqual(restored.snapshot('guild').tracks.map(item => item.validation.status), ['pending', 'ready', 'unavailable', 'pending']);
+  await until(() => checks.length === 2);
+  assert.deepEqual(checks, ['Checking', 'Legacy']);
+  await restored.shutdown();
+});
+
+test('permanent preload failures extend lookahead to the next two playable requests', async t => {
+  const media = warmMedia();
+  const normal = media.open.bind(media);
+  media.preflight = async item => item;
+  media.open = async (item, options) => {
+    if (item.title === 'Bad') throw new MediaError('No suitable recording.', 'NO_PLAYBACK_MATCH');
+    return normal(item, options);
+  };
+  const { manager } = await fixture(t, media, { preloadCount: 2, validationDelayMs: 1000 });
+  const voice = fakeTransport();
+  await manager.enqueue('guild', ['Current', 'Bad', 'Next', 'Following'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  assert.equal(manager.snapshot('guild').tracks[0].validation.status, 'unavailable');
+  assert.deepEqual([...manager.preloadEntries].map(entry => manager.state('guild').tracks.find(item => item.id === entry.id).title), ['Next', 'Following']);
+  assert.equal(manager.preloadEntries.size, 2);
+  voice.plays[0].end();
+  await settle();
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'Next');
+  assert.equal(media.calls.filter(call => call.title === 'Next').length, 1);
+});
+
+test('transient preload failures cool down lookahead and keep the original foreground request', async t => {
+  const media = warmMedia();
+  const normal = media.open.bind(media);
+  let badAttempts = 0;
+  media.open = async (item, options) => {
+    if (item.title === 'Transient' && ++badAttempts === 1) throw new MediaError('Provider timed out.', 'MEDIA_TIMEOUT');
+    return normal(item, options);
+  };
+  const { manager } = await fixture(t, media, { preloadCount: 2, validationCooldownMs: 100 });
+  const voice = fakeTransport();
+  await manager.enqueue('guild', ['Current', 'Transient', 'Next', 'Following'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  await new Promise(resolve => setTimeout(resolve, 35));
+  assert.equal(media.calls.some(call => call.title === 'Following'), false);
+  assert.equal(manager.snapshot('guild').tracks[0].validation?.status, undefined);
+  await until(() => media.calls.some(call => call.title === 'Following'));
+  assert.equal(badAttempts, 1);
+  voice.plays[0].end();
+  await settle();
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'Transient');
+  assert.equal(badAttempts, 2);
+});
+
+test('a permanent preload failure between scheduling and beginning cannot open the bad head again', async t => {
+  const media = warmMedia(); media.preflight = async item => item;
+  const { manager } = await fixture(t, media, { preloadCount: 2, validationDelayMs: 1000 });
+  const voice = fakeTransport();
+  const added = await manager.enqueue('guild', ['Current', 'Bad', 'Good'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await settle();
+  const parked = manager.state('guild').preloads.get(added[1].id).opened;
+  voice.plays[0].end();
+  parked.stream.emit('error', new MediaError('Video unavailable.', 'YOUTUBE_VIDEO_UNAVAILABLE'));
+  await settle();
+  assert.equal(media.calls.filter(call => call.title === 'Bad').length, 1);
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'Good');
+});
+
+test('public snapshots omit internal search/mapping fields while queue persistence retains them', async t => {
+  const { manager, dataDir } = await fixture(t);
+  const added = await manager.enqueue('guild', [{ ...track('Mapped'), searchQuery: 'private resolver query', playbackMapping: { videoId: 'abcdefghijk', referenceHash: 'internal' } }], requester);
+  const snapshot = manager.snapshot('guild');
+  assert.equal(Object.hasOwn(snapshot.tracks[0], 'searchQuery'), false);
+  assert.equal(Object.hasOwn(snapshot.tracks[0], 'playbackMapping'), false);
+  const saved = JSON.parse(await readFile(path.join(dataDir, 'queues.json'), 'utf8')).guilds.guild.tracks[0];
+  assert.equal(saved.searchQuery, 'private resolver query');
+  assert.equal(saved.playbackMapping.videoId, 'abcdefghijk');
+  assert.equal(saved.id, added[0].id);
+});
+
+test('a settling cancelled background checker gets the bounded foreground capacity wait', async t => {
+  const check = deferred();
+  let checkerSignal, attempts = 0;
+  const { manager } = await fixture(t, { preflight(_item, { signal }) { checkerSignal = signal; return check.promise; },
+    async open() {
+      if (++attempts === 1) { const error = new MediaError('Provider busy.', 'MEDIA_BUSY'); error.retryableBeforeStart = true; throw error; }
+      return openedAudio();
+    } }, { validationDelayMs: 5 });
+  await manager.enqueue('guild', [track('Current')], requester);
+  await until(() => checkerSignal);
+  manager.attach('guild', fakeTransport(), { id: 'voice', name: 'Lounge' });
+  await until(() => attempts === 2);
+  assert.equal(checkerSignal.aborted, true);
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'Current');
+  check.resolve(track('Old metadata'));
+  await settle();
+  assert.equal(manager.snapshot('guild').nowPlaying.title, 'Current');
+});
+
+test('interactive preflight holds background checks until its idempotent release', async t => {
+  let checks = 0;
+  const { manager } = await fixture(t, { async preflight(item) { checks++; return item; } }, { validationDelayMs: 5 });
+  const release = manager.pausePreflight();
+  await manager.enqueue('guild', [track('Queued')], requester);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(checks, 0);
+  release(); release();
+  await until(() => checks === 1);
+  assert.equal(manager.validationPauses, 0);
 });

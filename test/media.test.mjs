@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream';
 import { mkdtemp, readFile, rmdir, stat, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createMedia, MediaError } from '../src/media.mjs';
+import { createMedia, isPermanentMediaError, MediaError } from '../src/media.mjs';
 
 const VIDEO = 'abcdefghijk';
 const TRACK = '1234567890abcdefghijkl';
@@ -43,7 +43,7 @@ const metadata = value => child => {
 };
 
 test('provider errors carry safe HTTP statuses for portal and Discord responses', () => {
-  for (const code of ['INVALID_QUERY', 'UNSUPPORTED_MEDIA', 'INVALID_MEDIA', 'TRACK_TOO_LONG', 'SPOTIFY_NOT_FOUND']) {
+  for (const code of ['INVALID_QUERY', 'UNSUPPORTED_MEDIA', 'INVALID_MEDIA', 'TRACK_TOO_LONG', 'SPOTIFY_NOT_FOUND', 'NO_PLAYBACK_MATCH', 'YOUTUBE_VIDEO_UNAVAILABLE']) {
     assert.equal(new MediaError('Please choose another track.', code).status, 400);
   }
   for (const code of ['MEDIA_TIMEOUT', 'MEDIA_BUSY', 'EXTRACTOR_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'SPOTIFY_NOT_CONFIGURED', 'SPOTIFY_QUOTA_EXCEEDED']) {
@@ -136,7 +136,7 @@ test('unknown playlist durations enforce the same one-hour boundary before audio
 
 test('rejects malformed provider metadata', async () => {
   for (const entry of [null, { entries: [] }, { ...youtube, id: '../../other' }]) {
-    await assert.rejects(createMedia({}, extractor([metadata(entry)])).resolve('song'), error => ['INVALID_MEDIA', 'UNSUPPORTED_MEDIA'].includes(error.code));
+    await assert.rejects(createMedia({}, extractor([metadata(entry)])).resolve('song'), error => ['INVALID_MEDIA', 'NO_PLAYBACK_MATCH'].includes(error.code));
   }
 });
 
@@ -311,7 +311,7 @@ test('audio startup timeouts and cancellation terminate active processes', async
 test('a failed stream startup rejects and stale cleanup never kills an exited process', async () => {
   const track = { source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`, durationSec: 120 };
   const denied = extractor([child => { child.stderr.write('Video unavailable'); child.emit('close', 1); }]);
-  await assert.rejects(createMedia({}, denied).open(track), { code: 'YOUTUBE_UNAVAILABLE' });
+  await assert.rejects(createMedia({}, denied).open(track), { code: 'YOUTUBE_VIDEO_UNAVAILABLE' });
   const finished = extractor([child => child.stdout.write('audio')]);
   const opened = await createMedia({}, finished).open(track);
   finished.calls[0].child.emit('close', 0);
@@ -699,13 +699,17 @@ test('YouTube failures distinguish host rejection, request limits, restricted co
     ['This is a private video. Sign in', 'YOUTUBE_RESTRICTED', /restricted/],
     ['No supported JavaScript runtime could be found. Requested format is not available', 'EXTRACTOR_RUNTIME_UNAVAILABLE', /JavaScript dependencies/],
     ['Requested format is not available', 'YOUTUBE_FORMAT_UNAVAILABLE', /audio format/],
-    ['Video unavailable', 'YOUTUBE_UNAVAILABLE', /unavailable/],
+    ['Video unavailable', 'YOUTUBE_VIDEO_UNAVAILABLE', /unavailable/],
+    ['Unable to download video info: HTTP Error 503: Service Unavailable', 'YOUTUBE_UNAVAILABLE', /connection recovers/],
+    ['Video unavailable: HTTP Error 502: Bad Gateway', 'YOUTUBE_UNAVAILABLE', /connection recovers/],
+    ['Unable to download video info: connection reset by peer', 'YOUTUBE_UNAVAILABLE', /connection recovers/],
+    ['Provider request failed unexpectedly', 'YOUTUBE_UNAVAILABLE', /could not provide/],
   ];
   for (const [diagnostic, code, message] of cases) {
     const logs = [];
     const fake = extractor([child => { child.stderr.end(`${diagnostic}\nhttps://example.invalid/private?token=never-log-this`); child.emit('close', 1); }]);
     const media = createMedia({}, { ...fake, logger: { warn: (...args) => logs.push(args) } });
-    await assert.rejects(media.search('private query'), error => error.code === code && error.status === 503 && message.test(error.message) && !error.message.includes('never-log-this'));
+    await assert.rejects(media.search('private query'), error => error.code === code && error.status === (code === 'YOUTUBE_VIDEO_UNAVAILABLE' ? 400 : 503) && message.test(error.message) && !error.message.includes('never-log-this'));
     assert.deepEqual(logs, [['YouTube extractor failed.', { operation: 'search', code }]]);
   }
 });
@@ -775,7 +779,7 @@ test('Spotify matching rejects live-only and unrelated candidates without openin
     [video(3, { title: 'Different band - A song', uploader: 'Different band' })]]) {
     const fake = extractor([metadata({ entries })]);
     await assert.rejects(createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
-      title: 'A song', artist: 'An artist', durationSec: 120 }), error => error.code === 'UNSUPPORTED_MEDIA' && /studio/.test(error.message));
+      title: 'A song', artist: 'An artist', durationSec: 120 }), error => error.code === 'NO_PLAYBACK_MATCH' && /studio/.test(error.message));
     assert.equal(fake.calls.length, 1);
   }
 });
@@ -822,7 +826,7 @@ test('Spotify candidate validation keeps cancellation and duration limits', asyn
   const first = video(1, { title: 'An artist - A song (Official Audio)', duration: null });
   const fake = extractor([metadata({ entries: [first] }), metadata({ ...first, duration: 999 })]);
   const track = { source: 'spotify', sourceUrl: `spotify:track:${TRACK}`, title: 'A song', artist: 'An artist', durationSec: 120 };
-  await assert.rejects(createMedia({ maxTrackDurationSec: 600 }, fake).open(track), { code: 'UNSUPPORTED_MEDIA' });
+  await assert.rejects(createMedia({ maxTrackDurationSec: 600 }, fake).open(track), { code: 'NO_PLAYBACK_MATCH' });
   assert.equal(fake.calls.length, 2);
   const controller = new AbortController();
   const stalled = extractor([metadata({ entries: [first] }), () => controller.abort(new Error('skip cancelled matching'))]);
@@ -861,7 +865,7 @@ test('missing flat artist credits are checked in full metadata, never guessed fr
       assert.equal(fake.calls.length, 3);
       opened.cleanup();
     } else {
-      await assert.rejects(pending, { code: 'UNSUPPORTED_MEDIA' });
+      await assert.rejects(pending, { code: 'NO_PLAYBACK_MATCH' });
       assert.equal(fake.calls.length, 2, 'Missing or contradictory full artist credits never start audio.');
     }
   }
@@ -878,7 +882,7 @@ test('matching folds Latin accents without conflating Japanese voiced characters
   const wrong = video(2, { title: '歌手 - カラス (Official Audio)', uploader: '歌手', duration: 240 });
   const japanese = extractor([metadata({ entries: [wrong] })]);
   await assert.rejects(createMedia({}, japanese).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
-    title: 'ガラス', artist: '歌手', durationSec: 240 }), { code: 'UNSUPPORTED_MEDIA' });
+    title: 'ガラス', artist: '歌手', durationSec: 240 }), { code: 'NO_PLAYBACK_MATCH' });
   assert.equal(japanese.calls.length, 1);
 });
 
@@ -894,7 +898,7 @@ test('verified provider heart spellings match Spotify artist names without dropp
   const otherArtist = video(1, { title: 'Artist 3 - A song', uploader: 'Artist 3' });
   const mismatch = extractor([metadata({ entries: [otherArtist] })]);
   await assert.rejects(createMedia({}, mismatch).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
-    title: 'A song', artist: 'Artist 4', durationSec: 120 }), { code: 'UNSUPPORTED_MEDIA' });
+    title: 'A song', artist: 'Artist 4', durationSec: 120 }), { code: 'NO_PLAYBACK_MATCH' });
   assert.equal(mismatch.calls.length, 1);
 });
 
@@ -911,7 +915,7 @@ test('Japanese title translations cannot hide a First Take recording annotation'
   const recording = video(1, { title: '美波 - カワキヲアメク (THE FIRST TAKE)', uploader: '美波', duration: 252 });
   const fake = extractor([metadata({ entries: [recording] })]);
   await assert.rejects(createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
-    title: 'カワキヲアメク', artist: '美波', durationSec: 252 }), { code: 'UNSUPPORTED_MEDIA' });
+    title: 'カワキヲアメク', artist: '美波', durationSec: 252 }), { code: 'NO_PLAYBACK_MATCH' });
   assert.equal(fake.calls.length, 1);
 });
 
@@ -923,7 +927,7 @@ test('matching rejects different tracks, different artists and alternate recordi
     const info = video(1, { title, uploader: title.startsWith('Another artist') ? 'Another artist' : 'An artist' });
     const fake = extractor([metadata({ entries: [info] })]);
     await assert.rejects(createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
-      title: 'A song', artist: 'An artist', durationSec: 120 }), { code: 'UNSUPPORTED_MEDIA' });
+      title: 'A song', artist: 'An artist', durationSec: 120 }), { code: 'NO_PLAYBACK_MATCH' });
     assert.equal(fake.calls.length, 1, title);
   }
 });
@@ -953,7 +957,7 @@ test('Spotify mapping cache expires and is invalidated when audio becomes unavai
   now = 10 * 60_000;
   (await media.open(track)).cleanup();
   assert.equal(fake.calls.length, 6, 'Expired mappings require catalog and full metadata again.');
-  await assert.rejects(media.open(track), { code: 'YOUTUBE_UNAVAILABLE' });
+  await assert.rejects(media.open(track), { code: 'YOUTUBE_VIDEO_UNAVAILABLE' });
   assert.equal(fake.calls.length, 7, 'Cached mappings still perform a normal public audio extraction.');
   (await media.open(track)).cleanup();
   assert.equal(fake.calls.length, 10, 'Unavailable mappings are not reused on the next attempt.');
@@ -970,4 +974,208 @@ test('Spotify validated mapping cache remains bounded and metadata-sensitive', a
   assert.equal(fake.calls.length, 202 * 3, 'The oldest mapping is evicted after 200 entries.');
   (await media.open({ ...tracks[0], durationSec: 121 })).cleanup();
   assert.equal(fake.calls.length, 203 * 3, 'Changed track metadata cannot reuse an earlier validation.');
+});
+
+const queuedSpotify = () => ({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`, title: 'A song', artist: 'An artist', durationSec: 120 });
+async function savedSpotifyMapping(checkedAt = 1000) {
+  return createMedia({}, { ...extractor([metadata({ entries: [youtube] }), metadata(youtube)]), now: () => checkedAt }).preflight(queuedSpotify());
+}
+
+test('metadata preflight validates Spotify without audio and shares its selected recording with open', async () => {
+  const fake = extractor([metadata({ entries: [youtube] }), metadata({ ...youtube, formats: [{ acodec: 'opus', url: 'https://private-cdn.invalid/audio?token=never-persist' }] }), child => child.stdout.write('audio')]);
+  const media = createMedia({}, { ...fake, now: () => 1000 });
+  const track = queuedSpotify();
+  const ready = await media.preflight(track);
+  assert.equal(fake.calls.length, 2);
+  assert.ok(fake.calls.every(call => call.args.includes('--skip-download')));
+  assert.equal(track.playbackMapping, undefined, 'Preflight returns an update without mutating the queue request.');
+  assert.deepEqual(ready.validation, { status: 'ready', checkedAt: 1000 });
+  assert.equal(ready.source, 'spotify');
+  assert.equal(ready.sourceUrl, track.sourceUrl);
+  assert.equal(ready.playbackMapping.videoId, VIDEO);
+  assert.match(ready.playbackMapping.referenceHash, /^[a-f0-9]{64}$/);
+  assert.deepEqual(Object.keys(ready.playbackMapping).sort(), ['artist', 'checkedAt', 'durationSec', 'referenceHash', 'title', 'videoId']);
+  assert.doesNotMatch(JSON.stringify(ready), /private-cdn|never-persist|formats/);
+  const opened = await media.open(ready);
+  assert.equal(fake.calls.length, 3);
+  assert.equal(fake.calls[2].args.at(-1), `https://www.youtube.com/watch?v=${VIDEO}`);
+  assert.deepEqual(opened.track.playbackMapping, ready.playbackMapping);
+  opened.cleanup();
+});
+
+test('fresh persisted mappings survive a process restart and stale mappings revalidate the same public ID', async () => {
+  const ready = await savedSpotifyMapping();
+  const fresh = extractor([child => child.stdout.write('audio')]);
+  const restarted = createMedia({}, { ...fresh, now: () => 1001 });
+  const restored = await restarted.preflight(JSON.parse(JSON.stringify(ready)));
+  assert.equal(fresh.calls.length, 0, 'A fresh metadata check is reusable after restart.');
+  (await restarted.open(restored)).cleanup();
+  assert.equal(fresh.calls.length, 1);
+
+  const stale = extractor([metadata(youtube), child => child.stdout.write('audio')]);
+  const later = createMedia({}, { ...stale, now: () => 601_001 });
+  const updated = await later.preflight(ready);
+  assert.equal(stale.calls.length, 1);
+  assert.equal(stale.calls[0].args.at(-1), `https://www.youtube.com/watch?v=${VIDEO}`);
+  assert.equal(updated.validation.checkedAt, 601_001);
+  (await later.open(updated)).cleanup();
+  assert.equal(stale.calls.length, 2);
+});
+
+test('stale Spotify mapping replacement performs at most two full validations including the old ID', async () => {
+  const ready = await savedSpotifyMapping();
+  const next = video(2, { title: 'An artist - A song (Official Audio)' });
+  const third = video(3, { title: 'An artist - A song' });
+  const staleFirst = { ...youtube, title: 'An artist - A song (Official Audio)', uploader: 'An artist - Topic' };
+  for (const valid of [true, false]) {
+    const fake = extractor([child => { child.stderr.end('Video unavailable'); child.emit('close', 1); },
+      metadata({ entries: [staleFirst, next, third] }), metadata(valid ? next : { ...next, title: 'Another song' })]);
+    const pending = createMedia({}, { ...fake, now: () => 601_001 }).preflight(ready);
+    if (valid) assert.equal((await pending).playbackMapping.videoId, next.id);
+    else await assert.rejects(pending, { code: 'NO_PLAYBACK_MATCH' });
+    assert.equal(fake.calls.length, 3);
+    assert.equal(fake.calls.filter(call => !call.args.at(-1).startsWith('ytsearch')).length, 2);
+    assert.equal(new Set(fake.calls.filter(call => !call.args.at(-1).startsWith('ytsearch')).map(call => call.args.at(-1))).size, 2,
+      'A rejected stale ID is excluded from fallback even when it still ranks first in the catalog.');
+    assert.ok(fake.calls.every(call => call.args.includes('--skip-download')));
+  }
+});
+
+test('resolved YouTube singles reuse metadata while flat playlist entries validate before audio', async () => {
+  const full = extractor([metadata(youtube), child => child.stdout.write('audio')]);
+  const media = createMedia({}, { ...full, now: () => 1000 });
+  const [resolved] = await media.resolve(`https://youtu.be/${VIDEO}`);
+  const ready = await media.preflight(resolved);
+  assert.equal(full.calls.length, 1, 'Request-time preflight does not repeat a completed YouTube resolution.');
+  (await media.open(ready)).cleanup();
+  assert.equal(full.calls.length, 2);
+
+  const flat = extractor([metadata(youtube), child => child.stdout.write('audio')]);
+  const playlists = createMedia({}, { ...flat, now: () => 1000 });
+  const checked = await playlists.preflight({ source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`, title: 'Old title', durationSec: null, needsValidation: true });
+  assert.equal(checked.durationSec, 120);
+  assert.equal(checked.title, 'A song');
+  assert.equal(checked.needsValidation, false);
+  assert.equal(flat.calls.length, 1);
+  (await playlists.open(checked)).cleanup();
+  assert.equal(flat.calls.length, 2);
+});
+
+test('preflight checks legacy YouTube entries without a mapping instead of trusting old queue metadata', async () => {
+  for (const needsValidation of [undefined, false]) {
+    const fake = extractor([metadata(youtube)]);
+    const ready = await createMedia({}, fake).preflight({ source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`,
+      title: 'Legacy title', artist: 'Legacy artist', durationSec: 90, ...(needsValidation === undefined ? {} : { needsValidation }) });
+    assert.equal(fake.calls.length, 1);
+    assert.ok(fake.calls[0].args.includes('--skip-download'));
+    assert.equal(ready.title, youtube.title);
+    assert.equal(ready.durationSec, youtube.duration);
+    assert.equal(ready.validation.status, 'ready');
+  }
+  const removed = extractor([child => { child.stderr.end('Video unavailable'); child.emit('close', 1); }]);
+  await assert.rejects(createMedia({}, removed).preflight({ source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`,
+    title: 'Legacy title', artist: 'Legacy artist', durationSec: 120 }), error => error.code === 'YOUTUBE_VIDEO_UNAVAILABLE' && isPermanentMediaError(error));
+  assert.equal(removed.calls.length, 1);
+});
+
+test('background preflight reserves the fourth extractor slot for interactive requests', async () => {
+  const fake = extractor([child => child.stdout.write('audio'), child => child.stdout.write('audio'), child => child.stdout.write('audio'),
+    metadata({ entries: [youtube] }), metadata(youtube)]);
+  const media = createMedia({}, fake);
+  const playing = [];
+  try {
+    for (let index = 0; index < 3; index++) playing.push(await media.open({ source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`, durationSec: 120 }));
+    await assert.rejects(media.preflight(queuedSpotify(), { background: true }), { code: 'MEDIA_BUSY' });
+    assert.equal(fake.calls.length, 3);
+    assert.equal((await media.preflight(queuedSpotify())).validation.status, 'ready');
+    assert.equal(fake.calls.length, 5);
+  } finally { for (const opened of playing) opened.cleanup(); }
+});
+
+test('background admission is checked again after its catalog query yields to foreground work', async () => {
+  const controllers = [], pending = [];
+  let media;
+  const occupy = () => {
+    const controller = new AbortController(); controllers.push(controller);
+    pending.push(assert.rejects(media.resolve(`https://youtu.be/${VIDEO}`, { signal: controller.signal }), /test cleanup/));
+  };
+  const fake = extractor([undefined, undefined, child => { metadata({ entries: [youtube] })(child); child.once('close', occupy); }]);
+  media = createMedia({}, fake);
+  occupy(); occupy();
+  try {
+    await assert.rejects(media.preflight(queuedSpotify(), { background: true }), { code: 'MEDIA_BUSY' });
+    assert.equal(fake.calls.length, 4, 'Background full extraction cannot take the reserved fourth slot.');
+  } finally { for (const controller of controllers) controller.abort(new Error('test cleanup')); await Promise.all(pending); }
+});
+
+test('per-track definitive errors stay separate from temporary provider, metadata and auth failures', async () => {
+  for (const code of ['INVALID_QUERY', 'UNSUPPORTED_MEDIA', 'TRACK_TOO_LONG', 'NO_PLAYBACK_MATCH', 'YOUTUBE_VIDEO_UNAVAILABLE', 'YOUTUBE_RESTRICTED', 'SPOTIFY_NOT_FOUND', 'EMPTY_PLAYLIST']) {
+    const error = new MediaError('Authored message', code);
+    assert.equal(isPermanentMediaError(error), true, code);
+    assert.equal(isPermanentMediaError(new Error('Wrapper', { cause: error })), true, code);
+  }
+  for (const code of ['INVALID_MEDIA', 'MEDIA_BUSY', 'MEDIA_TIMEOUT', 'MEDIA_CANCELLED', 'YOUTUBE_UNAVAILABLE', 'YOUTUBE_FORMAT_UNAVAILABLE', 'YOUTUBE_RATE_LIMITED', 'YOUTUBE_REQUEST_BLOCKED', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'SPOTIFY_UNAVAILABLE', 'SPOTIFY_QUOTA_EXCEEDED', 'SPOTIFY_REAUTHORIZE', 'SPOTIFY_UNAUTHORIZED', 'SPOTIFY_FORBIDDEN']) {
+    assert.equal(isPermanentMediaError(new MediaError('Authored message', code)), false, code);
+  }
+  assert.equal(isPermanentMediaError({ code: 'NO_PLAYBACK_MATCH' }), false, 'Unclassified arbitrary exceptions are not permanent provider decisions.');
+  const empty = extractor([metadata({ entries: [] })]);
+  await assert.rejects(createMedia({}, empty).preflight(queuedSpotify()), error => error.code === 'NO_PLAYBACK_MATCH' && isPermanentMediaError(error));
+  const malformed = extractor([metadata({ entries: [youtube] }), metadata({})]);
+  await assert.rejects(createMedia({}, malformed).preflight(queuedSpotify()), error => error.code === 'INVALID_MEDIA' && !isPermanentMediaError(error));
+});
+
+test('preflight cancellation and timeout release metadata extractors without audio or success state', async () => {
+  const controller = new AbortController();
+  const cancelled = extractor([metadata({ entries: [youtube] }), () => controller.abort(new Error('Removed request'))]);
+  await assert.rejects(createMedia({}, cancelled).preflight(queuedSpotify(), { signal: controller.signal }), /Removed request/);
+  assert.equal(cancelled.stopped.length, 1);
+  assert.ok(cancelled.calls.every(call => call.args.includes('--skip-download')));
+  const stalled = extractor();
+  await assert.rejects(createMedia({}, { ...stalled, resolveTimeoutMs: 15 }).preflight(queuedSpotify()), error => error.code === 'MEDIA_TIMEOUT' && !isPermanentMediaError(error));
+  assert.equal(stalled.stopped.length, 1);
+});
+
+test('persistent mappings cannot supply CDN URLs or another Spotify track reference', async () => {
+  const ready = await savedSpotifyMapping();
+  const copy = structuredClone(ready);
+  copy.playbackMapping.url = 'http://127.0.0.1/private';
+  const cached = extractor([child => child.stdout.write('audio')]);
+  const opened = await createMedia({}, { ...cached, now: () => 1001 }).open(copy);
+  assert.equal(cached.calls[0].args.at(-1), `https://www.youtube.com/watch?v=${VIDEO}`);
+  assert.equal(opened.track.playbackMapping.url, undefined);
+  opened.cleanup();
+  for (const override of [{ videoId: '../invalid' }, { referenceHash: '0'.repeat(64) }, { checkedAt: 5000 }]) {
+    const fake = extractor([metadata({ entries: [youtube] }), metadata(youtube)]);
+    await createMedia({}, { ...fake, now: () => 1001 }).preflight({ ...ready, playbackMapping: { ...ready.playbackMapping, ...override } });
+    assert.equal(fake.calls.length, 2);
+    assert.ok(fake.calls[0].args.at(-1).startsWith('ytsearch10:'));
+  }
+});
+
+test('audio source failure invalidates even a fresh persisted mapping before a later retry', async () => {
+  const ready = await savedSpotifyMapping();
+  const replacement = video(2, { title: 'An artist - A song' });
+  const fake = extractor([child => { child.stderr.end('Video unavailable'); child.emit('close', 1); },
+    metadata({ entries: [replacement] }), metadata(replacement), child => child.stdout.write('audio')]);
+  const media = createMedia({}, { ...fake, now: () => 1001 });
+  await assert.rejects(media.open(ready), { code: 'YOUTUBE_VIDEO_UNAVAILABLE' });
+  const opened = await media.open(ready);
+  assert.equal(fake.calls.length, 4);
+  assert.equal(opened.track.playbackMapping.videoId, replacement.id);
+  opened.cleanup();
+});
+
+test('full metadata with no offered audio format remains retryable and never starts an audio process', async () => {
+  for (const formats of [[], [{ acodec: 'none', vcodec: 'avc1' }], [{ acodec: 'none', vcodec: 'none', ext: 'mhtml' }]]) {
+    const fake = extractor([metadata({ ...youtube, formats })]);
+    await assert.rejects(createMedia({}, fake).resolve(`https://youtu.be/${VIDEO}`), error => error.code === 'YOUTUBE_FORMAT_UNAVAILABLE' && !isPermanentMediaError(error));
+    assert.equal(fake.calls.length, 1);
+    assert.ok(fake.calls[0].args.includes('--skip-download'));
+  }
+  for (const formats of [undefined, [{ acodec: 'opus', vcodec: 'none' }], [{ acodec: 'mp4a.40.2', vcodec: 'avc1' }]]) {
+    const fake = extractor([metadata({ ...youtube, formats })]);
+    const ready = await createMedia({}, fake).preflight({ source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`, durationSec: null, needsValidation: true });
+    assert.equal(ready.validation.status, 'ready');
+    assert.equal(fake.calls.length, 1);
+  }
 });

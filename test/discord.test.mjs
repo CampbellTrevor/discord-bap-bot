@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { ChannelType, Events } from 'discord.js';
 import { createBot } from '../src/discord.mjs';
+import { MediaError } from '../src/media.mjs';
 
 function deferred() {
   let resolve;
@@ -232,4 +233,59 @@ test('late cancellation never rolls back a request that already committed', asyn
   assert.equal(result.added.length, 1);
   assert.equal(result.queue.tracks.length, 1);
   assert.equal(queue.tracks.length, 1);
+});
+
+test('single requests validate playback before admission and preserve the validated mapping', async t => {
+  const { bot, media, music, calls } = await fixture(t);
+  let held = false;
+  music.pausePreflight = () => { held = true; return () => { held = false; }; };
+  const controller = new AbortController();
+  media.preflight = async (value, { signal }) => {
+    assert.equal(held, true);
+    assert.equal(calls.enqueues, 0);
+    assert.equal(calls.snapshots, 0);
+    assert.equal(signal, controller.signal);
+    return { ...value, validation: { status: 'ready', checkedAt: 123 }, playbackMapping: { videoId: 'abcdefghijk' } };
+  };
+  const result = await bot.request('guild', 'listener', 'song', undefined, { signal: controller.signal });
+  assert.equal(held, false);
+  assert.equal(result.added[0].validation.status, 'ready');
+  assert.equal(result.added[0].playbackMapping.videoId, 'abcdefghijk');
+  assert.equal(calls.enqueues, 1);
+});
+
+test('failed or cancelled single-song validation never joins voice or changes the queue', async t => {
+  const { bot, media, music, calls } = await fixture(t);
+  let releases = 0;
+  music.pausePreflight = () => () => { releases++; };
+  media.preflight = async () => { throw new MediaError('No suitable studio recording was found.', 'NO_PLAYBACK_MATCH'); };
+  await assert.rejects(bot.request('guild', 'listener', 'song'), { code: 'NO_PLAYBACK_MATCH' });
+  assert.equal(calls.enqueues, 0);
+  assert.equal(calls.snapshots, 0);
+  const started = deferred(), checked = deferred(), controller = new AbortController();
+  media.preflight = async () => { started.resolve(); return checked.promise; };
+  const pending = bot.request('guild', 'listener', 'song', undefined, { signal: controller.signal });
+  const rejected = assert.rejects(pending, /cancelled match/);
+  await started.promise;
+  controller.abort(new Error('cancelled match'));
+  checked.resolve({ ...track, validation: { status: 'ready' } });
+  await rejected;
+  assert.equal(calls.enqueues, 0);
+  assert.equal(calls.snapshots, 0);
+  assert.equal(releases, 2);
+});
+
+test('playlist requests enqueue pending checks without blocking on every playback lookup', async t => {
+  const { bot, media, music } = await fixture(t);
+  const tracks = [track, { ...track, title: 'Second' }];
+  Object.defineProperty(tracks, 'import', { value: { source: 'youtube', accepted: 2, warnings: [] } });
+  media.resolve = async () => tracks;
+  media.preflight = async () => assert.fail('The request must leave playlist playback checks to the queue');
+  const enqueue = music.enqueue.bind(music);
+  music.enqueue = (guildId, values, requester) => enqueue(guildId, values.map(value => ({ ...value, validation: { status: 'pending' } })), requester);
+  const result = await bot.request('guild', 'listener', 'playlist');
+  assert.equal(result.added.length, 2);
+  assert.equal(result.import.accepted, 2);
+  assert.deepEqual(result.warnings, ['Playback matches are being checked in the background.']);
+  assert.deepEqual(tracks.import.warnings, []);
 });

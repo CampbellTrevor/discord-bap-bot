@@ -7,6 +7,7 @@ const state = {
   guildId: '',
   detail: null,
   busy: false,
+  busyEndpoint: '',
   polling: false,
   offline: false,
   sampleTime: Date.now(),
@@ -41,7 +42,7 @@ function cancelSearch(close = true) {
 }
 
 function updateRequestLabel() {
-  $('request-button').querySelector('span').textContent = state.search.pending ? 'SEARCHING...' : directRequest($('request-query').value.trim()) ? '+ REQUEST' : 'SEARCH';
+  $('request-button').querySelector('span').textContent = state.busyEndpoint === 'requests' ? 'CHECKING...' : state.search.pending ? 'SEARCHING...' : directRequest($('request-query').value.trim()) ? '+ REQUEST' : 'SEARCH';
   $('request-form').setAttribute('aria-busy', String(state.search.pending || state.busy));
 }
 
@@ -94,7 +95,7 @@ function renderSearchResults() {
     add.addEventListener('click', async () => {
       if (state.search.pending || state.busy || revision !== state.search.revision || context !== searchContext() || state.search.added.has(url) || $('search-results').hidden) return;
       const channelId = state.detail?.queue?.channelId || $('channel-select').value;
-      add.textContent = 'ADDING...';
+      add.textContent = 'CHECKING...';
       const success = await mutate('requests', { query: url, ...(channelId ? { channelId } : {}) }, requestMessage);
       if (revision !== state.search.revision || context !== searchContext()) return;
       if (success) state.search.added.add(url);
@@ -695,6 +696,25 @@ function renderProgress() {
   $('progress-track').setAttribute('aria-valuetext', `${duration(boundedElapsed)} elapsed${totalText === '--:--' ? '; duration unknown' : ` of ${totalText}`}`);
 }
 
+const validationLabels = {
+  pending: ['Checking', 'Waiting for a playback match check.'],
+  checking: ['Checking', 'Checking the playback metadata.'],
+  ready: ['Matched', 'Playback metadata matched. Audio is prepared near playback.'],
+  unavailable: ['Unavailable', 'No playback match is available. Try a specific YouTube link.'],
+  retry: ['Retry pending', 'The playback check will be retried.'],
+};
+const validationReasons = {
+  NO_PLAYBACK_MATCH: 'No suitable recording matched this track.',
+  YOUTUBE_VIDEO_UNAVAILABLE: 'This YouTube recording is unavailable.',
+  UNSUPPORTED_MEDIA: 'This recording is not supported for playback.',
+  TRACK_TOO_LONG: 'This recording exceeds the track duration limit.',
+  YOUTUBE_RESTRICTED: 'This recording requires access the bot does not have.',
+  MEDIA_BUSY: 'The provider is busy. The check will be retried.',
+  MEDIA_TIMEOUT: 'The provider did not respond in time. The check will be retried.',
+  YOUTUBE_RATE_LIMITED: 'The provider is limiting requests. The check will be retried.',
+  YOUTUBE_REQUEST_BLOCKED: 'The provider refused the request. The check will be retried.',
+};
+
 function renderQueue() {
   const tracks = state.detail?.queue?.tracks || [];
   $('queue-count').textContent = String(tracks.length).padStart(2, '0');
@@ -720,6 +740,15 @@ function renderQueue() {
     const title = appendText(copy, 'p', 'queue-item-title', track.title || 'Untitled track');
     title.title = track.title || 'Untitled track';
     appendText(copy, 'span', 'queue-item-artist', track.artist || 'Unknown artist');
+    const validation = track.validation;
+    if (validation && Object.hasOwn(validationLabels, validation.status)) {
+      const [label, explanation] = validationLabels[validation.status];
+      const badge = appendText(copy, 'span', 'queue-validation', label);
+      badge.dataset.validation = validation.status;
+      const reason = Object.hasOwn(validationReasons, validation.code) ? validationReasons[validation.code] : explanation;
+      badge.title = reason;
+      badge.setAttribute('aria-label', `${label}. ${reason}`);
+    }
     item.append(copy);
     const requester = appendText(item, 'div', 'queue-item-requester', '');
     const person = appendText(requester, 'span', 'queue-item-person', track.requestedBy?.username || 'Listener');
@@ -806,6 +835,7 @@ async function initialize() {
 async function mutate(endpoint, body, successMessage) {
   if (state.busy || state.offline || !state.guildId || !state.session?.user || !state.session.botReady || (!state.session.configured && !state.session.demo)) return false;
   state.busy = true;
+  state.busyEndpoint = endpoint;
   const guildId = state.guildId;
   const userId = state.session.user.id;
   state.detailRevision += 1;
@@ -828,6 +858,7 @@ async function mutate(endpoint, body, successMessage) {
     return false;
   } finally {
     state.busy = false;
+    state.busyEndpoint = '';
     renderEnabled();
   }
 }
@@ -836,7 +867,10 @@ function requestMessage(result) {
   const count = Array.isArray(result.added) ? result.added.length : result.import?.accepted;
   const messages = [count == null ? 'Request added to the queue.' : `Added ${count} ${count === 1 ? 'track' : 'tracks'} to ${state.session?.demo ? 'the demo' : 'the'} queue.`];
   const details = result.import;
-  const warnings = [...new Set((result.warnings || details?.warnings || []).filter(value => typeof value === 'string'))];
+  const warnings = [...new Set([
+    ...(Array.isArray(result.warnings) ? result.warnings : []),
+    ...(Array.isArray(details?.warnings) ? details.warnings : []),
+  ].filter(value => typeof value === 'string'))];
   if (details?.skipped && !warnings.some(value => /skipp/i.test(value))) messages.push(`${details.skipped} playlist entries were skipped.`);
   if (details?.limitReached && !warnings.some(value => /first|limit|remaining/i.test(value))) messages.push(`Only the first ${details.inspected} playlist entries were inspected.`);
   messages.push(...warnings);

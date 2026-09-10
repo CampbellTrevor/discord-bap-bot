@@ -298,7 +298,19 @@ export function createBot({ config, media, metrics, logger = console }, dependen
       signal?.throwIfAborted();
       if (typeof query !== 'string' || !query.trim() || query.length > 500) throw musicError('Enter a song name or a Spotify/YouTube track or playlist URL (up to 500 characters).');
       if (music.capacity(guildId) < 1) throw musicError('The queue is full. Wait for a song to finish or remove one.', 409);
-      const tracks = await media.resolve(query.trim(), { signal });
+      let tracks;
+      const releasePreflight = music.pausePreflight?.();
+      try {
+        tracks = await media.resolve(query.trim(), { signal });
+        signal?.throwIfAborted();
+        // A single request is accepted only after its playback match is known.
+        // Playlist checks run in the queue so large imports do not hold HTTP
+        // requests or the guild's control lock for minutes.
+        if (!tracks.import && tracks.length === 1 && media.preflight) {
+          tracks[0] = await media.preflight(tracks[0], { signal });
+          signal?.throwIfAborted();
+        }
+      } finally { releasePreflight?.(); }
       return locked(guildId, async () => {
         signal?.throwIfAborted();
         const identity = await membership(guildId, userId);
@@ -312,6 +324,9 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         signal?.throwIfAborted();
         const added = await music.enqueue(guildId, tracks, { id: userId, username: identity.member.displayName });
         const details = tracks.import ? structuredClone(tracks.import) : null;
+        if (details && added.some(track => ['pending', 'checking', 'retry'].includes(track.validation?.status))) {
+          details.warnings = [...new Set([...(details.warnings || []), 'Playback matches are being checked in the background.'])];
+        }
         return {
           added, queue: music.snapshot(guildId),
           ...(details ? { import: details } : {}),
