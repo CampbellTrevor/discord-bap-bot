@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#eee7d8">
   <meta name="description" content="Request songs and playlists from Spotify or YouTube for your Discord voice channel.">
   <title>Turntable — Discord music queue</title>
-  <link rel="stylesheet" href="/styles.css?v=queue-validation-4">
-  <script src="/app.js?v=queue-validation-4" defer></script>
+  <link rel="stylesheet" href="/styles.css?v=volume-5">
+  <script src="/app.js?v=volume-5" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to player</a>
@@ -34,6 +34,7 @@
           <div class="seekline"><div class="counter"><span id="elapsed-time">0:00</span><small class="cassette-only"> / <span id="cassette-total">0:00</span></small></div><div class="progress-track" id="progress-track" role="progressbar" aria-label="Playback position" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-fill"></div></div><span class="winamp-only" id="total-time">0:00</span></div>
         </div>
         <div class="transport"><div class="transport-buttons"><button class="hardware-button pause" id="pause-button" type="button" aria-label="Pause playback" disabled><span class="button-symbol" id="pause-icon" aria-hidden="true">Ⅱ</span><span id="pause-label">PAUSE</span></button><button class="hardware-button" id="skip-button" type="button" aria-label="Skip current track" disabled><span class="button-symbol" aria-hidden="true">▸▏</span><span>SKIP</span></button><button class="hardware-button stop" id="stop-button" type="button" aria-label="Stop playback and clear queue" title="Stop playback and clear queue" disabled><span class="button-symbol stop-symbol" aria-hidden="true">■</span><span>STOP</span></button></div><div class="output-label"><span>OUTPUT / VOICE</span><strong id="output-status">DISCONNECTED</strong></div></div>
+        <div class="volume-control" id="volume-control" hidden><label for="volume-input">Volume</label><input id="volume-input" type="range" min="0" max="100" step="1" value="0" title="Shared playback volume" aria-label="Volume for everyone in this voice channel" disabled><output id="volume-value" for="volume-input">—</output></div>
         <div class="deck-footer"><span>TT–01 / DUAL-SOURCE AUDIO</span><span id="now-requester">AUTO QUEUE / ON</span></div>
         <p id="controls-help" class="controls-help">Connect Discord to use playback controls.</p>
       </div>

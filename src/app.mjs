@@ -152,6 +152,13 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     if (typeof channelId !== 'string' || !channelId) throw httpError('Choose a voice channel.', 400);
     res.json({ queue: await bot.join(req.params.guildId, req.session.user.id, channelId) });
   });
+  app.post('/api/guilds/:guildId/volume', csrf, limiter(30, 60000), async (req, res) => {
+    const { volumePercent } = req.body || {};
+    if (!Number.isInteger(volumePercent) || volumePercent < 0 || volumePercent > 100) {
+      throw httpError('Volume must be a whole number from 0 to 100.', 400);
+    }
+    res.json({ queue: await withClientCancellation(req, res, signal => bot.setVolume(req.params.guildId, req.session.user.id, volumePercent, { signal })) });
+  });
   app.post('/api/guilds/:guildId/control', csrf, limiter(30, 60000), async (req, res) => {
     const { action, trackId } = req.body || {};
     if (!['skip', 'pause', 'resume', 'stop', 'leave', 'remove', 'shuffle', 'move-top'].includes(action)) throw httpError('Unknown playback control.', 400);

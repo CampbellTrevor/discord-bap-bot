@@ -8,7 +8,7 @@ export function createDemoBot() {
   const makeTrack = (title, artist, source) => ({ id: randomUUID(), title, artist, source, durationSec: 240, thumbnail: null, sourceUrl: '', requestedBy: user });
   const searchFixtures = new Map();
   const queue = { guildId: guild.id, channelId: channel.id, channelName: channel.name, nowPlaying: makeTrack('After hours', 'Demo track · no audio', 'youtube'),
-    tracks: [makeTrack('Somewhere slow', 'Demo track · no audio', 'spotify'), makeTrack('Meet me on the rooftop', 'Demo track · no audio', 'youtube')], paused: false, playing: true, lastError: null, elapsedSec: 32 };
+    tracks: [makeTrack('Somewhere slow', 'Demo track · no audio', 'spotify'), makeTrack('Meet me on the rooftop', 'Demo track · no audio', 'youtube')], paused: false, playing: true, lastError: null, elapsedSec: 32, volumePercent: 50 };
   let sampledAt = Date.now();
   const failure = (message, status = 400) => Object.assign(new Error(message), { status });
   const validate = id => { if (id !== guild.id) throw failure('Server not found.', 404); };
@@ -31,6 +31,12 @@ export function createDemoBot() {
     context: async id => { validate(id); return { guild, member: { canControl: true, canManage: true, voiceChannelId: channel.id }, voiceChannels: [channel] }; },
     snapshot: id => { validate(id); tick(); return structuredClone(queue); },
     join: async id => { validate(id); queue.channelId = channel.id; queue.channelName = channel.name; if (!queue.nowPlaying) advance(); return bot.snapshot(id); },
+    setVolume: async (id, _userId, volumePercent) => {
+      validate(id);
+      if (!Number.isInteger(volumePercent) || volumePercent < 0 || volumePercent > 100) throw failure('Volume must be an integer from 0 to 100.');
+      queue.volumePercent = volumePercent;
+      return bot.snapshot(id);
+    },
     search: async (id, _userId, query, source = 'youtube') => {
       validate(id);
       if (typeof query !== 'string' || !query.trim() || query.length > 500) throw failure('Enter a song or artist to search, up to 500 characters.');

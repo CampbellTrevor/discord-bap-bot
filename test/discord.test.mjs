@@ -74,11 +74,75 @@ async function fixture(t, { fetchMember, metrics } = {}) {
     async search() { calls.searches += 1; return [track]; },
     async resolve() { calls.resolves += 1; return [track]; },
   };
-  const bot = createBot({ config: { discordClientId: '123456789012345678', discordToken: 'unused-test-token' }, media, metrics, logger: { info() {}, warn() {}, error() {} } }, { client, music, rest: { async put() {} } });
+  const registered = [];
+  const bot = createBot({ config: { discordClientId: '123456789012345678', discordToken: 'unused-test-token' }, media, metrics, logger: { info() {}, warn() {}, error() {} } }, { client, music, rest: { async put(_route, { body }) { registered.push(...body); } } });
   await bot.start();
   t.after(() => bot.shutdown());
-  return { bot, calls, member, guild, music, media, queue };
+  return { bot, calls, member, guild, music, media, queue, client, registered };
 }
+
+test('volume uses current membership and playback permission, validating before mutation', async t => {
+  const { bot, member, guild, music, queue } = await fixture(t);
+  const changes = [];
+  music.setVolume = async (guildId, percent) => { changes.push([guildId, percent]); queue.volumePercent = percent; return queue; };
+  member.voice.channelId = 'other-voice';
+  await assert.rejects(bot.setVolume('guild', 'listener', 50), { status: 403 });
+  member.voice.channelId = 'voice';
+  for (const value of [-1, 101, 0.5, '50', null, undefined, NaN]) {
+    await assert.rejects(bot.setVolume('guild', 'listener', value), { status: 400 });
+  }
+  assert.equal(changes.length, 0);
+  assert.equal((await bot.setVolume('guild', 'listener', 0)).volumePercent, 0);
+  member.voice.channelId = null;
+  member.permissions.has = () => true;
+  assert.equal((await bot.setVolume('guild', 'manager', 100)).volumePercent, 100);
+  guild.members.fetch = async () => { throw Object.assign(new Error('Unknown member'), { code: 10007 }); };
+  await assert.rejects(bot.setVolume('guild', 'removed-manager', 50), { status: 403 });
+  assert.deepEqual(changes, [['guild', 0], ['guild', 100]]);
+});
+
+test('cancelled volume request never commits after a delayed membership check', async t => {
+  const started = deferred(), release = deferred();
+  const { bot, music } = await fixture(t, { fetchMember: async (_options, _count, member) => {
+    started.resolve(); await release.promise; return member;
+  } });
+  let changed = false;
+  music.setVolume = async () => { changed = true; };
+  const controller = new AbortController();
+  const result = bot.setVolume('guild', 'listener', 50, { signal: controller.signal });
+  await started.promise;
+  controller.abort(new Error('volume cancelled'));
+  release.resolve();
+  await assert.rejects(result, /volume cancelled/);
+  assert.equal(changed, false);
+});
+
+test('volume slash command registers bounded optional percent and supports reading or muting', async t => {
+  const { client, registered, member, music, queue } = await fixture(t);
+  const command = registered.find(value => value.name === 'volume');
+  assert.equal(command.options[0].name, 'percent');
+  assert.equal(command.options[0].min_value, 0);
+  assert.equal(command.options[0].max_value, 100);
+  assert.equal(Boolean(command.options[0].required), false);
+  queue.volumePercent = 50;
+  const changes = [];
+  music.setVolume = async (_guild, percent) => { changes.push(percent); queue.volumePercent = percent; return queue; };
+  async function invoke(percent) {
+    const reply = deferred();
+    client.emit(Events.InteractionCreate, {
+      isChatInputCommand: () => true, guildId: 'guild', user: { id: 'listener' }, commandName: 'volume',
+      options: { getInteger: () => percent }, deferred: true,
+      async deferReply() {}, async editReply(value) { reply.resolve(value); },
+    });
+    return reply.promise;
+  }
+  member.voice.channelId = null;
+  assert.match((await invoke(null)).content, /50%/);
+  assert.equal(changes.length, 0);
+  member.voice.channelId = 'voice';
+  assert.match((await invoke(0)).content, /0%/);
+  assert.deepEqual(changes, [0]);
+});
 
 test('detail authorizes membership before returning server context and its queue', async t => {
   const { bot, calls } = await fixture(t);

@@ -52,6 +52,34 @@ test('performance API authenticates and forwards the user and guild to worker au
   assert.equal((await request(endpoint)).status, 403);
 });
 
+test('volume API requires authentication and CSRF, validates bounds, and forwards authorization', async t => {
+  let allowed = true;
+  const calls = [];
+  const bot = { isReady: () => true, setVolume: async (guild, user, percent, { signal }) => {
+    calls.push([guild, user, percent]);
+    assert.ok(signal instanceof AbortSignal);
+    if (!allowed) throw Object.assign(new Error('Join the bot voice channel.'), { status: 403 });
+    return { volumePercent: percent, tracks: [] };
+  } };
+  const { request, signIn, config } = await portalFixture(t, { bot });
+  const endpoint = `/api/guilds/${GUILD_ID}/volume`;
+  const post = (value, headers = {}) => request(endpoint, { method: 'POST', body: JSON.stringify({ volumePercent: value }), headers: { 'Content-Type': 'application/json', ...headers } });
+  assert.equal((await post(50)).status, 401);
+  const session = await signIn();
+  assert.equal((await post(50)).status, 403);
+  const headers = { Origin: config.publicUrl, 'X-CSRF-Token': session.csrfToken };
+  for (const value of [-1, 101, 0.5, '50', null, undefined]) assert.equal((await post(value, headers)).status, 400);
+  assert.equal(calls.length, 0);
+  for (const value of [0, 50, 100]) {
+    const response = await post(value, headers);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).queue.volumePercent, value);
+  }
+  assert.deepEqual(calls, [0, 50, 100].map(value => [GUILD_ID, USER_ID, value]));
+  allowed = false;
+  assert.equal((await post(50, headers)).status, 403);
+});
+
 async function portalFixture(t, { bot, env = {} } = {}) {
   const config = loadConfig({ ...portalEnv, ...env });
   const fetchImpl = async (url, options) => {

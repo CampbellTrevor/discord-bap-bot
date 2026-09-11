@@ -1,12 +1,15 @@
 import { PassThrough, Transform } from 'node:stream';
 import { createAudioResource, demuxProbe, StreamType } from '@discordjs/voice';
+import OpusScript from 'opusscript';
 import { MediaError } from './media.mjs';
+import { opusPacketDurationMs } from './audio-health.mjs';
 
 // Opus packets retain their boundaries. At Discord's 20 ms packet cadence,
 // this reservoir holds about three seconds, independently of song length.
 const BUFFER_PACKETS = 150;
 const READY_PACKETS = 25;
 const MAX_PACKET_BYTES = 8192;
+const PCM_FRAME_BYTES = 960 * 2 * 2;
 
 async function probeSource(stream) {
   // Probe a copied prefix. The library probe pushes bytes back into its input;
@@ -52,10 +55,14 @@ async function probeSource(stream) {
 }
 
 /** Prepare the exact resource that play() will later consume. Owns raw on entry. */
-export async function prepareAudio(opened, { signal, timeoutMs = 15_000 } = {}, dependencies = {}) {
+export async function prepareAudio(opened, { signal, timeoutMs = 15_000, volume = 1 } = {}, dependencies = {}) {
   const probe = dependencies.demuxProbe ?? probeSource;
   const resourceFactory = dependencies.createAudioResource ?? createAudioResource;
-  let decoded, packets, prepared, probedStream, stopped = false;
+  let decoded, packets, prepared, probedStream, codec, stopped = false;
+  const setVolume = value => {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) throw new RangeError('Volume must be a number from 0 to 1.');
+    if (!stopped) volume = value;
+  };
   let timer;
   const cleanup = () => {
     if (stopped) return;
@@ -66,6 +73,8 @@ export async function prepareAudio(opened, { signal, timeoutMs = 15_000 } = {}, 
     decoded?.playStream.destroy();
     if (probedStream !== opened.stream) probedStream?.destroy();
     packets?.destroy();
+    try { codec?.delete(); } catch {}
+    codec = null;
     opened.cleanup?.();
     opened.stream.destroy();
   };
@@ -83,6 +92,7 @@ export async function prepareAudio(opened, { signal, timeoutMs = 15_000 } = {}, 
     if (!stopped && !opened.stream.readableEnded) sourceError(new MediaError('The audio source closed early.', 'MEDIA_UNAVAILABLE'));
   });
   try {
+    setVolume(volume);
     signal?.throwIfAborted();
     signal?.addEventListener('abort', abort, { once: true });
     timer = setTimeout(() => {
@@ -135,11 +145,40 @@ export async function prepareAudio(opened, { signal, timeoutMs = 15_000 } = {}, 
     decoded.playStream.pipe(packets);
     await ready;
     signal?.throwIfAborted();
+    // Allocate the codec before declaring readiness, but keep speculative
+    // packets in their original form. Gain is applied only as the player reads
+    // each packet, so a live change cannot trail a three-second warm buffer.
+    codec = dependencies.createVolumeCodec ? dependencies.createVolumeCodec() : new OpusScript(48000, 2, OpusScript.Application.AUDIO);
+    codec.encoderCTL(4010, 5); // OPUS_SET_COMPLEXITY: modest cost for live music.
+    codec.encoderCTL(4002, 128000); // OPUS_SET_BITRATE, stereo music.
+    const readPacket = prepared.read.bind(prepared);
+    prepared.read = () => {
+      if (stopped) return null;
+      const packet = readPacket();
+      if (!packet) return packet;
+      try {
+        if (opusPacketDurationMs(packet) !== 20) throw new Error('Unsupported packet duration');
+        const pcm = codec.decode(packet);
+        if (pcm.length !== PCM_FRAME_BYTES) throw new Error('Unexpected decoded frame size');
+        if (volume === 0) pcm.fill(0);
+        else if (volume !== 1) {
+          for (let offset = 0; offset < pcm.length; offset += 2) pcm.writeInt16LE(Math.round(pcm.readInt16LE(offset) * volume), offset);
+        }
+        // Keep both codec states advancing even at unity/mute. Switching raw
+        // and newly encoded packets mid-song can disrupt decoder prediction.
+        return codec.encode(pcm, 960);
+      } catch {
+        // AudioPlayer calls read() from its timer without a try/catch. Route a
+        // processing failure through the existing stream error path instead.
+        packets.destroy(new MediaError('The audio volume processor could not handle this stream.', 'INVALID_MEDIA'));
+        return null;
+      }
+    };
     clearTimeout(timer);
     // Cancellation remains connected until the resource is cleaned up.
     return { ...opened, stream: packets, resource: prepared,
-      pipelineMode: [StreamType.WebmOpus, StreamType.OggOpus, StreamType.Opus].includes(result.type) ? 'native-opus' : 'transcoded',
-      cleanup };
+      pipelineMode: [StreamType.WebmOpus, StreamType.OggOpus, StreamType.Opus].includes(result.type) ? 'opus-gain' : 'transcoded-gain',
+      setVolume, cleanup };
   } catch (error) {
     cleanup();
     throw error;

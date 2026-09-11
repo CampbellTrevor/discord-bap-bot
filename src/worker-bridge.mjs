@@ -11,8 +11,8 @@ const REQUEST_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12
 const ACTIONS = new Set(['skip', 'pause', 'resume', 'stop', 'leave', 'remove', 'shuffle', 'move-top']);
 const SESSION_ID = /^[A-Za-z0-9_-]{32,128}$/;
 const SESSION_METHODS = new Set(['sessionGet', 'sessionSet', 'sessionTake', 'sessionDestroy']);
-const METHODS = new Set(['listGuilds', 'detail', 'performance', 'search', 'request', 'join', 'control', ...SESSION_METHODS]);
-const MUTATIONS = new Set(['request', 'join', 'control']);
+const METHODS = new Set(['listGuilds', 'detail', 'performance', 'search', 'request', 'join', 'control', 'setVolume', ...SESSION_METHODS]);
+const MUTATIONS = new Set(['request', 'join', 'control', 'setVolume']);
 const STATUSES = new Set([400, 403, 404, 409, 429, 503]);
 const MEDIA_CODES = new Set([
   'NO_PLAYBACK_MATCH', 'YOUTUBE_VIDEO_UNAVAILABLE',
@@ -55,6 +55,7 @@ const PUBLIC_MESSAGES = new Set([
   'Unknown playback action.',
   'Only a server manager or DJ can view host performance.',
   'Host performance is temporarily unavailable.',
+  'Volume must be a whole number from 0 to 100.',
 ]);
 const CAPACITY_MESSAGE = /^This request contains \d{1,4} tracks?, but only \d{1,4} queue slots? (?:is|are) available \(limit \d{1,4}, including the current track\)\. Nothing was added\. Try a smaller request or wait for space\.$/;
 
@@ -174,6 +175,7 @@ function validArguments(method, args) {
   if (method === 'search') return args.length === 4 && query(args[2]) && ['youtube', 'spotify'].includes(args[3]);
   if (method === 'request') return args.length === 4 && query(args[2]) && optionalId(args[3]);
   if (method === 'join') return args.length === 3 && optionalId(args[2]);
+  if (method === 'setVolume') return args.length === 3 && Number.isInteger(args[2]) && args[2] >= 0 && args[2] <= 100;
   if (method === 'control') return args.length === 4 && ACTIONS.has(args[2])
     && (['remove', 'move-top'].includes(args[2]) ? typeof args[3] === 'string' && REQUEST_ID.test(args[3]) : args[3] === null || args[3] === undefined);
   return false;
@@ -348,6 +350,7 @@ export function createWorkerBridge({ secret, logger = console, trustProxy = fals
     request: (guildId, userId, query, channelId, options) => rpc('request', [guildId, userId, query, channelId ?? null], options),
     join: (guildId, userId, channelId, options) => rpc('join', [guildId, userId, channelId ?? null], options),
     control: (guildId, userId, action, trackId, options) => rpc('control', [guildId, userId, action, trackId ?? null], options),
+    setVolume: (guildId, userId, volumePercent, options) => rpc('setVolume', [guildId, userId, volumePercent], options),
     shutdown: close,
   };
   return {
@@ -492,6 +495,7 @@ export function connectWorker({ url, secret, bot, sessionStorage, spotifyEnabled
           case 'request': result = await bot.request(args[0], args[1], args[2], args[3] ?? undefined, { signal: controller.signal }); break;
           case 'join': result = await bot.join(args[0], args[1], args[2] ?? undefined); break;
           case 'control': result = await bot.control(args[0], args[1], args[2], args[3] ?? undefined); break;
+          case 'setVolume': result = await bot.setVolume(args[0], args[1], args[2], { signal: controller.signal }); break;
           case 'sessionGet': result = await sessionStorage.get(args[0]); break;
           case 'sessionSet': result = await sessionStorage.set(args[0], args[1]); break;
           case 'sessionTake': result = await sessionStorage.take(args[0]); break;

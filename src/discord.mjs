@@ -13,6 +13,8 @@ import { createAudioHealth } from './audio-health.mjs';
 const commands = [
   new SlashCommandBuilder().setName('play').setDescription('Request a song or playlist from Spotify or YouTube')
     .addStringOption(option => option.setName('query').setDescription('Song name, or a Spotify/YouTube track or playlist URL').setRequired(true).setMaxLength(500)),
+  new SlashCommandBuilder().setName('volume').setDescription('Show or change the bot volume for this server')
+    .addIntegerOption(option => option.setName('percent').setDescription('Volume from 0 (muted) to 100 (original level)').setMinValue(0).setMaxValue(100)),
   ...[
     ['queue', 'Show the current song and waiting queue'],
     ['join', 'Join your voice channel and continue the queue'],
@@ -348,6 +350,20 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         };
       });
     },
+    async setVolume(guildId, userId, volumePercent, { signal } = {}) {
+      signal?.throwIfAborted();
+      return locked(guildId, async () => {
+        signal?.throwIfAborted();
+        const { member, manager } = await membership(guildId, userId);
+        signal?.throwIfAborted();
+        if (!Number.isInteger(volumePercent) || volumePercent < 0 || volumePercent > 100) {
+          throw musicError('Volume must be a whole number from 0 to 100.', 400);
+        }
+        authorizeControl({ manager, userId, voiceChannelId: member.voice.channelId, snapshot: music.snapshot(guildId), action: 'volume' });
+        // Once committed, a disconnected client must not roll back the setting.
+        return music.setVolume(guildId, volumePercent);
+      });
+    },
     async control(guildId, userId, action, trackId) {
       return locked(guildId, async () => {
         const { member, manager } = await membership(guildId, userId);
@@ -384,6 +400,16 @@ export function createBot({ config, media, metrics, logger = console }, dependen
             ? state.tracks.slice(0, 10).map((track, index) => `${index + 1}. ${safeText(track.title)} — ${safeText(track.requestedBy.username)}`).join('\n')
             : 'The waiting queue is empty.';
           if (state.tracks.length > 10) content += `\n…and ${state.tracks.length - 10} more. Open /portal to see every request.`;
+          break;
+        }
+        case 'volume': {
+          const percent = interaction.options.getInteger('percent');
+          let state;
+          if (percent === null) {
+            await api.context(guildId, userId);
+            state = music.snapshot(guildId);
+          } else state = await api.setVolume(guildId, userId, percent);
+          content = `Volume${percent === null ? '' : ' set to'}: **${state.volumePercent}%**.`;
           break;
         }
         case 'portal':

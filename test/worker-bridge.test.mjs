@@ -57,6 +57,36 @@ test('performance and move-top RPCs validate identities and retain track IDs', a
   assert.equal(calls.length, 2);
 });
 
+test('volume RPC preserves zero, bounds, identities and worker cancellation', async t => {
+  const { bridge, connect } = await fixture(t);
+  const calls = [];
+  const started = deferred(), cancelled = deferred();
+  connect(fakeBot({ setVolume: async (guild, user, percent, { signal }) => {
+    calls.push([guild, user, percent]);
+    assert.ok(signal instanceof AbortSignal);
+    if (percent === 25) {
+      started.resolve();
+      await new Promise(resolve => signal.addEventListener('abort', () => { cancelled.resolve(); resolve(); }, { once: true }));
+    }
+    return { volumePercent: percent };
+  } }));
+  await until(() => bridge.bot.isReady());
+  for (const value of [-1, 101, 0.5, '50', null, undefined]) {
+    await assert.rejects(bridge.bot.setVolume(GUILD, USER, value), { code: 'WORKER_INVALID_REQUEST' });
+  }
+  await assert.rejects(bridge.bot.setVolume('invalid', USER, 50), { code: 'WORKER_INVALID_REQUEST' });
+  assert.equal(calls.length, 0);
+  for (const value of [0, 50, 100]) assert.equal((await bridge.bot.setVolume(GUILD, USER, value)).volumePercent, value);
+  assert.deepEqual(calls, [0, 50, 100].map(value => [GUILD, USER, value]));
+  const controller = new AbortController();
+  const result = bridge.bot.setVolume(GUILD, USER, 25, { signal: controller.signal });
+  await started.promise;
+  controller.abort();
+  await assert.rejects(result, { code: 'WORKER_OUTCOME_UNKNOWN' });
+  await cancelled.promise;
+  assert.equal(calls.length, 4);
+});
+
 function fakeSessionStorage(overrides = {}) {
   const records = new Map();
   return {

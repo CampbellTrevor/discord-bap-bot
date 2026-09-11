@@ -54,6 +54,186 @@ async function fixture(t, media = { open: async () => openedAudio() }, options =
   return { manager, dataDir };
 }
 
+test('guild volume defaults to 50 and persists independently even with empty queues', async t => {
+  const { manager, dataDir } = await fixture(t);
+  assert.equal(manager.snapshot('guild').volumePercent, 50);
+  assert.equal(manager.snapshot('other').volumePercent, 50);
+  const changes = [];
+  manager.on('change', (guildId, snapshot) => changes.push([guildId, snapshot.volumePercent]));
+  assert.equal((await manager.setVolume('guild', 0)).volumePercent, 0);
+  assert.equal((await manager.setVolume('other', 100)).volumePercent, 100);
+  assert.deepEqual(changes, [['guild', 0], ['other', 100]]);
+  const saved = JSON.parse(await readFile(path.join(dataDir, 'queues.json'), 'utf8'));
+  assert.deepEqual(saved.guilds.guild, { tracks: [], nowPlaying: null, volumePercent: 0 });
+  assert.deepEqual(saved.guilds.other, { tracks: [], nowPlaying: null, volumePercent: 100 });
+  const restored = new MusicManager({ media: {}, dataDir, logger: quiet });
+  await restored.restore();
+  assert.equal(restored.snapshot('guild').volumePercent, 0);
+  assert.equal(restored.snapshot('other').volumePercent, 100);
+  assert.equal(restored.snapshot('new').volumePercent, 50);
+  await restored.shutdown();
+});
+
+test('volume rejects invalid input without changing playback or persisted settings', async t => {
+  const { manager, dataDir } = await fixture(t);
+  await manager.setVolume('guild', 35);
+  const saved = await readFile(path.join(dataDir, 'queues.json'), 'utf8');
+  const before = manager.snapshot('guild');
+  for (const value of [-1, 101, 50.5, NaN, Infinity, '50', null, undefined, true, {}]) {
+    await assert.rejects(manager.setVolume('guild', value), { status: 400 });
+  }
+  assert.deepEqual(manager.snapshot('guild'), before);
+  assert.equal(await readFile(path.join(dataDir, 'queues.json'), 'utf8'), saved);
+  await manager.shutdown();
+  await assert.rejects(manager.setVolume('guild', 80), { status: 503 });
+  assert.equal(manager.snapshot('guild').volumePercent, 35);
+});
+
+test('restoration saves safe volume defaults while retaining requests and removing unavailable songs', async t => {
+  const { manager, dataDir } = await fixture(t);
+  const savedTrack = title => ({ ...track(title), id: title, requestedBy: requester });
+  const guilds = {
+    legacy: { nowPlaying: savedTrack('Interrupted'), tracks: [savedTrack('Waiting'), { ...savedTrack('Unavailable'), validation: { status: 'unavailable' } }] },
+    empty: { nowPlaying: null, tracks: [] },
+    muted: { nowPlaying: null, tracks: [], volumePercent: 0 },
+    full: { nowPlaying: null, tracks: [], volumePercent: 100 },
+  };
+  for (const [index, volumePercent] of [-1, 101, 25.5, '90', null, true, {}].entries()) {
+    guilds[`invalid-${index}`] = { tracks: [], nowPlaying: null, volumePercent };
+  }
+  await writeFile(path.join(dataDir, 'queues.json'), JSON.stringify({ version: 1, guilds }));
+  await manager.restore();
+  assert.deepEqual(manager.snapshot('legacy').tracks.map(item => item.title), ['Interrupted', 'Waiting']);
+  assert.deepEqual(manager.snapshot('legacy').tracks.map(item => item.requestedBy), [requester, requester]);
+  assert.equal(manager.snapshot('legacy').nowPlaying, null);
+  assert.equal(manager.snapshot('legacy').channelId, null);
+  const migrated = JSON.parse(await readFile(path.join(dataDir, 'queues.json'), 'utf8')).guilds;
+  for (const id of Object.keys(guilds)) {
+    const expected = id === 'muted' ? 0 : id === 'full' ? 100 : 50;
+    assert.equal(manager.snapshot(id).volumePercent, expected);
+    assert.equal(migrated[id].volumePercent, expected);
+  }
+  assert.deepEqual(migrated.legacy.tracks.map(item => item.title), ['Interrupted', 'Waiting']);
+});
+
+test('volume updates current and parked resources without canceling, unpausing, or reordering', async t => {
+  const media = warmMedia();
+  const { manager, dataDir } = await fixture(t, media, { preloadCount: 2 });
+  const voice = fakeTransport(), prepared = [], initialVolumes = [], playedVolumes = [];
+  voice.prepare = async (raw, { volume }) => {
+    initialVolumes.push(volume);
+    const gains = [];
+    const opened = { ...raw, gains, setVolume: value => gains.push(value) };
+    prepared.push(opened);
+    return opened;
+  };
+  const play = voice.play;
+  voice.play = function (opened, ...callbacks) {
+    playedVolumes.push(opened.gains.at(-1));
+    play.call(this, opened, ...callbacks);
+  };
+  await manager.enqueue('guild', ['A', 'B', 'C'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await until(() => manager.preloadEntries.size === 2 && [...manager.preloadEntries].every(entry => entry.status === 'ready'));
+  assert.deepEqual(initialVolumes, [0.5, 0.5, 0.5]);
+  assert.deepEqual(playedVolumes, [0.5]);
+  await manager.control('guild', 'pause');
+  const before = manager.snapshot('guild'), generation = manager.state('guild').generation;
+  const parked = [...manager.preloadEntries], stopped = voice.stopped;
+  const result = await manager.setVolume('guild', 0);
+  assert.deepEqual(result, { ...before, volumePercent: 0 });
+  assert.deepEqual(prepared.map(source => source.gains.at(-1)), [0, 0, 0]);
+  await manager.setVolume('guild', 23);
+  assert.deepEqual(prepared.map(source => source.gains.at(-1)), [0.23, 0.23, 0.23]);
+  assert.deepEqual([...manager.preloadEntries], parked);
+  assert.equal(manager.state('guild').generation, generation);
+  assert.equal(voice.plays.length, 1);
+  assert.equal(voice.plays[0].opened, prepared[0]);
+  assert.equal(voice.stopped, stopped);
+  assert.equal(voice.paused, true);
+  assert.equal(media.calls.length, 3);
+  assert.ok(media.calls.every(call => !call.signal.aborted && call.opened.cleanupCount === 0));
+  await manager.shutdown();
+  const restored = new MusicManager({ media: {}, dataDir, logger: quiet });
+  await restored.restore();
+  assert.equal(restored.snapshot('guild').volumePercent, 23);
+  assert.deepEqual(restored.snapshot('guild').tracks.map(item => item.title), ['A', 'B', 'C']);
+  await restored.shutdown();
+});
+
+test('volume changes during preparation and handoff apply before the first consumed packet', async t => {
+  const media = warmMedia();
+  const { manager } = await fixture(t, media, { preloadCount: 1 });
+  const voice = fakeTransport(), preparation = [], playedVolumes = [];
+  voice.prepare = (raw, options) => {
+    const pending = deferred(), gains = [];
+    const opened = { ...raw, gains, setVolume: value => gains.push(value) };
+    preparation.push({ ...pending, options, opened });
+    return pending.promise;
+  };
+  const play = voice.play;
+  voice.play = function (opened, ...callbacks) {
+    playedVolumes.push(opened.gains.at(-1));
+    play.call(this, opened, ...callbacks);
+  };
+  await manager.enqueue('guild', ['A', 'B'].map(track), requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await until(() => preparation.length === 1);
+  assert.equal(preparation[0].options.volume, 0.5);
+  await manager.setVolume('guild', 0);
+  assert.equal(preparation[0].options.signal.aborted, false);
+  preparation[0].resolve(preparation[0].opened);
+  await until(() => preparation.length === 2);
+  assert.deepEqual(playedVolumes, [0]);
+  assert.equal(preparation[1].options.volume, 0);
+  await manager.setVolume('guild', 100);
+  assert.equal(preparation[1].options.signal.aborted, false);
+  preparation[1].resolve(preparation[1].opened);
+  await until(() => [...manager.preloadEntries][0]?.status === 'ready');
+  assert.equal(preparation[1].opened.gains.at(-1), 1);
+  voice.plays[0].end();
+  await manager.setVolume('guild', 25);
+  await until(() => voice.plays.length === 2);
+  assert.deepEqual(playedVolumes, [0, 0.25]);
+  assert.equal(voice.plays[1].opened, preparation[1].opened);
+  assert.equal(media.calls.length, 2);
+});
+
+test('volume leaves pending metadata validation running and canceled preparation stays canceled', async t => {
+  const checking = deferred(), checkSignals = [], preparing = deferred();
+  const media = {
+    async open() { return openedAudio(); },
+    preflight(_item, { signal }) { checkSignals.push(signal); return checking.promise; },
+  };
+  const { manager } = await fixture(t, media, { validationDelayMs: 1 });
+  await manager.enqueue('guild', [track('A')], requester);
+  await until(() => checkSignals.length === 1);
+  await manager.setVolume('guild', 70);
+  assert.equal(checkSignals[0].aborted, false);
+  checking.resolve({ ...track('A') });
+  await until(() => !manager.validationEntry);
+  const voice = fakeTransport();
+  let prepared, prepareSignal;
+  voice.prepare = (raw, { signal, volume }) => {
+    assert.equal(volume, 0.7);
+    prepareSignal = signal;
+    const gains = [];
+    prepared = { ...raw, gains, setVolume: value => gains.push(value) };
+    return preparing.promise;
+  };
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await until(() => prepared);
+  await manager.setVolume('guild', 65);
+  await manager.control('guild', 'stop');
+  assert.equal(prepareSignal.aborted, true);
+  preparing.resolve(prepared);
+  await until(() => prepared.stream.destroyed);
+  assert.deepEqual(prepared.gains, []);
+  assert.equal(voice.plays.length, 0);
+  assert.equal(manager.snapshot('guild').volumePercent, 65);
+  assert.deepEqual(manager.snapshot('guild').tracks, []);
+});
+
 test('skip during asynchronous opening discards and cleans the stale song', async t => {
   const first = deferred();
   const second = deferred();

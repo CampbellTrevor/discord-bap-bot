@@ -102,6 +102,7 @@ To activate an existing preview, add all three Discord credentials, explicitly s
 | `/queue` | Show current song and next ten requests |
 | `/join` | Join your voice channel and continue saved requests |
 | `/pause`, `/resume` | Pause or resume the current song |
+| `/volume percent:50` | Set shared volume from 0–100%; omit `percent` to see the current level |
 | `/skip` | Skip the current song |
 | `/shuffle` | Randomize the waiting queue while the current song continues |
 | `/stop` | Stop and clear the queue, staying in voice briefly |
@@ -111,6 +112,8 @@ To activate an existing preview, add all three Discord credentials, explicitly s
 ## Configuration and verification
 
 `.env.example` lists all options. Defaults: 2,000 total songs per server (including the current track), up to 2,000 playlist entries inspected per import, 60 minutes per track, five-minute idle disconnect. Spotify imports use pages of at most 50 entries with a bounded page count and a 90-second overall deadline. Request endpoints have rate limits; media extraction has bounded concurrency/timeouts. OAuth uses one-time state, server sessions, CSRF protection, and live Discord membership/permission checks.
+
+Shared volume starts at **50%** in each server and is saved with its queue, including when the queue is empty. Use the **Volume** slider in either theme or `/volume percent:` to change it during playback. Zero mutes; 100% is the original level. Changes require the same voice-channel, manager, or DJ permission as skip/pause. A restart restores the setting and requests; `/join` resumes the interrupted song from the beginning.
 
 ```sh
 npm run check
@@ -126,6 +129,8 @@ Layout: `src/app.mjs` (HTTP/OAuth), `src/discord.mjs` (Discord/policies), `src/m
 ## Preloading and playback host performance
 
 The worker prepares the next two waiting songs during the final two minutes of the current track. Each prepared source has its playable resource and a buffer of up to 150 Opus packets (about three seconds at Discord's packet cadence); at least 25 packets are prepared before it is marked ready. Compatible Opus sources avoid FFmpeg conversion, and other formats are converted ahead of the transition. Playback reuses that resource without adding end padding. Silence in the recording and Discord transport timing can still produce an audible gap.
+
+Volume is applied to each consumed packet by decoding, scaling PCM samples, and encoding back to Opus. Buffered songs use the latest setting when they play, without waiting for the three-second reservoir to drain. This processing adds CPU work during playback; speculative buffers remain unprocessed until consumed.
 
 At most two speculative sources are held across all servers, with five-minute expiry. Playback has priority; queue changes discard stale sources. The preloader looks past confirmed unavailable entries and failed preparation attempts to prepare the next playable songs, retaining already buffered sources. Temporary preparation failures impose a cooldown to avoid sweeping through the queue during a provider outage; a missing preload can still require a normal source open at playback time. Resuming after an expired preload allows a fresh preparation attempt. Validated Spotify-to-YouTube matches are cached for ten minutes, up to 200 entries, so canceled preparation does not repeat the same search. Audio URLs are extracted afresh. Matching recognizes translated titles and release credits while retaining artist, duration, and studio-version checks.
 

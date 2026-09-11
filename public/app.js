@@ -8,6 +8,7 @@ const state = {
   detail: null,
   busy: false,
   busyEndpoint: '',
+  volumeDraft: null,
   polling: false,
   offline: false,
   sampleTime: Date.now(),
@@ -637,7 +638,37 @@ function renderEnabled() {
   }
   for (const tab of document.querySelectorAll('[data-search-source]')) tab.disabled = !ready || (tab.dataset.searchSource === 'spotify' && !state.session?.demo && !state.session?.spotifyEnabled);
   for (const button of $('search-results-list').querySelectorAll('button')) button.disabled = !ready || state.search.pending || state.search.context !== searchContext() || state.search.added.has(button.dataset.sourceUrl);
+  renderVolume();
   updateRequestLabel();
+}
+
+function volumeAvailable() {
+  const value = state.detail?.queue?.volumePercent;
+  return Number.isInteger(value) && value >= 0 && value <= 100;
+}
+
+function canSetVolume() {
+  return volumeAvailable() && Boolean(state.session?.user && (state.session.configured || state.session.demo)
+    && state.session.botReady && !state.offline && state.guildId && state.detail?.member?.canControl);
+}
+
+function renderVolume() {
+  const supported = volumeAvailable();
+  const allowed = canSetVolume();
+  const draft = state.volumeDraft;
+  if (draft && (!allowed || draft.context !== searchContext())) state.volumeDraft = null;
+  $('volume-control').hidden = !supported;
+  $('volume-control').setAttribute('aria-busy', String(state.busyEndpoint === 'volume'));
+  $('volume-input').disabled = !allowed || state.busy;
+  if (!supported) {
+    $('volume-value').textContent = '—';
+    $('volume-input').removeAttribute('aria-valuetext');
+    return;
+  }
+  const value = state.volumeDraft?.value ?? state.detail.queue.volumePercent;
+  $('volume-input').value = String(value);
+  $('volume-input').setAttribute('aria-valuetext', value === 0 ? '0%, muted' : `${value}%`);
+  $('volume-value').textContent = `${value}%`;
 }
 
 function renderPlayer() {
@@ -939,6 +970,27 @@ $('pause-button').addEventListener('click', () => {
 $('skip-button').addEventListener('click', () => mutate('control', { action: 'skip' }, 'Skipped the current track.'));
 $('stop-button').addEventListener('click', () => mutate('control', { action: 'stop' }, 'Playback stopped and the queue cleared.'));
 $('shuffle-button').addEventListener('click', () => mutate('control', { action: 'shuffle' }, 'Shuffled the upcoming tracks.'));
+$('volume-input').addEventListener('input', () => {
+  if (!canSetVolume() || state.busy) { renderVolume(); return; }
+  const value = Number($('volume-input').value);
+  if (!Number.isInteger(value) || value < 0 || value > 100) { renderVolume(); return; }
+  state.volumeDraft = { context: searchContext(), value };
+  renderVolume();
+});
+$('volume-input').addEventListener('change', async () => {
+  const draft = state.volumeDraft;
+  if (!draft || draft.context !== searchContext() || !canSetVolume() || state.busy) { renderVolume(); return; }
+  if (draft.value === state.detail.queue.volumePercent) { state.volumeDraft = null; renderVolume(); return; }
+  try {
+    await mutate('volume', { volumePercent: draft.value }, draft.value === 0 ? 'Playback muted.' : `Volume set to ${draft.value}%.`);
+  } finally {
+    if (state.volumeDraft === draft) state.volumeDraft = null;
+    renderVolume();
+  }
+});
+$('volume-input').addEventListener('pointercancel', () => {
+  if (state.busyEndpoint !== 'volume') { state.volumeDraft = null; renderVolume(); }
+});
 $('performance-panel').addEventListener('toggle', () => {
   if ($('performance-panel').open) void pollPerformance(true);
   else cancelPerformance();

@@ -7,6 +7,8 @@ import { MediaError, isPermanentMediaError } from './media.mjs';
 
 const SAFE_RUNTIME_CODES = new Set(['ENOENT', 'EPIPE', 'ECONNRESET', 'ETIMEDOUT', 'ABORT_ERR', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END', 'ERR_MODULE_NOT_FOUND', 'ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_OUT_OF_RANGE']);
 const SAFE_ERROR_TYPES = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError', 'TimeoutError', 'AudioPlayerError']);
+const DEFAULT_VOLUME_PERCENT = 50;
+const validVolumePercent = value => Number.isInteger(value) && value >= 0 && value <= 100;
 const SOURCE_METRIC_CODES = new Set(['AUDIO_SOURCE_FAILED', 'MEDIA_CANCELLED', 'MEDIA_BUSY', 'MEDIA_TIMEOUT', 'MEDIA_UNAVAILABLE', 'INVALID_MEDIA', 'UNSUPPORTED_MEDIA', 'TRACK_TOO_LONG', 'YOUTUBE_REQUEST_BLOCKED', 'YOUTUBE_RATE_LIMITED', 'YOUTUBE_RESTRICTED', 'YOUTUBE_FORMAT_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'EXTRACTOR_UNAVAILABLE']);
 SOURCE_METRIC_CODES.add('NO_PLAYBACK_MATCH');
 SOURCE_METRIC_CODES.add('YOUTUBE_VIDEO_UNAVAILABLE');
@@ -80,7 +82,7 @@ export class MusicManager extends EventEmitter {
       state = {
         guildId, tracks: [], nowPlaying: null, channelId: null, channelName: null,
         transport: null, generation: 0, opened: null, abort: null,
-        paused: false, opening: false, lastError: null, idleTimer: null,
+        paused: false, opening: false, lastError: null, idleTimer: null, volumePercent: DEFAULT_VOLUME_PERCENT,
         preloads: new Map(), preloadTimer: null, retryingTrackId: null, transitionStartedAt: null,
       };
       this.states.set(guildId, state);
@@ -99,7 +101,7 @@ export class MusicManager extends EventEmitter {
     if (saved.version !== 1 || !saved.guilds || typeof saved.guilds !== 'object') {
       throw new Error('Unsupported saved queue format. Preserve queues.json before starting again.');
     }
-    let removedUnavailable = false;
+    let migrated = false;
     for (const [guildId, value] of Object.entries(saved.guilds)) {
       if (!value || !Array.isArray(value.tracks)) throw new Error('Invalid saved queue data.');
       const restored = [value.nowPlaying, ...value.tracks].filter(Boolean);
@@ -107,11 +109,13 @@ export class MusicManager extends EventEmitter {
         throw new Error('Invalid track in saved queue data.');
       }
       const state = this.state(guildId);
+      state.volumePercent = validVolumePercent(value.volumePercent) ? value.volumePercent : DEFAULT_VOLUME_PERCENT;
+      migrated ||= state.volumePercent !== value.volumePercent;
       state.tracks = restored;
-      removedUnavailable = this.removeUnavailable(state) > 0 || removedUnavailable;
+      migrated = this.removeUnavailable(state) > 0 || migrated;
       state.tracks = state.tracks.map(track => this.initializeValidation(track));
     }
-    if (removedUnavailable) await this.persist();
+    if (migrated) await this.persist();
     this.scheduleValidation();
   }
 
@@ -120,7 +124,7 @@ export class MusicManager extends EventEmitter {
     return structuredClone({
       guildId, channelId: state.channelId, channelName: state.channelName,
       nowPlaying: publicTrack(state.nowPlaying), tracks: state.tracks.map(publicTrack),
-      paused: state.paused,
+      paused: state.paused, volumePercent: state.volumePercent,
       playing: Boolean(state.nowPlaying && state.transport && !state.opening && !state.paused),
       lastError: state.lastError,
       elapsedSec: state.nowPlaying ? Math.max(0, state.transport?.elapsedSec?.() || 0) : 0,
@@ -250,6 +254,23 @@ export class MusicManager extends EventEmitter {
     return this.snapshot(guildId);
   }
 
+  async setVolume(guildId, percent) {
+    if (this.shuttingDown) throw musicError('The bot is restarting. Please try again shortly.', 503);
+    if (!validVolumePercent(percent)) throw musicError('Volume must be a whole number from 0 to 100.');
+    const state = this.state(guildId);
+    state.volumePercent = percent;
+    const volume = percent / 100;
+    state.opened?.setVolume?.(volume);
+    for (const entry of state.preloads.values()) {
+      if (entry.status === 'ready') entry.opened?.setVolume?.(volume);
+    }
+    // Preparing sources pick up this value before activation. A gain change
+    // does not cancel metadata work, replace resources, or reorder the queue.
+    await this.persist();
+    this.changed(state);
+    return this.snapshot(guildId);
+  }
+
   clearIdle(state) {
     clearTimeout(state.idleTimer);
     state.idleTimer = null;
@@ -363,7 +384,7 @@ export class MusicManager extends EventEmitter {
             });
           }
         }
-        opened = await this.prepareSource(opened, transport, signal);
+        opened = await this.prepareSource(opened, transport, signal, state.volumePercent / 100);
       }
       if (state.generation !== generation || this.shuttingDown || state.transport !== transport) {
         metric('error');
@@ -422,6 +443,9 @@ export class MusicManager extends EventEmitter {
         state.transitionStartedAt = null;
         try { this.emit('transitionMetric', { outcome: 'ready', durationMs, preloaded: Boolean(usePreload) }); } catch {}
       };
+      // Preparation and preloading may span a volume change. Apply the latest
+      // gain immediately before the first packet can be consumed.
+      opened.setVolume?.(state.volumePercent / 100);
       transport.play(opened, () => finish(), error => finish(error), onStarted);
       if (state.paused) transport.pause();
       this.changed(state);
@@ -447,13 +471,13 @@ export class MusicManager extends EventEmitter {
     }
   }
 
-  async prepareSource(raw, transport, signal) {
+  async prepareSource(raw, transport, signal, volume) {
     if (!transport.prepare) return raw;
     try {
       signal.throwIfAborted();
       // Both the preparing adapter and race cleanup can release this source;
       // route ownership through the manager's idempotent cleanup guard.
-      return await transport.prepare({ ...raw, cleanup: () => this.cleanup(raw) }, { signal });
+      return await transport.prepare({ ...raw, cleanup: () => this.cleanup(raw) }, { signal, volume });
     } catch (error) {
       this.cleanup(raw);
       throw error;
@@ -702,7 +726,7 @@ export class MusicManager extends EventEmitter {
       if (transport.prepare) {
         // This is an object-mode Opus packet stream and its exact resource.
         // Never run it through the byte-mode speculative source buffer.
-        const prepared = await this.prepareSource(raw, transport, entry.controller.signal);
+        const prepared = await this.prepareSource(raw, transport, entry.controller.signal, state.volumePercent / 100);
         if (!current() || entry.status !== 'opening') { this.cleanup(prepared); return; }
         entry.opened = prepared;
         buffer = prepared.stream;
@@ -725,6 +749,7 @@ export class MusicManager extends EventEmitter {
         raw.stream.pipe(buffer);
         if (raw.stream.destroyed && !raw.stream.readableEnded) sourceClose();
       }
+      entry.opened.setVolume?.(state.volumePercent / 100);
       entry.onError = failed;
       buffer.once('error', entry.onError);
       entry.status = 'ready';
@@ -785,7 +810,7 @@ export class MusicManager extends EventEmitter {
   persist() {
     const guilds = {};
     for (const [id, state] of this.states) {
-      guilds[id] = { tracks: state.tracks, nowPlaying: state.nowPlaying };
+      guilds[id] = { tracks: state.tracks, nowPlaying: state.nowPlaying, volumePercent: state.volumePercent };
     }
     // Capture now, then serialize writes: a delayed older write cannot overwrite a newer queue.
     const body = JSON.stringify({ version: 1, guilds }, null, 2);
