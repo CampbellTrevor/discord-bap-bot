@@ -234,7 +234,8 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         // Failed/unfinished restoration must never replace the original queue file.
         if (queuesRestored) await music.shutdown();
       } finally {
-        client.destroy();
+        try { await media.close?.(); }
+        finally { client.destroy(); }
       }
     },
     async listGuilds(userId) {

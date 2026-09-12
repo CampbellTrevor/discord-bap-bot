@@ -31,7 +31,7 @@ sudo docker build -t bap-bot-worker:local .
 sudo docker run --rm bap-bot-worker:local node scripts/probe-audio.mjs 'https://www.youtube.com/watch?v=VIDEO_ID'
 ```
 
-Supply a real, ordinary public video. The probe uses the same media implementation, reads a small audio sample, and discards it. Image building checks FFmpeg, Opus, and Discord encryption dependencies. Neither substitutes for listening in Discord. Test several representative tracks and the reported failing song, then check memory/CPU under search, playlist import, and playback together. If YouTube refuses access, do not activate the worker.
+Supply a real, ordinary public video. This access probe uses the media implementation's streaming adapter, reads a small audio sample, and discards it; it does not test the production worker's complete-file download path. Image building checks FFmpeg, Opus, and Discord encryption dependencies. Neither substitutes for listening in Discord. Test complete downloads and playback with several representative tracks and the reported failing song, then check memory/CPU under search, playlist import, and playback together. If YouTube refuses access, do not activate the worker.
 
 ## Activate after audio access passes
 
@@ -39,17 +39,24 @@ Supply a real, ordinary public video. The probe uses the same media implementati
 2. Generate one random ASCII `WORKER_SECRET` of 32–256 characters, without spaces. Set Render `BOT_ROLE=portal` and that secret. Keep its Discord application ID, OAuth client secret, `SESSION_SECRET`, and existing HTTPS `PUBLIC_URL`. The portal does not need the Discord bot token or Spotify credentials in this role.
 3. Deploy Render and wait until the old combined process has terminated. Do not run two copies of this Discord bot during migration.
 4. Transfer a root-readable `/etc/bap-bot/worker.env` over SSH (mode 0600). Include `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `WORKER_SECRET`, `WORKER_URL=https://discord-bap-bot.onrender.com`, and `PUBLIC_URL=https://discord-bap-bot.onrender.com`. Copy Spotify credentials/refresh token and any server/DJ restrictions. Never copy the local `PUBLIC_URL=http://localhost:3000` into production. The worker needs neither the OAuth client secret nor the portal session secret.
-5. Restore preserved state into `/var/lib/bap-bot/data` with UID/GID 1000 and private permissions. Start the prepared service:
+5. Restore preserved state into `/var/lib/bap-bot/data` with UID/GID 1000 and private permissions. Prepare the separate audio-cache directory if cloud-init has not already created it, then start the prepared service:
 
 ```sh
+sudo install -d -m 0700 -o 1000 -g 1000 /var/lib/bap-bot/audio-cache
 sudo docker compose -f deploy/worker.compose.yaml up -d --no-build
 ```
 
 The Compose service sets the worker role, restarts after failure/reboot, limits memory and logs, and preserves data outside the container. Its filesystem is otherwise read-only and it publishes no ports. The configuration targets a 1GB VM; do not apply its memory limits unchanged to a 512MB host.
 
+The worker downloads complete audio before playback, with up to three HTTP retries and three fragment retries and a failure on unavailable fragments. `AUDIO_DOWNLOAD_TIMEOUT_MS` defaults to 90,000 milliseconds and accepts 10,000–120,000. The first song can need a few seconds to download; the next two are prepared during the current song's final 120 seconds. Completed local preloads do not expire while retained in that window, including when the preceding song lasts an hour. Provider/network failures after a successful download cannot cut off the local recording, though local playback and Discord delivery still need observation.
+
+Compose sets `AUDIO_CACHE_DIR=/var/cache/bap-bot` and mounts `/var/lib/bap-bot/audio-cache` there. It uses host disk, not the container's 128 MiB `/tmp` tmpfs or an in-memory whole-song buffer. Downloads are bounded to 128 MiB per file, 512 MiB total, and 16 files. Files are removed when playback ends or their source is discarded. Keep queue, sign-in, Spotify state, and performance-history backups in the separate `/var/lib/bap-bot/data` mount. Audio-cache files are disposable and do not need migration or backup. Outside Compose, `AUDIO_CACHE_DIR` defaults to `DATA_DIR/.audio-cache`; exclude that subdirectory from state backups.
+
 Verify portal health reports `botReady: true`. Sign in, join voice, and test YouTube audio, Spotify matching, search selection, playlist import, shuffle, and reconnect after a portal restart. Discord playback must continue while the portal is disconnected. Unconfirmed actions are not retried automatically: refresh the queue before retrying. A successful migration requires that actual voice test; it has not happened yet.
 
 For updates, build a reviewed commit, recreate the worker with Compose, and check logs/health. Keep one previous image for rollback and back up the small data directory. The portal reconnects automatically; a worker restart preserves the queue but requires `/join` to resume voice.
+
+For an existing VM upgrading to complete audio downloads, run the `sudo install -d` command above before the next planned worker recreation so Docker does not create a root-owned cache directory. Creating the directory alone does not interrupt playback. The new mount and code take effect when that planned recreation runs; leave the current worker running until then.
 
 ## Persistent website sign-in
 

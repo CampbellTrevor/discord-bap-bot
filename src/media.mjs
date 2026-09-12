@@ -2,6 +2,7 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { AudioDownloadError, createAudioDownloadCache } from './audio-download.mjs';
 
 const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 const YOUTUBE_PLAYLIST_ID = /^[A-Za-z0-9_-]{10,100}$/;
@@ -296,6 +297,7 @@ export function createMedia(config = {}, dependencies = {}) {
   const now = dependencies.now ?? Date.now;
   const resolveTimeoutMs = dependencies.resolveTimeoutMs ?? 30_000;
   const startupTimeoutMs = dependencies.startupTimeoutMs ?? 45_000;
+  const audioDownloadTimeoutMs = dependencies.audioDownloadTimeoutMs ?? config.audioDownloadTimeoutMs ?? 90_000;
   const playlistTimeoutMs = dependencies.playlistTimeoutMs ?? 90_000;
   const maxDuration = config.maxTrackDurationSec ?? 3600;
   // The configured ceiling bounds inspected entries. Per-request maxTracks
@@ -318,6 +320,14 @@ export function createMedia(config = {}, dependencies = {}) {
   let spotifyRefreshLoaded;
   const spotifyCache = new Map();
   const spotifyMatches = new Map();
+  const audioCache = config.audioCacheDir ? createAudioDownloadCache({ directory: config.audioCacheDir }, {
+    error: kind => { const failure = new AudioDownloadError(kind); return new MediaError(failure.message, failure.code); },
+    fs: dependencies.audioCacheFs,
+  }) : null;
+  const shutdownController = new AbortController();
+  const pendingOpens = new Set();
+  const downloadCleanups = new Set();
+  let closing;
 
   function logExtractorFailure(error, operation) {
     if (!EXTRACTOR_FAILURE_CODES.has(error.code)) return;
@@ -326,9 +336,9 @@ export function createMedia(config = {}, dependencies = {}) {
     try { logger.warn?.('YouTube extractor failed.', { operation, code: error.code }); } catch {}
   }
 
-  function startExtractor(extraArgs, target, { playlist = false, background = false } = {}) {
+  function startExtractor(extraArgs, target, { playlist = false, background = false, download = false } = {}) {
     if (activeProcesses >= (background ? MAX_PROCESSES - 1 : MAX_PROCESSES)) throw new MediaError('The music provider is busy. Try again in a moment.', 'MEDIA_BUSY');
-    const args = ['--ignore-config', '--no-cache-dir', playlist ? '--yes-playlist' : '--no-playlist', '--no-progress', '--no-colors', '--js-runtimes', 'node', '--socket-timeout', '10', '--retries', '1', '--extractor-retries', '1', ...extraArgs, '--', target];
+    const args = ['--ignore-config', '--no-cache-dir', playlist ? '--yes-playlist' : '--no-playlist', '--no-progress', '--no-colors', '--js-runtimes', 'node', '--socket-timeout', '10', '--retries', download ? '3' : '1', '--extractor-retries', '1', ...extraArgs, '--', target];
     let child;
     try {
       child = spawn(config.ytDlpPath || 'yt-dlp', args, { shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -818,6 +828,79 @@ export function createMedia(config = {}, dependencies = {}) {
     });
   }
 
+  async function downloadYoutube(track, startupSignal, externalSignal) {
+    const lease = await audioCache.reserve({ signal: startupSignal });
+    let child;
+    let stream;
+    let stderr = '';
+    let ready = false;
+    let failure;
+    let rejectCompletion;
+    let cleaning;
+    let stopped = false;
+    const cleanup = () => {
+      if (stopped) return cleaning ?? Promise.resolve();
+      stopped = true;
+      startupSignal.removeEventListener('abort', startupAbort);
+      externalSignal?.removeEventListener('abort', externalAbort);
+      if (child) { stopExtractor(child); child.stdout.destroy(); }
+      stream?.destroy();
+      cleaning = lease.cleanup().then(removed => {
+        downloadCleanups.delete(cleanup);
+        if (!removed) {
+          try { logger.warn?.('Audio download cleanup failed.', { code: 'MEDIA_UNAVAILABLE' }); } catch {}
+        }
+      });
+      return cleaning;
+    };
+    const fail = error => {
+      if (stopped) return;
+      failure ??= error;
+      rejectCompletion?.(failure);
+      if (ready) stream?.destroy(failure);
+      void cleanup();
+    };
+    const startupAbort = () => fail(abortReason(startupSignal));
+    const externalAbort = () => fail(abortReason(externalSignal));
+    downloadCleanups.add(cleanup);
+    try {
+      startupSignal.throwIfAborted();
+      externalSignal?.throwIfAborted();
+      child = startExtractor(['--format', 'bestaudio[acodec=opus][asr=48000]/bestaudio/best', '--output', '-',
+        '--fragment-retries', '3', '--retry-sleep', 'http:exp=1:4', '--retry-sleep', 'fragment:exp=1:4',
+        '--abort-on-unavailable-fragments', '--concurrent-fragments', '1'], track.playbackUrl, { download: true });
+      const completed = new Promise((resolve, reject) => {
+        rejectCompletion = reject;
+        child.stderr.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-8192); });
+        child.stderr.on('error', () => {});
+        child.once('error', () => fail(new MediaError('The audio extractor could not start. Install yt-dlp and its dependencies on the bot host.', 'EXTRACTOR_UNAVAILABLE')));
+        child.once('close', code => code === 0 ? resolve() : fail(youtubeFailure(stderr)));
+      });
+      startupSignal.addEventListener('abort', startupAbort, { once: true });
+      externalSignal?.addEventListener('abort', externalAbort, { once: true });
+      // Drain the provider into a bounded disk file at download speed. Neither
+      // stdout EOF nor an early successful exit alone proves completion.
+      await Promise.all([completed, lease.writeFrom(child.stdout, {
+        signal: startupSignal, sourceError: () => youtubeFailure(stderr), onError: error => { failure ??= error; },
+      })]);
+      startupSignal.throwIfAborted();
+      externalSignal?.throwIfAborted();
+      if (failure) throw failure;
+      stream = await lease.openStream({ signal: startupSignal });
+      startupSignal.throwIfAborted();
+      externalSignal?.throwIfAborted();
+      if (failure) throw failure;
+      ready = true;
+      startupSignal.removeEventListener('abort', startupAbort);
+      return { stream, cleanup, localFile: true };
+    } catch (error) {
+      const reported = failure ?? error;
+      logExtractorFailure(reported, 'playback');
+      await cleanup();
+      throw reported;
+    }
+  }
+
   function validatePlaybackInput(track) {
     if (!track || !['youtube', 'spotify'].includes(track.source)) throw new MediaError('This track has an unsupported source.', 'UNSUPPORTED_MEDIA');
     if (!(track.source === 'youtube' && track.needsValidation === true && track.durationSec == null)) durationSeconds(track.durationSec, maxDuration);
@@ -926,7 +1009,8 @@ export function createMedia(config = {}, dependencies = {}) {
     } finally { activeResolutions--; }
   }
 
-  async function open(track, { signal } = {}) {
+  async function openTrack(track, { signal } = {}) {
+    signal = signal ? AbortSignal.any([signal, shutdownController.signal]) : shutdownController.signal;
     validatePlaybackInput(track);
     signal?.throwIfAborted();
     if (activeProcesses >= MAX_PROCESSES) {
@@ -936,24 +1020,47 @@ export function createMedia(config = {}, dependencies = {}) {
       Object.defineProperty(error, 'retryableBeforeStart', { value: true });
       throw error;
     }
-    return withDeadline(signal, startupTimeoutMs, async deadline => {
+    return withDeadline(signal, audioCache ? audioDownloadTimeoutMs : startupTimeoutMs, async deadline => {
       const { playable, track: validated, matchKey } = await resolvePlayback(track, deadline);
       let opened;
       const invalidate = () => {
         if (matchKey && spotifyMatches.get(matchKey)?.track === playable) rememberMatch(matchKey, {
           track: null, rejectedVideoId: validated.playbackMapping.videoId, expires: now() + MATCH_CACHE_TTL_MS });
       };
-      try { opened = await streamYoutube(playable, deadline, signal); }
+      try { opened = await (audioCache ? downloadYoutube(playable, deadline, signal) : streamYoutube(playable, deadline, signal)); }
       catch (error) {
         // Queue edits commonly cancel a valid preload. Keep its mapping for a
         // later attempt, but re-search after an actual unavailable audio source.
-        if (!signal?.aborted && error.code !== 'MEDIA_BUSY') invalidate();
+        if (!signal?.aborted && error.code !== 'MEDIA_BUSY' && !(audioCache && error.code === 'MEDIA_UNAVAILABLE')) invalidate();
         throw error;
       }
-      if (matchKey) opened.stream.once('error', () => { if (!signal?.aborted) invalidate(); });
+      if (deadline.aborted || signal.aborted) {
+        await opened.cleanup();
+        deadline.throwIfAborted();
+        signal.throwIfAborted();
+      }
+      if (matchKey && !opened.localFile) opened.stream.once('error', () => { if (!signal?.aborted) invalidate(); });
       return { ...opened, track: validated };
     });
   }
 
-  return { resolve, search, preflight, open };
+  function open(track, options) {
+    const operation = openTrack(track, options);
+    pendingOpens.add(operation);
+    operation.then(() => pendingOpens.delete(operation), () => pendingOpens.delete(operation));
+    return operation;
+  }
+
+  function close() {
+    if (closing) return closing;
+    shutdownController.abort(new MediaError('The media request was cancelled.', 'MEDIA_CANCELLED'));
+    closing = (async () => {
+      await Promise.allSettled([...pendingOpens]);
+      await Promise.all([...downloadCleanups].map(cleanup => cleanup()));
+      await audioCache?.close();
+    })();
+    return closing;
+  }
+
+  return { resolve, search, preflight, open, close };
 }

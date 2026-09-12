@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
-import { mkdtemp, readFile, rmdir, stat, unlink } from 'node:fs/promises';
+import { PassThrough, Writable } from 'node:stream';
+import { mkdtemp, open, readFile, readdir, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createMedia, isPermanentMediaError, MediaError } from '../src/media.mjs';
@@ -42,6 +42,32 @@ const metadata = value => child => {
   setImmediate(() => child.emit('close', 0));
 };
 
+async function downloadedMedia(t, scenarios = [], config = {}, dependencies = {}) {
+  const directory = await mkdtemp(path.join(tmpdir(), 'bap-media-download-test-'));
+  const fake = extractor(scenarios);
+  const media = createMedia({ audioCacheDir: directory, ...config }, { ...fake, ...dependencies });
+  t.after(async () => {
+    await media.close();
+    for (const name of await readdir(directory)) await unlink(path.join(directory, name));
+    await rmdir(directory);
+  });
+  return { media, fake, directory, track: { source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`, title: 'A song', durationSec: 120 } };
+}
+
+async function until(check) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (await check()) return;
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
+  assert.fail('Expected asynchronous media operation to settle.');
+}
+
+const readAudio = async stream => {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+};
+
 test('provider errors carry safe HTTP statuses for portal and Discord responses', () => {
   for (const code of ['INVALID_QUERY', 'UNSUPPORTED_MEDIA', 'INVALID_MEDIA', 'TRACK_TOO_LONG', 'SPOTIFY_NOT_FOUND', 'NO_PLAYBACK_MATCH', 'YOUTUBE_VIDEO_UNAVAILABLE']) {
     assert.equal(new MediaError('Please choose another track.', code).status, 400);
@@ -49,6 +75,201 @@ test('provider errors carry safe HTTP statuses for portal and Discord responses'
   for (const code of ['MEDIA_TIMEOUT', 'MEDIA_BUSY', 'EXTRACTOR_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'SPOTIFY_NOT_CONFIGURED', 'SPOTIFY_QUOTA_EXCEEDED']) {
     assert.equal(new MediaError('Please try again later.', code).status, 503);
   }
+});
+
+test('complete downloads reject stdout EOF followed by a late extractor failure before playback', async t => {
+  const { media, fake, directory, track } = await downloadedMedia(t, [child => {
+    child.stdout.end('the first half of the recording');
+    child.stderr.write('ERROR: HTTP Error 503 at https://private.example/stream?signature=do-not-log');
+  }]);
+  let settled = false;
+  const opening = media.open(track);
+  opening.then(() => { settled = true; }, () => { settled = true; });
+  const rejected = assert.rejects(opening, error => error.code === 'YOUTUBE_UNAVAILABLE' && !error.message.includes('private.example'));
+  await until(() => fake.calls[0]?.child.stdout.readableEnded);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, 'EOF alone cannot publish a playable source.');
+  fake.calls[0].child.emit('close', 1);
+  await rejected;
+  assert.deepEqual((await readdir(directory)).filter(name => name.endsWith('.download')), []);
+});
+
+test('complete downloads retain every byte and wait for stdout when close zero arrives first', async t => {
+  const { media, fake, directory, track } = await downloadedMedia(t, [child => child.emit('close', 0)]);
+  let settled = false;
+  const opening = media.open(track);
+  opening.then(() => { settled = true; }, () => { settled = true; });
+  await until(() => fake.calls.length === 1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, 'A successful exit alone cannot publish an unwritten file.');
+  const content = Buffer.concat([Buffer.from('first'), Buffer.alloc(256 * 1024, 91), Buffer.from('last')]);
+  fake.calls[0].child.stdout.end(content);
+  const opened = await opening;
+  assert.equal(opened.localFile, true);
+  assert.deepEqual(Object.keys(opened).sort(), ['cleanup', 'localFile', 'stream', 'track']);
+  assert.equal(JSON.stringify(opened.track).includes(directory), false);
+  assert.deepEqual(await readAudio(opened.stream), content);
+  assert.equal(fake.stopped.length, 0, 'Finished downloads have already released the extractor.');
+  const cleanup = opened.cleanup();
+  assert.equal(opened.cleanup(), cleanup);
+  await cleanup;
+  assert.equal(fake.stopped.length, 0, 'Playback cleanup does not kill an already finished subprocess.');
+  assert.deepEqual((await readdir(directory)).filter(name => name.endsWith('.download')), []);
+});
+
+test('download-only retries are bounded and missing fragments must abort the recording', async t => {
+  const { media, fake, track } = await downloadedMedia(t, [metadata(youtube), child => {
+    child.stdout.end('incomplete fragments');
+    child.stderr.end('ERROR: fragment 17 not found, unable to continue');
+    setImmediate(() => child.emit('close', 1));
+  }]);
+  const [resolved] = await media.resolve(track.sourceUrl);
+  await assert.rejects(media.open(resolved), { code: 'YOUTUBE_UNAVAILABLE' });
+  assert.equal(fake.calls.length, 2, 'There is no outer loop retrying a failed recording.');
+  const metadataArgs = fake.calls[0].args;
+  const audioArgs = fake.calls[1].args;
+  assert.equal(metadataArgs[metadataArgs.indexOf('--retries') + 1], '1');
+  assert.equal(metadataArgs.includes('--fragment-retries'), false);
+  assert.equal(audioArgs[audioArgs.indexOf('--retries') + 1], '3');
+  assert.equal(audioArgs[audioArgs.indexOf('--fragment-retries') + 1], '3');
+  assert.equal(audioArgs[audioArgs.indexOf('--concurrent-fragments') + 1], '1');
+  assert.ok(audioArgs.includes('--abort-on-unavailable-fragments'));
+  assert.deepEqual(audioArgs.flatMap((value, index) => value === '--retry-sleep' ? [audioArgs[index + 1]] : []), ['http:exp=1:4', 'fragment:exp=1:4']);
+});
+
+test('complete download cancellation owns metadata, the writer, and the wait for subprocess close', async t => {
+  for (const stage of ['metadata', 'writing', 'after-eof']) {
+    await t.test(stage, async t => {
+      const scenario = stage === 'after-eof' ? child => child.stdout.end('complete stdout, no exit yet')
+        : stage === 'writing' ? child => child.stdout.write('partial audio') : undefined;
+      const { media, fake, directory, track } = await downloadedMedia(t, scenario ? [scenario] : []);
+      const controller = new AbortController();
+      const opening = media.open(stage === 'metadata' ? { ...track, needsValidation: true } : track, { signal: controller.signal });
+      const reason = new MediaError('Cancelled test request.', 'MEDIA_CANCELLED');
+      const rejected = assert.rejects(opening, error => error === reason);
+      await until(() => fake.calls.length === 1 && (stage !== 'after-eof' || fake.calls[0].child.stdout.readableEnded));
+      controller.abort(reason);
+      await rejected;
+      assert.equal(fake.stopped.length, 1);
+      assert.deepEqual((await readdir(directory)).filter(name => name.endsWith('.download')), []);
+    });
+  }
+});
+
+test('a cancelled ready download closes its local stream and deletes its file without another provider call', async t => {
+  const { media, fake, directory, track } = await downloadedMedia(t, [child => {
+    child.stdout.end(Buffer.alloc(512 * 1024, 4));
+    setImmediate(() => child.emit('close', 0));
+  }]);
+  const controller = new AbortController();
+  const opened = await media.open(track, { signal: controller.signal });
+  const errors = [];
+  opened.stream.on('error', error => errors.push(error));
+  controller.abort(new MediaError('Cancelled test request.', 'MEDIA_CANCELLED'));
+  await opened.cleanup();
+  assert.equal(opened.stream.destroyed, true);
+  assert.equal(fake.calls.length, 1);
+  assert.equal(fake.stopped.length, 0);
+  assert.deepEqual((await readdir(directory)).filter(name => name.endsWith('.download')), []);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].code, 'MEDIA_CANCELLED');
+});
+
+test('completed parked recordings release subprocess capacity for later audio and metadata work', async t => {
+  const complete = child => { child.stdout.end('stored recording'); setImmediate(() => child.emit('close', 0)); };
+  const { media, fake, track } = await downloadedMedia(t, [...Array(6).fill(complete), metadata(youtube)]);
+  const parked = [];
+  for (let i = 0; i < 6; i++) parked.push(await media.open(track));
+  assert.equal(parked.every(opened => opened.localFile === true && !opened.stream.destroyed), true);
+  const [resolved] = await media.resolve(track.sourceUrl);
+  assert.equal(resolved.title, youtube.title);
+  assert.equal(fake.calls.length, 7);
+  for (const opened of parked) await opened.cleanup();
+});
+
+test('complete downloads use their overall deadline for matching and full output, not the streaming first-byte timeout', async t => {
+  await t.test('full output gets the download deadline', async t => {
+    const { media, track } = await downloadedMedia(t, [child => {
+      setTimeout(() => { child.stdout.end('complete audio'); child.emit('close', 0); }, 25);
+    }], {}, { startupTimeoutMs: 5, audioDownloadTimeoutMs: 1000 });
+    const opened = await media.open(track);
+    await opened.cleanup();
+  });
+  for (const stage of ['metadata', 'audio']) await t.test(`${stage} is cancelled at the overall deadline`, async t => {
+    const { media, fake, directory, track } = await downloadedMedia(t, [], {}, { audioDownloadTimeoutMs: stage === 'audio' ? 500 : 25 });
+    await assert.rejects(media.open(stage === 'metadata' ? { ...track, needsValidation: true } : track), { code: 'MEDIA_TIMEOUT' });
+    assert.equal(fake.stopped.length, 1);
+    assert.deepEqual((await readdir(directory)).filter(name => name.endsWith('.download')), []);
+  });
+});
+
+test('stdout errors and an extractor startup error reject complete downloads with safe errors', async t => {
+  for (const stage of ['stdout', 'spawn']) await t.test(stage, async t => {
+    const { media, directory, track } = await downloadedMedia(t, [child => {
+      if (stage === 'stdout') { child.stderr.write('HTTP Error 503'); child.stdout.destroy(new Error('sensitive internal stream detail')); }
+      else child.emit('error', new Error('sensitive executable path'));
+    }]);
+    await assert.rejects(media.open(track), error => error.code === (stage === 'stdout' ? 'YOUTUBE_UNAVAILABLE' : 'EXTRACTOR_UNAVAILABLE') && !error.message.includes('sensitive'));
+    assert.deepEqual((await readdir(directory)).filter(name => name.endsWith('.download')), []);
+  });
+});
+
+test('a cache storage failure happens before the audio subprocess starts', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'bap-media-cache-error-test-'));
+  const file = path.join(directory, 'not-a-directory');
+  await writeFile(file, 'unrelated sentinel');
+  const fake = extractor();
+  const media = createMedia({ audioCacheDir: file }, fake);
+  t.after(async () => { await media.close(); await unlink(file); await rmdir(directory); });
+  await assert.rejects(media.open({ source: 'youtube', sourceUrl: `https://youtu.be/${VIDEO}`, durationSec: 120 }), {
+    code: 'MEDIA_UNAVAILABLE', message: 'The bot could not store this audio download. Please try again.',
+  });
+  assert.equal(fake.calls.length, 0);
+  assert.equal(await readFile(file, 'utf8'), 'unrelated sentinel');
+});
+
+test('a disk write failure is not misreported as a YouTube failure when pipeline destroys stdout', async t => {
+  const warnings = [];
+  const { media, fake, directory, track } = await downloadedMedia(t, [child => {
+    child.stdout.write('partial recording');
+    child.stderr.write('some unrelated YouTube warning');
+  }], {}, {
+    logger: { warn(...args) { warnings.push(args); } },
+    audioCacheFs: {
+      async open(file, flags, mode) {
+        const handle = await open(file, flags, mode);
+        if (file.endsWith('.download')) handle.createWriteStream = () => new Writable({
+          write(chunk, encoding, callback) { callback(Object.assign(new Error(`ENOSPC: ${file}`), { code: 'ENOSPC' })); },
+        });
+        return handle;
+      },
+    },
+  });
+  await assert.rejects(media.open(track), {
+    code: 'MEDIA_UNAVAILABLE', message: 'The bot could not store this audio download. Please try again.',
+  });
+  assert.equal(fake.calls.length, 1);
+  assert.equal(fake.stopped.length, 1);
+  assert.deepEqual(warnings, [], 'Host disk failure must not be logged as a YouTube provider failure.');
+  assert.deepEqual((await readdir(directory)).filter(name => name.endsWith('.download')), []);
+});
+
+test('media shutdown aborts active downloads and reclaims parked files before releasing ownership', async t => {
+  const { media, fake, directory, track } = await downloadedMedia(t, [child => {
+    child.stdout.end('a complete parked recording'); setImmediate(() => child.emit('close', 0));
+  }, child => child.stdout.write('partial next recording')]);
+  const parked = await media.open(track);
+  const opening = media.open(track);
+  const rejected = assert.rejects(opening, { code: 'MEDIA_CANCELLED' });
+  await until(() => fake.calls.length === 2);
+  const closing = media.close();
+  assert.equal(media.close(), closing);
+  await closing;
+  await rejected;
+  assert.equal(parked.stream.destroyed, true);
+  assert.equal(fake.stopped.length, 1);
+  assert.deepEqual((await readdir(directory)).filter(name => process.platform !== 'linux' || name !== '.bap-audio-cache-owner.json'), []);
+  await assert.rejects(media.open(track), { code: 'MEDIA_CANCELLED' });
 });
 
 test('canonicalizes YouTube links and ignores playlist tracking parameters', async () => {

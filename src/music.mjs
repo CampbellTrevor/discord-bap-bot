@@ -754,13 +754,18 @@ export class MusicManager extends EventEmitter {
       buffer.once('error', entry.onError);
       entry.status = 'ready';
       this.preloadMetric(entry, 'ready');
-      entry.expiresAt = Date.now() + this.preloadTtlMs;
-      entry.timer = setTimeout(() => {
-        if (!current() || entry.status !== 'ready') return;
-        failed(new MediaError('The preloaded audio expired before playback.', 'MEDIA_UNAVAILABLE'), 'expired');
-        this.syncPreloads();
-      }, this.preloadTtlMs);
-      entry.timer.unref?.();
+      // Completed local audio has no provider connection or signed URL left
+      // to expire. Keep its owned resource through a long preceding song;
+      // queue reconciliation and the existing preload budget still release it.
+      entry.expiresAt = entry.opened.localFile === true ? Infinity : Date.now() + this.preloadTtlMs;
+      if (Number.isFinite(entry.expiresAt)) {
+        entry.timer = setTimeout(() => {
+          if (!current() || entry.status !== 'ready') return;
+          failed(new MediaError('The preloaded audio expired before playback.', 'MEDIA_UNAVAILABLE'), 'expired');
+          this.syncPreloads();
+        }, this.preloadTtlMs);
+        entry.timer.unref?.();
+      }
       if (buffer.destroyed) failed(new MediaError('The preloaded audio source closed early.', 'MEDIA_UNAVAILABLE'));
     }).catch(failed);
   }

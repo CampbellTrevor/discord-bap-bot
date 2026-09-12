@@ -31,6 +31,17 @@ test('queue defaults support 2,000 total songs and one-hour tracks across roles'
   }
 });
 
+test('configured playback uses a disk audio cache with a bounded complete-download deadline', () => {
+  for (const env of [{}, workerEnv, portalEnv]) {
+    const config = loadConfig(env);
+    assert.ok(config.audioCacheDir.endsWith('.audio-cache'));
+    assert.equal(config.audioDownloadTimeoutMs, 90000);
+    assert.equal(loadConfig({ ...env, AUDIO_DOWNLOAD_TIMEOUT_MS: '120000' }).audioDownloadTimeoutMs, 120000);
+    assert.throws(() => loadConfig({ ...env, AUDIO_DOWNLOAD_TIMEOUT_MS: '0' }), /AUDIO_DOWNLOAD_TIMEOUT_MS/);
+    assert.throws(() => loadConfig({ ...env, AUDIO_DOWNLOAD_TIMEOUT_MS: '120001' }), /AUDIO_DOWNLOAD_TIMEOUT_MS/);
+  }
+});
+
 test('performance API authenticates and forwards the user and guild to worker authorization', async t => {
   let allowed = true;
   const calls = [];

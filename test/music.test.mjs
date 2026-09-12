@@ -657,10 +657,11 @@ test('cleanup diagnostics exclude raw exception messages', async t => {
 });
 
 const settle = async () => { for (let index = 0; index < 4; index += 1) await turn(); };
-function warmMedia() {
+function warmMedia({ localFile } = {}) {
   const calls = [];
   return { calls, async open(item, { signal }) {
     const opened = openedAudio();
+    if (localFile !== undefined) opened.localFile = localFile;
     opened.stream.write(Buffer.from(`audio:${item.title}`));
     calls.push({ title: item.title, signal, opened });
     return opened;
@@ -845,6 +846,140 @@ test('long songs defer warming and expired parked streams refresh only in the ne
   manager.syncPreloads();
   await settle();
   assert.equal(media.calls.filter(call => call.title === 'C').length, 2);
+});
+
+test('completed local preloads survive an hour before handing off the same prepared resource', async t => {
+  const sources = [];
+  const media = { async open(item) {
+    const stream = new PassThrough({ objectMode: true });
+    const opened = { stream, localFile: true, cleanupCount: 0, cleanup() { this.cleanupCount++; stream.destroy(); } };
+    sources.push(opened);
+    for (let i = 0; i < 40; i++) stream.write(Buffer.from([0xf8, item.title.charCodeAt(0), i]));
+    return opened;
+  } };
+  const { manager, dataDir } = await fixture(t, media, { preloadCount: 2, preloadTtlMs: 25 });
+  const voice = fakeTransport(), playedVolumes = [], gains = new Map();
+  let elapsed = 0, preparations = 0;
+  voice.elapsedSec = () => elapsed;
+  voice.prepare = async (raw, options) => {
+    preparations++;
+    const prepared = await prepareAudio(raw, options, { demuxProbe: async stream => ({ stream, type: StreamType.Opus }) });
+    const setVolume = prepared.setVolume;
+    prepared.setVolume = value => { gains.set(prepared, value); setVolume(value); };
+    return prepared;
+  };
+  const play = voice.play;
+  voice.play = function(opened, ...callbacks) {
+    playedVolumes.push(gains.get(opened));
+    play.call(this, opened, ...callbacks);
+  };
+  const added = await manager.enqueue('guild', [track('A'), { ...track('B'), durationSec: 3600 }, track('C')], requester);
+  manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+  await until(() => manager.preloadEntries.size === 2 && [...manager.preloadEntries].every(entry => entry.status === 'ready'));
+  const state = manager.state('guild'), parked = state.preloads.get(added[2].id);
+  const prepared = parked.opened, resource = prepared.resource;
+  assert.equal(prepared.localFile, true);
+  assert.equal(parked.timer, null);
+  voice.plays[0].end();
+  await until(() => voice.plays.length === 2);
+  await new Promise(resolve => setTimeout(resolve, 45));
+  let time = Date.now();
+  t.mock.method(Date, 'now', () => time);
+  time += 3_600_000;
+  manager.syncPreloads();
+  assert.equal(state.preloads.get(added[2].id), parked);
+  assert.equal(parked.status, 'ready');
+  assert.equal(sources[2].cleanupCount, 0);
+  assert.equal(sources.length, 3);
+  assert.deepEqual(manager.snapshot('guild').tracks.map(item => item.id), [added[2].id]);
+  await manager.setVolume('guild', 23);
+  elapsed = 3500;
+  manager.syncPreloads();
+  voice.plays[1].end();
+  await settle();
+  assert.equal(voice.plays[2].opened, prepared);
+  assert.equal(voice.plays[2].opened.resource, resource);
+  assert.deepEqual(playedVolumes, [0.5, 0.5, 0.23]);
+  assert.equal(preparations, 3);
+  assert.equal(sources.length, 3);
+  await manager.persist();
+  assert.doesNotMatch(await readFile(path.join(dataDir, 'queues.json'), 'utf8'), /localFile|expiresAt|Infinity|resource/);
+  await manager.shutdown();
+  assert.ok(sources.every(source => source.cleanupCount === 1 && source.stream.destroyed));
+});
+
+test('queue controls release completed local audio exactly once and preserve request order', async t => {
+  for (const action of ['remove', 'move-top', 'shuffle', 'skip', 'leave', 'stop', 'shutdown']) {
+    const media = warmMedia({ localFile: true });
+    const { manager } = await fixture(t, media, { preloadCount: 2, randomIndex: () => 0 });
+    const voice = fakeTransport();
+    const added = await manager.enqueue('guild', ['A', 'B', 'C', 'D'].map(track), requester);
+    manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+    await settle();
+    assert.equal(manager.preloadEntries.size, 2);
+    if (action === 'shutdown') await manager.shutdown();
+    else await manager.control('guild', action, action === 'move-top' ? added[3].id : added[1].id);
+    await settle();
+    const expected = {
+      remove: { current: 'A', waiting: ['C', 'D'], released: ['B'] },
+      'move-top': { current: 'A', waiting: ['D', 'B', 'C'], released: ['C'] },
+      shuffle: { current: 'A', waiting: ['C', 'D', 'B'], released: ['B'] },
+      skip: { current: 'B', waiting: ['C', 'D'], released: ['A'] },
+      leave: { current: null, waiting: ['A', 'B', 'C', 'D'], released: ['A', 'B', 'C'] },
+      stop: { current: null, waiting: [], released: ['A', 'B', 'C'] },
+      shutdown: { current: null, waiting: ['A', 'B', 'C', 'D'], released: ['A', 'B', 'C'] },
+    }[action];
+    const snapshot = manager.snapshot('guild');
+    assert.equal(snapshot.nowPlaying?.title ?? null, expected.current, action);
+    assert.deepEqual(snapshot.tracks.map(item => item.title), expected.waiting, action);
+    assert.ok(manager.preloadEntries.size <= 2, action);
+    for (const call of media.calls) {
+      const released = expected.released.includes(call.title);
+      assert.equal(call.opened.cleanupCount, released ? 1 : 0, `${action}: ${call.title}`);
+      assert.equal(call.signal.aborted, released, `${action}: ${call.title}`);
+    }
+    await manager.shutdown();
+    assert.ok(media.calls.every(call => call.opened.cleanupCount === 1), action);
+  }
+});
+
+test('canceled local downloads and packet preparations discard late owned resources', async t => {
+  for (const phase of ['download', 'prepare']) {
+    const pending = deferred(), media = warmMedia({ localFile: true });
+    const normal = media.open.bind(media);
+    let held, heldSignal;
+    media.open = async (item, options) => {
+      const raw = await normal(item, options);
+      if (phase === 'download' && item.title === 'B') {
+        held = raw;
+        heldSignal = options.signal;
+        return pending.promise;
+      }
+      return raw;
+    };
+    const { manager } = await fixture(t, media, { preloadCount: 2 });
+    const voice = fakeTransport();
+    if (phase === 'prepare') voice.prepare = async (raw, { signal }) => {
+      if (media.calls.find(call => call.opened.stream === raw.stream)?.title === 'B') {
+        held = raw;
+        heldSignal = signal;
+        return pending.promise;
+      }
+      return raw;
+    };
+    const added = await manager.enqueue('guild', ['A', 'B', 'C'].map(track), requester);
+    manager.attach('guild', voice, { id: 'voice', name: 'Lounge' });
+    await until(() => Boolean(held));
+    await manager.control('guild', 'remove', added[1].id);
+    assert.equal(heldSignal.aborted, true, phase);
+    pending.resolve(held);
+    await settle();
+    assert.equal(media.calls.find(call => call.title === 'B').opened.cleanupCount, 1, phase);
+    assert.deepEqual(manager.snapshot('guild').tracks.map(item => item.id), [added[2].id], phase);
+    assert.equal(voice.plays.length, 1, phase);
+    await manager.shutdown();
+    assert.ok(media.calls.every(call => call.opened.cleanupCount === 1), phase);
+  }
 });
 
 test('leave and shutdown clean all warm sources and restore preserves queue order without prefetching', async t => {

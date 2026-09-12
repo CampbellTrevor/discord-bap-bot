@@ -12,9 +12,11 @@ services:
       BOT_ROLE: worker
       SETUP_MODE: "false"
       DATA_DIR: /var/data
+      AUDIO_CACHE_DIR: /var/cache/bap-bot
     user: "1000:1000"
     volumes:
       - /var/lib/bap-bot/data:/var/data
+      - /var/lib/bap-bot/audio-cache:/var/cache/bap-bot
     read_only: true
     tmpfs:
       - /tmp:size=128m,mode=1777

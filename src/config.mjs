@@ -47,6 +47,7 @@ export function loadConfig(env = process.env, { demo = false } = {}) {
   if (Boolean(env.SPOTIFY_CLIENT_ID) !== Boolean(env.SPOTIFY_CLIENT_SECRET)) throw new Error('Set both Spotify credentials, or leave both empty.');
   if (env.SPOTIFY_REFRESH_TOKEN && !env.SPOTIFY_CLIENT_ID) throw new Error('Spotify playlist authorization also requires both Spotify app credentials.');
   if (env.SPOTIFY_MARKET && !/^[A-Z]{2}$/.test(env.SPOTIFY_MARKET)) throw new Error('SPOTIFY_MARKET must be a two-letter uppercase country code.');
+  const dataDir = path.resolve(env.DATA_DIR || './data');
   return {
     production, demo, setupMode, botRole, workerUrl, workerSecret: env.WORKER_SECRET || '', port, publicUrl: parsed.origin, host: demo ? '127.0.0.1' : '0.0.0.0',
     discordToken: env.DISCORD_TOKEN || '', discordClientId: env.DISCORD_CLIENT_ID || '',
@@ -54,7 +55,9 @@ export function loadConfig(env = process.env, { demo = false } = {}) {
     djRoleId: env.DJ_ROLE_ID || '', sessionSecret: env.SESSION_SECRET || randomBytes(32).toString('hex'),
     spotifyClientId: env.SPOTIFY_CLIENT_ID || '', spotifyClientSecret: env.SPOTIFY_CLIENT_SECRET || '',
     spotifyRefreshToken: env.SPOTIFY_REFRESH_TOKEN || '', spotifyMarket: env.SPOTIFY_MARKET || 'US',
-    dataDir: path.resolve(env.DATA_DIR || './data'), ytDlpPath: env.YT_DLP_PATH || 'yt-dlp',
+    dataDir, ytDlpPath: env.YT_DLP_PATH || 'yt-dlp',
+    audioCacheDir: path.resolve(env.AUDIO_CACHE_DIR || path.join(dataDir, '.audio-cache')),
+    audioDownloadTimeoutMs: integer('AUDIO_DOWNLOAD_TIMEOUT_MS', 90000, 10000, 120000),
     maxQueueSize: integer('MAX_QUEUE_SIZE', 2000, 1, 2000),
     maxTrackDurationSec: integer('MAX_TRACK_DURATION_SEC', 3600, 30, 14400),
     maxPlaylistTracks: integer('MAX_PLAYLIST_TRACKS', 2000, 1, 2000),

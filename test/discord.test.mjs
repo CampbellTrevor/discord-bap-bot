@@ -299,6 +299,21 @@ test('late cancellation never rolls back a request that already committed', asyn
   assert.equal(queue.tracks.length, 1);
 });
 
+test('shutdown releases completed audio files after saving the queue and always disconnects Discord', async t => {
+  const { bot, music, media, client } = await fixture(t);
+  const order = [];
+  music.shutdown = async () => { order.push('queue'); };
+  media.close = async () => { order.push('audio-files'); };
+  client.destroy = () => { order.push('discord'); };
+  await bot.shutdown();
+  assert.deepEqual(order, ['queue', 'audio-files', 'discord']);
+  order.length = 0;
+  media.close = async () => { order.push('audio-files'); throw new Error('cache close failed'); };
+  await assert.rejects(bot.shutdown(), /cache close failed/);
+  assert.deepEqual(order, ['queue', 'audio-files', 'discord']);
+  media.close = async () => {};
+});
+
 test('single requests validate playback before admission and preserve the validated mapping', async t => {
   const { bot, media, music, calls, queue } = await fixture(t);
   let held = false;

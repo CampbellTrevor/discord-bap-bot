@@ -18,5 +18,6 @@ runcmd:
   - [systemctl, enable, --now, docker]
   - [install, -d, -m, "0700", /etc/bap-bot]
   - [install, -d, -m, "0700", -o, "1000", -g, "1000", /var/lib/bap-bot/data]
+  - [install, -d, -m, "0700", -o, "1000", -g, "1000", /var/lib/bap-bot/audio-cache]
 # Image building, the public-audio probe, and secret transfer happen over SSH.
 # The bot is deliberately not started during instance creation.
