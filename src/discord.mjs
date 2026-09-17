@@ -9,6 +9,8 @@ import {
 import { MusicManager, musicError, publicTrack } from './music.mjs';
 import { prepareAudio } from './audio-pipeline.mjs';
 import { createAudioHealth } from './audio-health.mjs';
+import { createVoiceNetworkHealth } from './voice-network-health.mjs';
+import { createVoiceDiagnosticLog } from './voice-diagnostic-log.mjs';
 
 const commands = [
   new SlashCommandBuilder().setName('play').setDescription('Request a song or playlist from Spotify or YouTube')
@@ -103,9 +105,12 @@ export function createBot({ config, media, metrics, logger = console }, dependen
       selfDeaf: true, selfMute: false, daveEncryption: true,
     });
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
+    const voiceLog = createVoiceDiagnosticLog({ logger, guildId: guild.id, channelId: channel.id });
+    const voiceNetwork = createVoiceNetworkHealth({ connection, onEvent: event => voiceLog.event(event) });
     const audioHealth = createAudioHealth({
-      onMetric: metric => music.emit('audioHealthMetric', metric),
+      onMetric: metric => { music.emit('audioHealthMetric', metric); voiceLog.sample(metric); },
       getVoiceWsPing: () => connection.ping.ws,
+      getVoiceNetworkMetrics: () => voiceNetwork.sample(),
     });
     let destroyed = false;
     const transport = {
@@ -127,12 +132,15 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         if (destroyed) return;
         destroyed = true;
         player.stop(true);
-        audioHealth.close();
         if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
+        audioHealth.close();
+        voiceNetwork.close();
+        voiceLog.close();
       },
     };
     player.on('stateChange', (previous, next) => {
       audioHealth.playerState(next.status);
+      voiceNetwork.playerState(next.status);
       if (next.status === AudioPlayerStatus.Playing && previous.resource !== next.resource) {
         next.resource?.metadata?.onStarted?.();
       } else if (next.status === AudioPlayerStatus.Playing && previous.status === AudioPlayerStatus.Buffering) {

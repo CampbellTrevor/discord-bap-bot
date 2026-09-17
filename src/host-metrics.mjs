@@ -21,6 +21,11 @@ const AUDIO_COUNTERS = ['readAttempts', 'packetsRead', 'emptyReads', 'starvedRea
   'opus2_5Ms', 'opus5Ms', 'opus10Ms', 'opus20Ms', 'opus40Ms', 'opus60Ms', 'opus80Ms', 'opus100Ms', 'opus120Ms', 'opusOtherMs',
   'opusInvalid', 'opusMismatch', 'voiceStateChanges'];
 const AUDIO_FIELDS = ['windowMs', ...AUDIO_COUNTERS, 'minBufferedPackets', 'maxReadGapMs', 'maxPacketBytes', 'voiceWsPingMs', 'voiceUdpPingMs'];
+// Additive section: never extend AUDIO_FIELDS, whose positions are stored on disk.
+const NETWORK_COUNTERS = ['udpKeepaliveSent', 'udpKeepaliveReplies', 'udpKeepaliveTimeouts', 'udpAudioPackets', 'udpSendErrors', 'udpKeepaliveUntracked'];
+const NETWORK_FIELDS = ['voiceUdpPingMs', 'udpKeepaliveSent', 'udpKeepaliveReplies', 'udpKeepaliveTimeouts',
+  'udpKeepalivePending', 'udpRttMaxMs', 'udpRttJitterMs', 'udpAudioPackets', 'udpMaxSendGapMs',
+  'udpSendErrors', 'udpSendQueueBytes', 'voiceWsHeartbeatAgeMs', 'udpKeepaliveConfirmed', 'udpKeepaliveUntracked'];
 const MAX_AUDIO_SAMPLES = 720;
 const MAX_HEALTH_VALUE = 1e9;
 const count = value => Number.isSafeInteger(value) && value >= 0;
@@ -34,9 +39,10 @@ const emptyPlayback = () => ({ ready: 0, error: 0, preloadedReady: 0, preloadedE
 const emptyPreload = () => ({ ...emptyPlayback(), cancelled: 0, expired: 0 });
 const emptyStats = fields => fields.map(() => [0, 0, null, null]);
 const emptyAudio = () => ({ samples: 0, metrics: emptyStats(AUDIO_FIELDS) });
+const emptyNetwork = () => ({ samples: 0, metrics: emptyStats(NETWORK_FIELDS) });
 const emptyBucket = at => ({ at, samples: 0, metrics: FIELDS.map(() => [0, 0, null, null]),
   playback: emptyPlayback(), legacySourceOnly: false, preload: emptyPreload(), transition: emptyPlayback(),
-  audio: emptyAudio(), eventLoop: emptyStats(LOOP_FIELDS) });
+  audio: emptyAudio(), network: emptyNetwork(), eventLoop: emptyStats(LOOP_FIELDS) });
 
 function addStats(target, fields, values) {
   fields.forEach((field, index) => {
@@ -74,6 +80,14 @@ function audioSummary(value) {
   }
   return { samples: value.samples, ...statsSummary(AUDIO_FIELDS, value.metrics), totals };
 }
+function networkSummary(value) {
+  const totals = {};
+  for (const field of NETWORK_COUNTERS) {
+    const [n, sum] = value.metrics[NETWORK_FIELDS.indexOf(field)];
+    totals[field] = n ? sum : null;
+  }
+  return { samples: value.samples, ...statsSummary(NETWORK_FIELDS, value.metrics), totals };
+}
 function validStats(value, fields, samples) {
   return Array.isArray(value) && value.length === fields.length && value.every(stat =>
     Array.isArray(stat) && stat.length === 4 && count(stat[0]) && stat[0] <= samples && numeric(stat[1])
@@ -84,6 +98,18 @@ function validStats(value, fields, samples) {
 }
 function validAudio(value) {
   return value && count(value.samples) && value.samples <= MAX_AUDIO_SAMPLES && validStats(value.metrics, AUDIO_FIELDS, value.samples);
+}
+function validNetwork(value) {
+  return value && count(value.samples) && value.samples <= MAX_AUDIO_SAMPLES
+    && validStats(value.metrics, NETWORK_FIELDS, value.samples)
+    && NETWORK_COUNTERS.every(field => {
+      const [n, sum, low, high] = value.metrics[NETWORK_FIELDS.indexOf(field)];
+      return !n || count(sum) && count(low) && count(high);
+    })
+    && (() => {
+      const [n, sum, low, high] = value.metrics[NETWORK_FIELDS.indexOf('udpKeepaliveConfirmed')];
+      return !n || count(sum) && count(low) && count(high) && high <= 1;
+    })();
 }
 
 function recordReady(target, durationMs) {
@@ -137,7 +163,8 @@ function bucketView(bucket) {
   Object.assign(avg, loop.avg); Object.assign(min, loop.min); Object.assign(max, loop.max);
   return { at: bucket.at, samples: bucket.samples, avg, min, max,
     playback: { ...playbackSummary(bucket.playback), legacySourceOnly: bucket.legacySourceOnly },
-    preload: preloadSummary(bucket.preload), transition: transitionSummary(bucket.transition), audio: audioSummary(bucket.audio) };
+    preload: preloadSummary(bucket.preload), transition: transitionSummary(bucket.transition), audio: audioSummary(bucket.audio),
+    network: networkSummary(bucket.network) };
 }
 function validPlayback(p) {
   if (!p || ['ready', 'error', 'preloadedReady', 'preloadedError', 'readyDurationSumMs', 'readyDurationMaxMs'].some(key => !count(p[key]))
@@ -176,7 +203,7 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
   const file = path.join(dataDir, '.host-metrics.json');
   const buckets = new Map();
   let latest = null, previous = null, timer, starting, sampling, closed = false;
-  let lastAudio = null, loopMonitor;
+  let lastAudio = null, lastNetwork = null, loopMonitor;
   let persistent = null, lastSavedAt = null, lastWriteAttempt = -Infinity;
   const read = async location => { try { const text = await fs.readFile(location, 'utf8'); return text.length <= 128 * 1024 ? text : null; } catch { return null; } };
   const prune = at => { for (const timestamp of buckets.keys()) if (timestamp < at - RETENTION || timestamp > at) buckets.delete(timestamp); };
@@ -221,6 +248,7 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
             if (validate(entry[key])) for (const field of Object.keys(clean[key])) clean[key][field] = entry[key][field];
           }
           if (validAudio(entry.audio)) clean.audio = { samples: entry.audio.samples, metrics: entry.audio.metrics.map(stat => [...stat]) };
+          if (validNetwork(entry.network)) clean.network = { samples: entry.network.samples, metrics: entry.network.metrics.map(stat => [...stat]) };
           if (validStats(entry.eventLoop, LOOP_FIELDS, entry.samples)) clean.eventLoop = entry.eventLoop.map(stat => [...stat]);
           buckets.set(entry.at, clean);
         }
@@ -412,7 +440,9 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
     },
     recordAudioHealth(value = {}) {
       if (closed || !numeric(value?.windowMs) || value.windowMs > MAX_HEALTH_VALUE) return;
-      const target = bucket(now()).audio;
+      const at = now();
+      const current = bucket(at);
+      const target = current.audio;
       if (target.samples >= MAX_AUDIO_SAMPLES) return;
       const clean = {};
       for (const field of AUDIO_FIELDS) {
@@ -421,13 +451,25 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
       }
       target.samples++;
       addStats(target.metrics, AUDIO_FIELDS, clean);
-      lastAudio = { at: now(), ...clean };
+      lastAudio = { at, ...clean };
+      if (current.network.samples < MAX_AUDIO_SAMPLES) {
+        const network = {};
+        for (const field of NETWORK_FIELDS) {
+          const item = value[field];
+          network[field] = numeric(item) && item <= MAX_HEALTH_VALUE
+            && (!NETWORK_COUNTERS.includes(field) || count(item))
+            && (field !== 'udpKeepaliveConfirmed' || item === 0 || item === 1) ? item : null;
+        }
+        current.network.samples++;
+        addStats(current.network.metrics, NETWORK_FIELDS, network);
+        lastNetwork = { at, ...network };
+      }
     },
     getSnapshot() {
       const at = now();
       prune(at);
       const grouped = new Map(), playback = emptyPlayback(), preload = emptyPreload(), transition = emptyPlayback();
-      const audio = emptyAudio(), eventLoop = emptyStats(LOOP_FIELDS);
+      const audio = emptyAudio(), network = emptyNetwork(), eventLoop = emptyStats(LOOP_FIELDS);
       let legacySourceOnly = false;
       for (const source of buckets.values()) {
         const timestamp = Math.floor(source.at / (5 * MINUTE)) * 5 * MINUTE;
@@ -456,6 +498,10 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
           destination.samples += source.audio.samples;
           mergeStats(destination.metrics, source.audio.metrics);
         }
+        for (const destination of [target.network, network]) {
+          destination.samples += source.network.samples;
+          mergeStats(destination.metrics, source.network.metrics);
+        }
         mergeStats(target.eventLoop, source.eventLoop);
         mergeStats(eventLoop, source.eventLoop);
       }
@@ -467,6 +513,10 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
         transition: { measurement: 'natural-end-to-transport-playing', ...transitionSummary(transition) },
         audio: { measurement: 'transport-packet-reads', latest: lastAudio && at >= lastAudio.at && at - lastAudio.at <= 15000 ? structuredClone(lastAudio) : null,
           ...audioSummary(audio) },
+        // These describe keepalive exchanges and local socket sends, not delivered audio or listener loss.
+        network: { measurement: 'voice-udp-keepalive-and-local-send',
+          latest: lastNetwork && at >= lastNetwork.at && at - lastNetwork.at <= 15000 ? structuredClone(lastNetwork) : null,
+          ...networkSummary(network) },
         eventLoop: { resolutionMs: 20, ...statsSummary(LOOP_FIELDS, eventLoop) },
         persistence: { available: persistent, lastSavedAt } };
     },

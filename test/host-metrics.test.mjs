@@ -459,3 +459,145 @@ test('audio telemetry rejects unbounded values and unavailable loop monitoring d
   metrics.recordAudioHealth({ windowMs: 5000, packetsRead: 1 });
   assert.equal(metrics.getSnapshot().audio.samples, 0);
 });
+
+test('network intervals preserve numeric counters, unknown readings and peaks across restart', async t => {
+  const { metrics, advance, create, dataDir } = await fixture(t);
+  await metrics.start();
+  metrics.recordAudioHealth({ windowMs: 5000, packetsRead: 250, voiceUdpPingMs: 25,
+    udpKeepaliveSent: 1, udpKeepaliveReplies: 1, udpKeepaliveTimeouts: 0, udpKeepalivePending: 0,
+    udpRttMaxMs: 25, udpRttJitterMs: null, udpAudioPackets: 250, udpMaxSendGapMs: 31,
+    udpSendErrors: 0, udpSendQueueBytes: 0, voiceWsHeartbeatAgeMs: 3000, udpKeepaliveConfirmed: 1,
+    udpKeepaliveUntracked: 0, endpoint: 'private-voice.example', token: 'private-token', packet: Buffer.from('private-payload') });
+  metrics.recordAudioHealth({ windowMs: 5000, packetsRead: 250, voiceUdpPingMs: 45,
+    udpKeepaliveSent: 1, udpKeepaliveReplies: 1, udpKeepaliveTimeouts: 1, udpKeepalivePending: 1,
+    udpRttMaxMs: 45, udpRttJitterMs: 20, udpAudioPackets: 249, udpMaxSendGapMs: 130,
+    udpSendErrors: 1, udpSendQueueBytes: null, voiceWsHeartbeatAgeMs: null, udpKeepaliveConfirmed: 1 });
+  const before = metrics.getSnapshot().network;
+  assert.equal(before.measurement, 'voice-udp-keepalive-and-local-send');
+  assert.equal(before.samples, 2);
+  assert.deepEqual(before.totals, { udpKeepaliveSent: 2, udpKeepaliveReplies: 2, udpKeepaliveTimeouts: 1,
+    udpAudioPackets: 499, udpSendErrors: 1, udpKeepaliveUntracked: 0 });
+  assert.equal(before.avg.voiceUdpPingMs, 35);
+  assert.equal(before.min.voiceUdpPingMs, 25);
+  assert.equal(before.max.voiceUdpPingMs, 45);
+  assert.equal(before.avg.udpRttJitterMs, 20, 'Missing jitter must not dilute measured jitter.');
+  assert.equal(before.max.udpMaxSendGapMs, 130);
+  assert.equal(before.avg.udpKeepalivePending, 0.5);
+  assert.equal(before.avg.udpKeepaliveConfirmed, 1);
+  assert.equal(before.latest.udpSendQueueBytes, null);
+  assert.equal(before.latest.voiceWsHeartbeatAgeMs, null);
+  assert.equal(before.latest.udpKeepaliveUntracked, null);
+  assert.equal(metrics.getSnapshot().audio.avg.voiceUdpPingMs, 35, 'The original audio ping field remains populated.');
+  before.latest.voiceUdpPingMs = 999;
+  assert.equal(metrics.getSnapshot().network.latest.voiceUdpPingMs, 45);
+  await advance(MINUTE);
+  const persisted = metrics.getSnapshot().network;
+  assert.equal(persisted.latest, null);
+  const stored = await fs.readFile(path.join(dataDir, '.host-metrics.json'), 'utf8');
+  assert.doesNotMatch(stored, /private-voice|private-token|private-payload|endpoint|packet"/);
+  assert.ok(Buffer.byteLength(stored) < 8 * MIB);
+  for (const bucket of JSON.parse(stored).buckets) {
+    assert.equal(bucket.metrics.length, 20);
+    assert.equal(bucket.audio.metrics.length, 23, 'The persisted audio array retains its original positions.');
+  }
+  await metrics.close();
+  const restarted = create();
+  await restarted.start();
+  assert.deepEqual(restarted.getSnapshot().network, persisted);
+  assert.equal(restarted.getSnapshot().audio.totals.packetsRead, 500);
+  assert.equal(restarted.getSnapshot().history.reduce((sum, point) => sum + (point.network.totals.udpAudioPackets || 0), 0), 499);
+});
+
+test('history from before network instrumentation retains audio and host readings with unknown network values', async t => {
+  const { metrics, advance, create, dataDir } = await fixture(t);
+  await metrics.start();
+  metrics.recordAudioHealth({ windowMs: 5000, packetsRead: 249, emptyReads: 1, voiceWsPingMs: 50 });
+  metrics.recordPlayback({ outcome: 'ready', durationMs: 123, preloaded: true });
+  await advance(MINUTE);
+  await metrics.close();
+  const file = path.join(dataDir, '.host-metrics.json');
+  const saved = JSON.parse(await fs.readFile(file, 'utf8'));
+  for (const entry of saved.buckets) delete entry.network;
+  await fs.writeFile(file, JSON.stringify(saved));
+  const restarted = create();
+  await restarted.start();
+  const snapshot = restarted.getSnapshot();
+  assert.equal(snapshot.persistence.available, true);
+  assert.equal(snapshot.audio.totals.packetsRead, 249);
+  assert.equal(snapshot.playback.ready, 1);
+  assert.equal(snapshot.network.samples, 0);
+  assert.equal(snapshot.network.latest, null);
+  assert.ok(Object.values(snapshot.network.totals).every(value => value === null));
+  assert.ok(Object.values(snapshot.network.max).every(value => value === null));
+  assert.ok(snapshot.history.every(point => point.network.samples === 0));
+  assert.ok(snapshot.history.some(point => point.max.hostMemoryTotalBytes === 2048 * MIB));
+  restarted.recordAudioHealth({ windowMs: 5000 });
+  const unknown = restarted.getSnapshot().network;
+  assert.ok(Object.values(unknown.totals).every(value => value === null));
+  assert.ok(Object.values(unknown.latest).slice(1).every(value => value === null));
+});
+
+test('malformed network persistence is isolated without dropping audio or accepting unknown metadata', async t => {
+  const { metrics, advance, create, dataDir } = await fixture(t);
+  await metrics.start();
+  metrics.recordAudioHealth({ windowMs: 5000, packetsRead: 250, udpKeepaliveSent: 1, udpKeepaliveConfirmed: 1 });
+  await advance(MINUTE);
+  await metrics.close();
+  const file = path.join(dataDir, '.host-metrics.json');
+  const original = JSON.parse(await fs.readFile(file, 'utf8'));
+  const variants = [
+    network => { network.samples = 721; },
+    network => { network.metrics[0] = [1, 1e10, 1e10, 1e10]; },
+    network => { network.metrics[1] = [1, 0.5, 0.5, 0.5]; },
+    network => { network.metrics[12] = [1, 0.5, 0.5, 0.5]; },
+    network => { network.metrics[0] = ['private-raw-payload']; },
+  ];
+  for (const damage of variants) {
+    const saved = structuredClone(original);
+    for (const entry of saved.buckets) damage(entry.network);
+    await fs.writeFile(file, JSON.stringify(saved));
+    const restarted = create();
+    await restarted.start();
+    const snapshot = restarted.getSnapshot();
+    assert.equal(snapshot.persistence.available, true);
+    assert.equal(snapshot.network.samples, 0);
+    assert.equal(snapshot.audio.totals.packetsRead, 250);
+    assert.ok(snapshot.history.some(point => point.max.hostMemoryTotalBytes === 2048 * MIB));
+    assert.doesNotMatch(JSON.stringify(snapshot), /private-raw-payload/);
+    await restarted.close();
+  }
+  for (const entry of original.buckets) entry.network.endpoint = 'private-server-address';
+  await fs.writeFile(file, JSON.stringify(original));
+  const restored = create();
+  await restored.start();
+  assert.equal(restored.getSnapshot().network.totals.udpKeepaliveSent, 1);
+  assert.doesNotMatch(JSON.stringify(restored.getSnapshot()), /private-server-address|endpoint/);
+});
+
+test('network telemetry bounds values and event rates, expires history and ignores closed collectors', async t => {
+  const { metrics, advance } = await fixture(t);
+  await metrics.start();
+  metrics.recordAudioHealth({ windowMs: Infinity, udpKeepaliveSent: 1 });
+  assert.equal(metrics.getSnapshot().network.samples, 0);
+  for (let index = 0; index < 800; index++) metrics.recordAudioHealth({ windowMs: 5000,
+    udpKeepaliveSent: 1, udpKeepaliveReplies: -1, udpKeepaliveTimeouts: 0.5, udpKeepalivePending: null,
+    voiceUdpPingMs: Infinity, udpRttMaxMs: 1e12, udpRttJitterMs: '34', udpAudioPackets: 250,
+    udpSendQueueBytes: NaN, udpMaxSendGapMs: 1e9, voiceWsHeartbeatAgeMs: -1,
+    udpKeepaliveConfirmed: 0.5, udpKeepaliveUntracked: Number.MAX_SAFE_INTEGER });
+  const snapshot = metrics.getSnapshot();
+  assert.equal(snapshot.network.samples, 720);
+  assert.equal(snapshot.network.totals.udpKeepaliveSent, 720);
+  assert.equal(snapshot.network.totals.udpAudioPackets, 720 * 250);
+  assert.equal(snapshot.network.max.udpMaxSendGapMs, 1e9);
+  for (const field of ['udpKeepaliveReplies', 'udpKeepaliveTimeouts', 'udpKeepaliveUntracked']) assert.equal(snapshot.network.totals[field], null);
+  for (const field of ['voiceUdpPingMs', 'udpKeepalivePending', 'udpRttMaxMs', 'udpRttJitterMs', 'udpSendQueueBytes',
+    'voiceWsHeartbeatAgeMs', 'udpKeepaliveConfirmed']) assert.equal(snapshot.network.max[field], null);
+  snapshot.history[0].network.totals.udpAudioPackets = 999;
+  assert.equal(metrics.getSnapshot().history[0].network.totals.udpAudioPackets, 720 * 250);
+  await advance(DAY + MINUTE);
+  assert.equal(metrics.getSnapshot().network.samples, 0);
+  assert.equal(metrics.getSnapshot().network.latest, null);
+  await metrics.close();
+  metrics.recordAudioHealth({ windowMs: 5000, udpKeepaliveSent: 1 });
+  assert.equal(metrics.getSnapshot().network.samples, 0);
+});

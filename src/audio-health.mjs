@@ -55,6 +55,7 @@ const empty = () => ({ readAttempts: 0, packetsRead: 0, emptyReads: 0, starvedRe
 
 /** Numeric interval diagnostics only; observing playback never changes its output. */
 export function createAudioHealth({ onMetric, getVoiceWsPing = () => null, sampleIntervalMs = 5000,
+  getVoiceNetworkMetrics = () => ({}),
   now = () => performance.now(), setInterval: interval = globalThis.setInterval,
   clearInterval: cancelInterval = globalThis.clearInterval } = {}) {
   let counters = empty(), intervalStarted = now(), previousReadAt = null, status = 'idle';
@@ -84,8 +85,18 @@ export function createAudioHealth({ onMetric, getVoiceWsPing = () => null, sampl
     const at = now();
     let ping = null;
     try { const value = getVoiceWsPing(); if (typeof value === 'number' && Number.isFinite(value) && value >= 0) ping = value; } catch {}
+    const network = {};
+    try {
+      const values = getVoiceNetworkMetrics();
+      for (const key of ['voiceUdpPingMs', 'udpKeepaliveSent', 'udpKeepaliveReplies', 'udpKeepaliveTimeouts',
+        'udpKeepalivePending', 'udpKeepaliveConfirmed', 'udpKeepaliveUntracked', 'udpRttMaxMs', 'udpRttJitterMs',
+        'udpAudioPackets', 'udpMaxSendGapMs', 'udpSendErrors', 'udpSendQueueBytes', 'voiceWsHeartbeatAgeMs']) {
+        const value = values?.[key];
+        network[key] = typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1e9 ? value : null;
+      }
+    } catch {}
     const metric = { windowMs: Math.max(0, at - intervalStarted), ...counters,
-      voiceWsPingMs: ping, voiceUdpPingMs: null };
+      voiceWsPingMs: ping, voiceUdpPingMs: null, ...network };
     counters = empty();
     intervalStarted = at;
     try { onMetric?.(metric); } catch {}

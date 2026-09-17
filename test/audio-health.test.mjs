@@ -119,3 +119,25 @@ test('diagnostic callback or ping failures cannot interrupt resource reads', () 
   assert.doesNotThrow(() => tick());
   assert.doesNotThrow(() => health.close());
 });
+
+test('network samples preserve unknown RTT, reject raw fields, and cannot interrupt audio', () => {
+  let callback, network = { voiceUdpPingMs: 145, udpAudioPackets: 250, udpKeepaliveConfirmed: 1,
+    udpSendErrors: -1, udpSendQueueBytes: Infinity, udpRttMaxMs: 'secret', token: 'secret' };
+  const metrics = [];
+  const health = createAudioHealth({ onMetric: value => metrics.push(value), getVoiceNetworkMetrics() {
+    if (!network) throw new Error('diagnostic unavailable');
+    return network;
+  }, setInterval(fn) { callback = fn; return 1; }, clearInterval() {} });
+  callback();
+  assert.equal(metrics[0].voiceUdpPingMs, 145);
+  assert.equal(metrics[0].udpAudioPackets, 250);
+  assert.equal(metrics[0].udpSendErrors, null);
+  assert.equal(metrics[0].udpSendQueueBytes, null);
+  assert.equal(metrics[0].udpRttMaxMs, null);
+  assert.equal('token' in metrics[0], false);
+  network = null;
+  assert.doesNotThrow(callback);
+  assert.equal(metrics[1].voiceUdpPingMs, null);
+  assert.ok(Object.values(metrics[1]).every(v => v === null || typeof v === 'number' && Number.isFinite(v)));
+  health.close();
+});
