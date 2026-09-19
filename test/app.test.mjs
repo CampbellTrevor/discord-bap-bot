@@ -9,6 +9,28 @@ import { createDemoBot } from '../src/demo.mjs';
 import { BoundedSessionStore } from '../src/session-store.mjs';
 import { EncryptedSessionStore, FileSessionStorage } from '../src/persistent-session-store.mjs';
 
+test('radio API validates action/seed and uses authenticated identity, CSRF and cancellation', async t => {
+  const calls = [];
+  const { request, config } = await fixture(t, { demo: true, bot: { isReady: () => true,
+    async radio(...args) { calls.push(args); return { radio: { active: args[2] === 'start', batchSize: 10 } }; } } });
+  const { csrfToken, user } = await (await request('/api/session')).json();
+  const endpoint = '/api/guilds/demo-guild/radio';
+  const headers = { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken, Origin: config.publicUrl };
+  assert.equal((await request(endpoint, { method: 'POST', body: JSON.stringify({ action: 'start' }), headers: { 'Content-Type': 'application/json' } })).status, 403);
+  for (const body of [{ action: 'invalid' }, { action: 'start', query: ' ' }, { action: 'start', query: 42 }, { action: 'stop', query: 'song' }, { action: 'start', channelId: 42 }]) {
+    assert.equal((await request(endpoint, { method: 'POST', body: JSON.stringify(body), headers })).status, 400);
+  }
+  assert.equal(calls.length, 0);
+  for (const action of ['start', 'stop']) {
+    const response = await request(endpoint, { method: 'POST', headers, body: JSON.stringify({ action, userId: 'forged' }) });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).queue.radio.active, action === 'start');
+  }
+  assert.equal(calls[0][0], 'demo-guild');
+  assert.equal(calls[0][1], user.id);
+  assert.ok(calls[0][5].signal instanceof AbortSignal);
+});
+
 test('move-top API preserves current playback and requires a queued track ID and CSRF', async t => {
   const { request, config } = await fixture(t, { demo: true });
   const { csrfToken } = await (await request('/api/session')).json();

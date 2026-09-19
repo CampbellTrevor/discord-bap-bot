@@ -8,8 +8,10 @@ export function createDemoBot() {
   const makeTrack = (title, artist, source) => ({ id: randomUUID(), title, artist, source, durationSec: 240, thumbnail: null, sourceUrl: '', requestedBy: user });
   const searchFixtures = new Map();
   const queue = { guildId: guild.id, channelId: channel.id, channelName: channel.name, nowPlaying: makeTrack('After hours', 'Demo track · no audio', 'youtube'),
-    tracks: [makeTrack('Somewhere slow', 'Demo track · no audio', 'spotify'), makeTrack('Meet me on the rooftop', 'Demo track · no audio', 'youtube')], paused: false, playing: true, lastError: null, elapsedSec: 32, volumePercent: 50 };
+    tracks: [makeTrack('Somewhere slow', 'Demo track · no audio', 'spotify'), makeTrack('Meet me on the rooftop', 'Demo track · no audio', 'youtube')], paused: false, playing: true, lastError: null, elapsedSec: 32, volumePercent: 50,
+    radio: { active: false, seed: null, loading: false, batchSize: 10 } };
   let sampledAt = Date.now();
+  let radioSequence = 0;
   const failure = (message, status = 400) => Object.assign(new Error(message), { status });
   const validate = id => { if (id !== guild.id) throw failure('Server not found.', 404); };
   function tick() {
@@ -19,10 +21,26 @@ export function createDemoBot() {
     if (queue.nowPlaying && queue.elapsedSec >= queue.nowPlaying.durationSec) advance();
   }
   function advance() {
+    refillRadio();
     queue.nowPlaying = queue.channelId ? queue.tracks.shift() || null : null;
     queue.elapsedSec = 0;
     queue.paused = false;
     queue.playing = Boolean(queue.nowPlaying);
+    refillRadio();
+  }
+  function refillRadio() {
+    if (!queue.radio.active || !queue.channelId || queue.tracks.filter(track => track.radio).length > 2
+      || queue.tracks.length + Number(Boolean(queue.nowPlaying)) + 10 > 2000) return;
+    for (let i = 0; i < 10; i++) {
+      const track = makeTrack(`Radio selection ${++radioSequence}`, `From ${queue.radio.seed.title} · demo only`, i % 2 ? 'spotify' : 'youtube');
+      track.radio = true;
+      track.requestedBy = { id: 'demo-radio', username: 'Radio' };
+      queue.tracks.push(track);
+    }
+  }
+  function stopRadio() {
+    queue.radio = { active: false, seed: null, loading: false, batchSize: 10 };
+    queue.tracks = queue.tracks.filter(track => !track.radio);
   }
   const bot = {
     isReady: () => true,
@@ -35,6 +53,22 @@ export function createDemoBot() {
       validate(id);
       if (!Number.isInteger(volumePercent) || volumePercent < 0 || volumePercent > 100) throw failure('Volume must be an integer from 0 to 100.');
       queue.volumePercent = volumePercent;
+      return bot.snapshot(id);
+    },
+    radio: async (id, _userId, action, query) => {
+      validate(id); tick();
+      if (!['start', 'stop'].includes(action)) throw failure('Choose start or stop for radio.');
+      if (action === 'stop') stopRadio();
+      else {
+        if (query !== undefined && (typeof query !== 'string' || !query.trim() || query.length > 500)) throw failure('Enter a song to start radio, up to 500 characters.');
+        const seed = query ? searchFixtures.get(query) || makeTrack(query, 'Demo seed · no audio', /spotify/i.test(query) ? 'spotify' : 'youtube') : queue.nowPlaying;
+        if (!seed) throw failure('Play a song first or choose a song for radio.', 409);
+        stopRadio();
+        queue.radio = { active: true, seed: { title: seed.title, artist: seed.artist, source: seed.source, sourceUrl: seed.sourceUrl }, loading: false, batchSize: 10 };
+        if (!queue.channelId) { queue.channelId = channel.id; queue.channelName = channel.name; }
+        refillRadio();
+        if (!queue.nowPlaying) advance();
+      }
       return bot.snapshot(id);
     },
     search: async (id, _userId, query, source = 'youtube') => {
@@ -62,7 +96,9 @@ export function createDemoBot() {
       const track = selected
         ? { ...structuredClone(selected), id: randomUUID(), requestedBy: user }
         : makeTrack(query, 'Your demo request · no audio', /spotify/i.test(query) ? 'spotify' : 'youtube');
-      queue.tracks.push(track);
+      const firstRadio = queue.tracks.findIndex(queued => queued.radio);
+      if (firstRadio < 0) queue.tracks.push(track);
+      else queue.tracks.splice(firstRadio, 0, track);
       if (!queue.nowPlaying && queue.channelId) advance();
       return { added: [track], queue: bot.snapshot(id) };
     },
@@ -72,13 +108,17 @@ export function createDemoBot() {
       if (action === 'skip') advance();
       if (action === 'pause') { queue.paused = true; queue.playing = false; }
       if (action === 'resume') { queue.paused = false; queue.playing = true; }
-      if (action === 'stop') { queue.tracks = []; advance(); }
+      if (action === 'stop') { stopRadio(); queue.tracks = []; advance(); }
       if (action === 'shuffle') {
         if (queue.tracks.length < 2) throw failure('Add at least two songs to the waiting queue before shuffling.', 409);
-        for (let i = queue.tracks.length - 1; i > 0; i--) {
-          const j = randomInt(i + 1);
-          [queue.tracks[i], queue.tracks[j]] = [queue.tracks[j], queue.tracks[i]];
+        const groups = [queue.tracks.filter(track => !track.radio), queue.tracks.filter(track => track.radio)];
+        for (const group of groups) {
+          for (let i = group.length - 1; i > 0; i--) {
+            const j = randomInt(i + 1);
+            [group[i], group[j]] = [group[j], group[i]];
+          }
         }
+        queue.tracks = groups.flat();
       }
       if (action === 'leave') {
         if (queue.nowPlaying) queue.tracks.unshift(queue.nowPlaying);
@@ -94,6 +134,7 @@ export function createDemoBot() {
         if (index === -1) throw failure('Song not found.', 404);
         queue.tracks.splice(index, 1);
       }
+      refillRadio();
       return bot.snapshot(id);
     },
   };

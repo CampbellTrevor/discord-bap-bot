@@ -15,6 +15,8 @@ const MAX_SPOTIFY_PLAYLIST_PAGES = 45;
 const MAX_PROCESSES = 4;
 const SEARCH_LIMIT = 5;
 const SEARCH_CANDIDATES = 10;
+const RADIO_CANDIDATES = 80;
+const RADIO_BATCH_LIMIT = 10;
 const MATCH_CACHE_LIMIT = 200;
 const MATCH_CACHE_TTL_MS = 10 * 60_000;
 const EXTRACTOR_FAILURE_CODES = new Set(['YOUTUBE_REQUEST_BLOCKED', 'YOUTUBE_RATE_LIMITED', 'YOUTUBE_RESTRICTED', 'YOUTUBE_FORMAT_UNAVAILABLE', 'YOUTUBE_VIDEO_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'EXTRACTOR_UNAVAILABLE']);
@@ -150,6 +152,29 @@ function matchText(value) {
     .replace(/[♡♥❤]\uFE0F?|[<ᐸ]3/gu, ' <3 ')
     .replace(/\p{Script=Latin}\p{M}*/gu, letters => letters.normalize('NFKD').replace(/\p{M}/gu, ''))
     .toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+// Provider URLs and recording names complement each other: the same recording
+// may appear as a Spotify track, a music video, and an official audio upload.
+export function radioTrackKeys(track) {
+  if (!track || typeof track !== 'object') return [];
+  const keys = new Set();
+  for (const value of [track.sourceUrl, track.playbackUrl]) {
+    try {
+      const parsed = parseQuery(value);
+      if (parsed.kind !== 'track') continue;
+      if (parsed.source === 'youtube') keys.add(`youtube:${new URL(parsed.url).searchParams.get('v')}`);
+      if (parsed.source === 'spotify') keys.add(`spotify:${parsed.id}`);
+    } catch {}
+  }
+  if (VIDEO_ID.test(track.playbackMapping?.videoId ?? '')) keys.add(`youtube:${track.playbackMapping.videoId}`);
+  const artist = matchText(safeText(track.artist).replace(/(?:\s*-\s*Topic|\s*VEVO|\s*Official(?:\s*YouTube)?(?:\s*Channel)?)$/iu, ''));
+  let title = matchText(safeText(track.title)
+    .replace(/\([^()]*\)|\[[^\[\]]*\]/gu, annotation => /\b(?:official|audio|music video|lyrics?|visuali[sz]er|hd|hq|4k)\b/iu.test(annotation) ? ' ' : annotation)
+    .replace(/\b(?:official\s+)?(?:music\s+video|video|m\/?v|audio|lyrics?|visuali[sz]er)\b|\b(?:hd|hq|4k)\b/giu, ' '));
+  if (artist && title.startsWith(`${artist} `)) title = title.slice(artist.length + 1);
+  if (artist && title && artist !== 'youtube') keys.add(`song:${artist}:${title}`);
+  return [...keys];
 }
 
 function namePattern(value) {
@@ -320,6 +345,7 @@ export function createMedia(config = {}, dependencies = {}) {
   let spotifyRefreshLoaded;
   const spotifyCache = new Map();
   const spotifyMatches = new Map();
+  const radioAnchorOffsets = new Map();
   const audioCache = config.audioCacheDir ? createAudioDownloadCache({ directory: config.audioCacheDir }, {
     error: kind => { const failure = new AudioDownloadError(kind); return new MediaError(failure.message, failure.code); },
     fs: dependencies.audioCacheFs,
@@ -358,7 +384,7 @@ export function createMedia(config = {}, dependencies = {}) {
     if (runningProcesses.has(child)) terminate(child);
   }
 
-  function extractMetadata(target, signal, { playlist = false, search = false, background = false } = {}) {
+  function extractMetadata(target, signal, { playlist = false, search = false, radio = false, background = false } = {}) {
     signal.throwIfAborted();
     const extraArgs = ['--dump-single-json', '--skip-download'];
     // Flat, lazy extraction fetches only bounded playlist metadata, never one
@@ -366,7 +392,8 @@ export function createMedia(config = {}, dependencies = {}) {
     if (playlist) extraArgs.push('--flat-playlist', '--lazy-playlist', '--playlist-items', `1:${maxPlaylistTracks + 1}`);
     // Search lists catalog metadata without resolving audio for every candidate.
     if (search) extraArgs.push('--flat-playlist', '--lazy-playlist', '--playlist-items', `1:${SEARCH_CANDIDATES}`);
-    const child = startExtractor(extraArgs, target, { playlist: playlist || search, background });
+    if (radio) extraArgs.push('--flat-playlist', '--lazy-playlist', '--playlist-items', `1:${RADIO_CANDIDATES}`);
+    const child = startExtractor(extraArgs, target, { playlist: playlist || search || radio, background });
     return new Promise((resolve, reject) => {
       const stdout = [];
       let stderr = '';
@@ -376,7 +403,7 @@ export function createMedia(config = {}, dependencies = {}) {
         if (done) return;
         done = true;
         signal.removeEventListener('abort', abort);
-        if (error) { logExtractorFailure(error, search ? 'search' : playlist ? 'playlist' : 'metadata'); stopExtractor(child); reject(error); }
+        if (error) { logExtractorFailure(error, radio ? 'radio' : search ? 'search' : playlist ? 'playlist' : 'metadata'); stopExtractor(child); reject(error); }
         else resolve(value);
       };
       const abort = () => finish(abortReason(signal));
@@ -428,9 +455,11 @@ export function createMedia(config = {}, dependencies = {}) {
     };
   }
 
-  async function resolveYoutube(target, signal, { background = false } = {}) {
+  async function resolveYoutube(target, signal, { background = false, studioOnly = false } = {}) {
     const result = await extractMetadata(target, signal, { background });
-    const track = youtubeTrack(Array.isArray(result?.entries) ? result.entries.find(Boolean) : result);
+    const info = Array.isArray(result?.entries) ? result.entries.find(Boolean) : result;
+    if (studioOnly && liveRecording(info)) throw new MediaError('Radio skipped a live recording.', 'NO_PLAYBACK_MATCH');
+    const track = youtubeTrack(info);
     return enrich(track, track, now());
   }
 
@@ -773,6 +802,94 @@ export function createMedia(config = {}, dependencies = {}) {
     } finally { activeResolutions -= 1; }
   }
 
+  async function radio(seed, { signal, limit = RADIO_BATCH_LIMIT, exclude = [], continuation } = {}) {
+    validatePlaybackInput(seed);
+    if (!Number.isInteger(limit) || limit < 1 || limit > RADIO_BATCH_LIMIT || !Array.isArray(exclude) || exclude.length > 5000) {
+      throw new MediaError('Radio requests must ask for 1 to 10 tracks with a bounded listening history.', 'INVALID_QUERY');
+    }
+    signal = signal ? AbortSignal.any([signal, shutdownController.signal]) : shutdownController.signal;
+    signal.throwIfAborted();
+    if (activeResolutions >= MAX_PROCESSES - 1 || activeProcesses >= MAX_PROCESSES - 1) {
+      throw new MediaError('The music provider is busy. Radio will try again shortly.', 'MEDIA_BUSY');
+    }
+    activeResolutions++;
+    try {
+      return await withDeadline(signal, resolveTimeoutMs, async deadline => {
+        const blocked = new Set([seed, ...exclude].flatMap(radioTrackKeys));
+        const resolved = await resolvePlayback(seed, deadline, { background: true, verifyMissing: true });
+        for (const key of radioTrackKeys(resolved.playable)) blocked.add(key);
+        const seedId = new URL(resolved.playable.playbackUrl).searchParams.get('v');
+        let continuationId = null;
+        // Only the queue engine supplies continuation, and only from a previous
+        // radio recommendation. Manual requests cannot steer the station.
+        if (continuation?.source === 'youtube') {
+          const parsed = parseQuery(continuation.playbackUrl || continuation.sourceUrl);
+          if (parsed.source === 'youtube' && parsed.kind === 'track') {
+            const id = new URL(parsed.url).searchParams.get('v');
+            if (id !== seedId) continuationId = id;
+          }
+        }
+        const readMix = async anchor => {
+          const url = `${youtubeUrl(anchor)}&list=RD${anchor}&start_radio=1`;
+          const result = await extractMetadata(url, deadline, { radio: true, background: true });
+          if (!Array.isArray(result?.entries)) throw new MediaError('YouTube did not return song radio recommendations.', 'RADIO_UNAVAILABLE');
+          const tracks = [];
+          for (const info of result.entries.slice(0, RADIO_CANDIDATES)) {
+            if (liveRecording(info)) continue;
+            // A song radio should not substitute karaoke, fan covers, reaction
+            // videos, or mixes for studio songs recommended by the provider.
+            if (/\b(?:karaoke|cover|reaction|nightcore|slowed|sped\s+up|full\s+album|hour\s+mix|compilation)\b/iu.test(safeText(info?.title))) continue;
+            let track;
+            try { track = youtubeTrack(info, { flat: true }); }
+            catch (error) { if (error instanceof MediaError) continue; throw error; }
+            tracks.push({ ...track, radioStudioOnly: true });
+          }
+          return tracks;
+        };
+        const candidates = [];
+        const addCandidates = tracks => {
+          for (const track of tracks) {
+            const keys = radioTrackKeys(track);
+            if (keys.some(key => blocked.has(key))) continue;
+            for (const key of keys) blocked.add(key);
+            candidates.push(track);
+          }
+        };
+        const primary = await readMix(seedId);
+        addCandidates(primary);
+        if (candidates.length < limit) {
+          // An exhausted last-batch Mix must not strand continuous radio on the
+          // same two pages forever. Rotate across songs recommended by this
+          // seed's own Mix, never across manual requests or arbitrary history.
+          const anchors = [...new Set([continuationId, ...primary.map(track => new URL(track.sourceUrl).searchParams.get('v'))])]
+            .filter(id => id && id !== seedId);
+          if (anchors.length) {
+            const key = referenceHash(seed);
+            const prior = radioAnchorOffsets.get(key);
+            const offset = prior?.continuationId === continuationId ? prior.next % anchors.length : 0;
+            radioAnchorOffsets.delete(key);
+            if (radioAnchorOffsets.size >= MATCH_CACHE_LIMIT) radioAnchorOffsets.delete(radioAnchorOffsets.keys().next().value);
+            radioAnchorOffsets.set(key, { continuationId, next: (offset + 1) % anchors.length });
+            addCandidates(await readMix(anchors[offset]));
+          }
+        }
+        deadline.throwIfAborted();
+        if (!candidates.length) throw new MediaError('No new studio songs were available for this radio station. Radio will try again shortly.', 'RADIO_EXHAUSTED');
+        // Preserve provider relevance within each pass, while preventing one
+        // artist from consuming a whole batch when related artists exist.
+        const chosen = [], artistCounts = new Map(), deferred = [];
+        for (const track of candidates) {
+          const artist = matchText(track.artist.replace(/(?:\s*-\s*Topic|\s*VEVO)$/iu, ''));
+          const count = artistCounts.get(artist) || 0;
+          if (count >= 3) { deferred.push(track); continue; }
+          artistCounts.set(artist, count + 1);
+          chosen.push(track);
+        }
+        return [...chosen, ...deferred].slice(0, limit);
+      });
+    } finally { activeResolutions--; }
+  }
+
   function streamYoutube(track, startupSignal, externalSignal) {
     startupSignal.throwIfAborted();
     // Prefer Discord's native codec when the public source offers it. The
@@ -958,7 +1075,7 @@ export function createMedia(config = {}, dependencies = {}) {
       const parsed = parseQuery(track.playbackUrl || track.sourceUrl);
       const fresh = mapped && mapped.checkedAt + MATCH_CACHE_TTL_MS > now();
       const playable = fresh ? mapped.playable : track.needsValidation || mapped || verifyMissing
-        ? await resolveYoutube(parsed.url, signal, { background }) : { ...track, playbackUrl: parsed.url };
+        ? await resolveYoutube(parsed.url, signal, { background, studioOnly: track.radioStudioOnly === true }) : { ...track, playbackUrl: parsed.url };
       const checkedAt = fresh ? mapped.checkedAt : now();
       return { playable, track: enrich(track, playable, checkedAt) };
     }
@@ -1062,5 +1179,5 @@ export function createMedia(config = {}, dependencies = {}) {
     return closing;
   }
 
-  return { resolve, search, preflight, open, close };
+  return { resolve, search, radio, preflight, open, close };
 }

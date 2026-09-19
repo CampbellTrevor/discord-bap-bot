@@ -628,8 +628,9 @@ function renderEnabled() {
   $('leave-button').disabled = !canControl;
   $('pause-button').disabled = !canControl || !queue?.nowPlaying;
   $('skip-button').disabled = !canControl || !queue?.nowPlaying;
-  $('stop-button').disabled = !canControl || (!queue?.nowPlaying && !queue?.tracks?.length);
+  $('stop-button').disabled = !canControl || (!queue?.nowPlaying && !queue?.tracks?.length && !queue?.radio?.active);
   $('shuffle-button').disabled = !canControl || (queue?.tracks?.length || 0) < 2;
+  $('radio-button').disabled = !canControl || !queue?.radio || (!queue.radio.active && !queue.nowPlaying);
   for (const button of $('queue-list').querySelectorAll('.queue-remove')) button.disabled = !ready;
   for (const button of $('queue-list').querySelectorAll('.queue-move')) button.disabled = !canControl || button.dataset.first === 'true';
   if (state.search.pending && (state.offline || !state.session?.botReady || !state.session?.user)) {
@@ -639,7 +640,26 @@ function renderEnabled() {
   for (const tab of document.querySelectorAll('[data-search-source]')) tab.disabled = !ready || (tab.dataset.searchSource === 'spotify' && !state.session?.demo && !state.session?.spotifyEnabled);
   for (const button of $('search-results-list').querySelectorAll('button')) button.disabled = !ready || state.search.pending || state.search.context !== searchContext() || state.search.added.has(button.dataset.sourceUrl);
   renderVolume();
+  renderRadio();
   updateRequestLabel();
+}
+
+function renderRadio() {
+  const radio = state.detail?.queue?.radio;
+  const active = Boolean(radio?.active);
+  const busy = state.busyEndpoint === 'radio';
+  $('radio-control').hidden = !radio;
+  $('radio-control').setAttribute('aria-busy', String(busy));
+  $('radio-button').textContent = active ? 'Stop radio' : 'Start radio';
+  $('radio-button').setAttribute('aria-pressed', String(active));
+  $('radio-button').title = active ? 'Stop adding songs and remove upcoming radio tracks. Requests and the current song stay.' : 'Keep adding similar songs in batches of 10. Requests play first.';
+  const seed = radio?.seed;
+  $('radio-status').textContent = active ? `Radio · ${seed?.title || 'Current song'}` : '10 songs at a time';
+  $('radio-status').title = active && seed ? [seed.title, seed.artist].filter(Boolean).join(' — ') : '';
+  const error = typeof radio?.error === 'string' ? radio.error : '';
+  $('radio-detail').textContent = busy ? 'Updating radio…' : active && radio.loading ? 'Finding 10 songs…' : error || (active ? 'Requests play first' : '');
+  $('radio-detail').hidden = !$('radio-detail').textContent;
+  $('radio-detail').classList.toggle('error', Boolean(error && !busy && !radio?.loading));
 }
 
 function volumeAvailable() {
@@ -676,7 +696,7 @@ function renderPlayer() {
   const track = queue?.nowPlaying;
   $('now-title').textContent = track?.title || 'No track loaded';
   $('now-artist').textContent = track?.artist || (track ? 'Unknown artist' : 'Request a song to get started.');
-  $('now-requester').textContent = track?.requestedBy?.username ? `REQUESTED BY ${track.requestedBy.username}` : 'AUTO QUEUE / ON';
+  $('now-requester').textContent = track?.radio ? 'RADIO' : track?.requestedBy?.username ? `REQUESTED BY ${track.requestedBy.username}` : 'AUTO QUEUE / ON';
   const sourceUrl = safeUrl(track?.sourceUrl, ['youtube.com', 'youtu.be', 'open.spotify.com']);
   $('now-link').hidden = !sourceUrl;
   if (sourceUrl) $('now-link').href = sourceUrl;
@@ -771,6 +791,7 @@ function renderQueue() {
     const title = appendText(copy, 'p', 'queue-item-title', track.title || 'Untitled track');
     title.title = track.title || 'Untitled track';
     appendText(copy, 'span', 'queue-item-artist', track.artist || 'Unknown artist');
+    if (track.radio) appendText(copy, 'span', 'queue-radio', 'Radio');
     const validation = track.validation;
     if (validation && Object.hasOwn(validationLabels, validation.status)) {
       const [label, explanation] = validationLabels[validation.status];
@@ -782,8 +803,8 @@ function renderQueue() {
     }
     item.append(copy);
     const requester = appendText(item, 'div', 'queue-item-requester', '');
-    const person = appendText(requester, 'span', 'queue-item-person', track.requestedBy?.username || 'Listener');
-    person.title = `Requested by ${track.requestedBy?.username || 'a listener'}`;
+    const person = appendText(requester, 'span', 'queue-item-person', track.radio ? 'Radio' : track.requestedBy?.username || 'Listener');
+    person.title = track.radio ? 'Added by song radio' : `Requested by ${track.requestedBy?.username || 'a listener'}`;
     appendText(requester, 'span', 'queue-item-source', track.source === 'spotify' ? 'Spotify' : 'YouTube');
     appendText(item, 'span', 'queue-item-duration', duration(track.durationSec));
     const actions = appendText(item, 'div', 'queue-actions', '');
@@ -970,6 +991,12 @@ $('pause-button').addEventListener('click', () => {
 $('skip-button').addEventListener('click', () => mutate('control', { action: 'skip' }, 'Skipped the current track.'));
 $('stop-button').addEventListener('click', () => mutate('control', { action: 'stop' }, 'Playback stopped and the queue cleared.'));
 $('shuffle-button').addEventListener('click', () => mutate('control', { action: 'shuffle' }, 'Shuffled the upcoming tracks.'));
+$('radio-button').addEventListener('click', () => {
+  const queue = state.detail?.queue;
+  if (!state.detail?.member?.canControl || !queue?.radio || (!queue.radio.active && !queue.nowPlaying)) return;
+  const action = queue.radio.active ? 'stop' : 'start';
+  return mutate('radio', { action }, action === 'stop' ? 'Radio stopped. Requests and the current song stay.' : 'Radio started. Songs will be added in batches of 10.');
+});
 $('volume-input').addEventListener('input', () => {
   if (!canSetVolume() || state.busy) { renderVolume(); return; }
   const value = Number($('volume-input').value);

@@ -15,6 +15,31 @@ const CHANNEL = '323456789012345678';
 const SID = 'test-session-identifier-with-32-characters';
 const silent = { warn() {} };
 
+test('radio RPC validates seed/action, propagates cancellation and never replays mutations', async t => {
+  const { bridge, connect } = await fixture(t);
+  const calls = [], started = deferred(), cancelled = deferred();
+  connect(fakeBot({ radio: async (guild, user, action, query, channel, { signal }) => {
+    calls.push([guild, user, action, query, channel]);
+    if (query === 'slow') { started.resolve(); await new Promise(resolve => signal.addEventListener('abort', () => { cancelled.resolve(); resolve(); }, { once: true })); }
+    return { radio: { active: action === 'start', batchSize: 10 } };
+  } }));
+  await until(() => bridge.bot.isReady());
+  for (const [action, query, channel] of [['invalid', undefined, undefined], ['start', '', undefined], ['stop', 'song', undefined], ['start', undefined, 'bad']]) {
+    await assert.rejects(bridge.bot.radio(GUILD, USER, action, query, channel), { code: 'WORKER_INVALID_REQUEST' });
+  }
+  assert.equal(calls.length, 0);
+  assert.equal((await bridge.bot.radio(GUILD, USER, 'start')).radio.active, true);
+  assert.equal((await bridge.bot.radio(GUILD, USER, 'stop')).radio.active, false);
+  assert.deepEqual(calls[0], [GUILD, USER, 'start', undefined, undefined]);
+  const controller = new AbortController();
+  const pending = bridge.bot.radio(GUILD, USER, 'start', 'slow', CHANNEL, { signal: controller.signal });
+  await started.promise;
+  controller.abort();
+  await assert.rejects(pending, { code: 'WORKER_OUTCOME_UNKNOWN' });
+  await cancelled.promise;
+  assert.equal(calls.length, 3);
+});
+
 test('2,000 Unicode Spotify entries round trip without internal resolution metadata', async t => {
   const tracks = Array.from({ length: 2000 }, () => ({ id: randomUUID(), title: '\u97f3'.repeat(250), artist: '\u697d'.repeat(250),
     requestedBy: { id: USER, username: '\u97f3'.repeat(32) }, durationSec: 3600, source: 'spotify', sourceUrl: 'https://open.spotify.com/track/1234567890123456789012',

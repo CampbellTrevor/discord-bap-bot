@@ -11,8 +11,8 @@ const REQUEST_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12
 const ACTIONS = new Set(['skip', 'pause', 'resume', 'stop', 'leave', 'remove', 'shuffle', 'move-top']);
 const SESSION_ID = /^[A-Za-z0-9_-]{32,128}$/;
 const SESSION_METHODS = new Set(['sessionGet', 'sessionSet', 'sessionTake', 'sessionDestroy']);
-const METHODS = new Set(['listGuilds', 'detail', 'performance', 'search', 'request', 'join', 'control', 'setVolume', ...SESSION_METHODS]);
-const MUTATIONS = new Set(['request', 'join', 'control', 'setVolume']);
+const METHODS = new Set(['listGuilds', 'detail', 'performance', 'search', 'request', 'join', 'control', 'setVolume', 'radio', ...SESSION_METHODS]);
+const MUTATIONS = new Set(['request', 'join', 'control', 'setVolume', 'radio']);
 const STATUSES = new Set([400, 403, 404, 409, 429, 503]);
 const MEDIA_CODES = new Set([
   'NO_PLAYBACK_MATCH', 'YOUTUBE_VIDEO_UNAVAILABLE',
@@ -22,6 +22,7 @@ const MEDIA_CODES = new Set([
   'YOUTUBE_UNAVAILABLE', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'EXTRACTOR_UNAVAILABLE',
   'SPOTIFY_UNAVAILABLE', 'SPOTIFY_QUOTA_EXCEEDED', 'SPOTIFY_RATE_LIMITED', 'SPOTIFY_REAUTHORIZE',
   'SPOTIFY_UNAUTHORIZED', 'SPOTIFY_FORBIDDEN', 'SPOTIFY_AUTH_STORAGE', 'SPOTIFY_NOT_CONFIGURED', 'SPOTIFY_PLAYLIST_ACCESS',
+  'RADIO_UNAVAILABLE', 'RADIO_EXHAUSTED', 'RADIO_INCOMPLETE',
 ]);
 const BRIDGE_CODES = new Set([
   'WORKER_UNAVAILABLE', 'WORKER_BUSY', 'WORKER_TIMEOUT', 'WORKER_CANCELLED', 'WORKER_OUTCOME_UNKNOWN',
@@ -56,6 +57,13 @@ const PUBLIC_MESSAGES = new Set([
   'Only a server manager or DJ can view host performance.',
   'Host performance is temporarily unavailable.',
   'Volume must be a whole number from 0 to 100.',
+  'Choose start or stop for radio.',
+  'Choose one seed song or leave the song blank to use the current track.',
+  'Radio needs one seed song, not a playlist.',
+  'Play a song first, or provide a seed song for radio.',
+  'Radio settings changed. Try again.',
+  'Radio is unavailable on this bot host.',
+  'Choose a song to start radio.',
 ]);
 const CAPACITY_MESSAGE = /^This request contains \d{1,4} tracks?, but only \d{1,4} queue slots? (?:is|are) available \(limit \d{1,4}, including the current track\)\. Nothing was added\. Try a smaller request or wait for space\.$/;
 
@@ -174,6 +182,8 @@ function validArguments(method, args) {
   if (method === 'detail' || method === 'performance') return args.length === 2;
   if (method === 'search') return args.length === 4 && query(args[2]) && ['youtube', 'spotify'].includes(args[3]);
   if (method === 'request') return args.length === 4 && query(args[2]) && optionalId(args[3]);
+  if (method === 'radio') return args.length === 5 && ['start', 'stop'].includes(args[2])
+    && (args[3] === null || args[3] === undefined || args[2] === 'start' && query(args[3])) && optionalId(args[4]);
   if (method === 'join') return args.length === 3 && optionalId(args[2]);
   if (method === 'setVolume') return args.length === 3 && Number.isInteger(args[2]) && args[2] >= 0 && args[2] <= 100;
   if (method === 'control') return args.length === 4 && ACTIONS.has(args[2])
@@ -321,7 +331,7 @@ export function createWorkerBridge({ secret, logger = console, trustProxy = fals
         entry.finish(interrupted(method, reason));
       }
       pending.set(id, entry);
-      timer = setTimeout(() => cancel('timeout'), method === 'request' ? requestTimeout : readTimeout);
+      timer = setTimeout(() => cancel('timeout'), ['request', 'radio'].includes(method) ? requestTimeout : readTimeout);
       timer.unref?.();
       signal?.addEventListener('abort', abort, { once: true });
       if (!sendFrame(connection, { v: VERSION, type: 'call', id, method, args })) {
@@ -351,6 +361,7 @@ export function createWorkerBridge({ secret, logger = console, trustProxy = fals
     join: (guildId, userId, channelId, options) => rpc('join', [guildId, userId, channelId ?? null], options),
     control: (guildId, userId, action, trackId, options) => rpc('control', [guildId, userId, action, trackId ?? null], options),
     setVolume: (guildId, userId, volumePercent, options) => rpc('setVolume', [guildId, userId, volumePercent], options),
+    radio: (guildId, userId, action, query, channelId, options) => rpc('radio', [guildId, userId, action, query ?? null, channelId ?? null], options),
     shutdown: close,
   };
   return {
@@ -482,7 +493,7 @@ export function connectWorker({ url, secret, bot, sessionStorage, spotifyEnabled
       const timeout = setTimeout(() => {
         reply(id, null, interrupted(method, 'timeout'));
         task.cancel();
-      }, method === 'request' ? requestTimeout : readTimeout);
+      }, ['request', 'radio'].includes(method) ? requestTimeout : readTimeout);
       timeout.unref?.();
       try {
         let result;
@@ -496,6 +507,7 @@ export function connectWorker({ url, secret, bot, sessionStorage, spotifyEnabled
           case 'join': result = await bot.join(args[0], args[1], args[2] ?? undefined); break;
           case 'control': result = await bot.control(args[0], args[1], args[2], args[3] ?? undefined); break;
           case 'setVolume': result = await bot.setVolume(args[0], args[1], args[2], { signal: controller.signal }); break;
+          case 'radio': result = await bot.radio(args[0], args[1], args[2], args[3] ?? undefined, args[4] ?? undefined, { signal: controller.signal }); break;
           case 'sessionGet': result = await sessionStorage.get(args[0]); break;
           case 'sessionSet': result = await sessionStorage.set(args[0], args[1]); break;
           case 'sessionTake': result = await sessionStorage.take(args[0]); break;

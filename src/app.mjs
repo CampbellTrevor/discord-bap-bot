@@ -159,6 +159,16 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     }
     res.json({ queue: await withClientCancellation(req, res, signal => bot.setVolume(req.params.guildId, req.session.user.id, volumePercent, { signal })) });
   });
+  app.post('/api/guilds/:guildId/radio', csrf, limiter(15, 60000), async (req, res) => {
+    const { action, query, channelId } = req.body || {};
+    if (!['start', 'stop'].includes(action)) throw httpError('Choose start or stop for radio.', 400);
+    if (query !== undefined && (action !== 'start' || typeof query !== 'string' || !query.trim() || query.length > 500)) {
+      throw httpError('Choose one seed song or leave the song blank to use the current track.', 400);
+    }
+    if (channelId !== undefined && (typeof channelId !== 'string' || !channelId)) throw httpError('Choose a voice channel.', 400);
+    res.json({ queue: await withClientCancellation(req, res, signal => bot.radio(req.params.guildId, req.session.user.id,
+      action, query?.trim(), channelId, { signal })) });
+  });
   app.post('/api/guilds/:guildId/control', csrf, limiter(30, 60000), async (req, res) => {
     const { action, trackId } = req.body || {};
     if (!['skip', 'pause', 'resume', 'stop', 'leave', 'remove', 'shuffle', 'move-top'].includes(action)) throw httpError('Unknown playback control.', 400);

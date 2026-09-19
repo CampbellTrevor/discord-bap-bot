@@ -128,6 +128,14 @@ The automated suite tests actual HTTP authentication/CSRF flows, provider parsin
 Layout: `src/app.mjs` (HTTP/OAuth), `src/discord.mjs` (Discord/policies), `src/music.mjs` (queues), `src/media.mjs` (providers), `public/` (portal), `render.yaml` and `Dockerfile` (hosting).
 
 
+## Song radio
+
+Use `/radio` or **Start radio** on the current song to keep discovering similar music. `/radio query:<song name or YouTube/Spotify track link>` chooses a different seed; it does not enqueue the seed itself. Radio adds **10 songs per batch** and requests the next batch when two radio songs remain. It reserves space for the entire batch within the 2,000-song queue limit. Normal song and playlist requests play before waiting radio picks; moving a radio pick to the top promotes it to a manual request.
+
+**Stop radio** or `/radio-stop` turns off discovery and removes waiting radio picks, preserving the current song and manual requests. `/stop` turns radio off and clears the queue. Pausing or leaving voice suspends discovery. The seed and recent history survive restarts; `/join` reconnects and continues the saved station. Only users with the existing playback-control permission can start or stop radio.
+
+Recommendations come from YouTube song Mixes, including when the seed is a Spotify song matched to YouTube. This is a similar experience, not Spotify's exact radio algorithm: Spotify does not expose Recommendations or Related Artists to new development apps ([Spotify's API changes](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api)). Radio favors artist variety and studio recordings, excludes queued/current songs and a bounded recent history, and checks candidates through the existing playback-validation pipeline. Unavailable songs are removed. If the provider cannot supply ten new songs, the station displays a retry message and waits before trying again; it does not flood the queue or interrupt current playback. Only one station discovery runs at a time across the host, with foreground playback retaining extraction capacity.
+
 ## Preloading and playback host performance
 
 The worker downloads each recording completely to disk before playback preparation, requiring the download to finish and yt-dlp to exit successfully. Downloads allow up to three HTTP retries and three fragment retries within the overall deadline; an unavailable fragment fails the download instead of producing a recording with a missing section. A cold first song can take a few seconds to download. Once ready, playback reads the completed local file, so a later YouTube connection failure cannot interrupt that recording. This does not change provider access requirements or prevent local audio/Discord failures.

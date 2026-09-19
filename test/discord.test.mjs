@@ -13,6 +13,73 @@ function deferred() {
 
 const track = { title: 'Song', artist: 'Artist', durationSec: 120, source: 'youtube', sourceUrl: 'https://www.youtube.com/watch?v=abcdefghijk' };
 
+test('radio requires playback permission and uses the current song without requeueing it', async t => {
+  const { bot, member, music, queue, calls, registered } = await fixture(t);
+  queue.nowPlaying = { ...track, id: 'current', requestedBy: { id: 'listener', username: 'Listener' } };
+  const starts = [];
+  music.startRadio = async (...args) => { starts.push(args); return { ...queue, radio: { active: true, seed: args[1], batchSize: 10 } }; };
+  member.voice.channelId = 'other';
+  await assert.rejects(bot.radio('guild', 'listener', 'start'), { status: 403 });
+  assert.equal(starts.length, 0);
+  member.voice.channelId = 'voice';
+  const result = await bot.radio('guild', 'listener', 'start');
+  assert.equal(result.radio.seed.id, 'current');
+  assert.deepEqual(starts[0][2], { id: 'listener', username: 'Listener' });
+  assert.equal(calls.resolves, 0);
+  assert.equal(calls.enqueues, 0);
+  assert.equal(registered.find(c => c.name === 'radio').options[0].required ?? false, false);
+  assert.ok(registered.some(c => c.name === 'radio-stop'));
+});
+
+test('radio validates seed input, rejects playlists, and rechecks membership before committing', async t => {
+  const { bot, music, media, guild } = await fixture(t);
+  let starts = 0;
+  music.startRadio = async () => { starts++; return {}; };
+  for (const [action, query] of [['invalid', undefined], ['start', ' '], ['stop', 'song'], ['start', 42]]) {
+    await assert.rejects(bot.radio('guild', 'listener', action, query), { status: 400 });
+  }
+  await assert.rejects(bot.radio('guild', 'listener', 'start'), { status: 409 });
+  media.resolve = async () => Object.assign([track], { import: { title: 'Playlist' } });
+  await assert.rejects(bot.radio('guild', 'listener', 'start', 'playlist'), /one seed song/);
+  media.resolve = async () => {
+    guild.members.fetch = async () => { throw Object.assign(new Error('Unknown member'), { code: 10007 }); };
+    return [track];
+  };
+  await assert.rejects(bot.radio('guild', 'listener', 'start', 'song'), { status: 403 });
+  assert.equal(starts, 0);
+});
+
+test('stopping radio cancels a pending seed lookup so it cannot restart the station later', async t => {
+  const { bot, music, media } = await fixture(t);
+  const started = deferred(), release = deferred();
+  let starts = 0, stops = 0, signal;
+  music.startRadio = async () => { starts++; return {}; };
+  music.stopRadio = async () => { stops++; return { radio: { active: false } }; };
+  media.resolve = async (_query, options) => { signal = options.signal; started.resolve(); await release.promise; return [track]; };
+  const pending = bot.radio('guild', 'listener', 'start', 'song');
+  const rejected = assert.rejects(pending, /Radio settings changed/);
+  await started.promise;
+  assert.equal((await bot.radio('guild', 'listener', 'stop')).radio.active, false);
+  assert.equal(signal.aborted, true);
+  release.resolve();
+  await rejected;
+  assert.equal(starts, 0);
+  assert.equal(stops, 1);
+});
+
+test('cancelled seed lookup cannot commit but a committed station survives request cancellation', async t => {
+  const { bot, music, media, queue } = await fixture(t);
+  queue.nowPlaying = track;
+  let starts = 0;
+  const controller = new AbortController();
+  music.startRadio = async () => { starts++; controller.abort(); return { radio: { active: true } }; };
+  assert.equal((await bot.radio('guild', 'listener', 'start', undefined, undefined, { signal: controller.signal })).radio.active, true);
+  const cancelled = new AbortController();
+  media.resolve = async () => { cancelled.abort(); return [track]; };
+  await assert.rejects(bot.radio('guild', 'listener', 'start', 'song', undefined, { signal: cancelled.signal }));
+  assert.equal(starts, 1);
+});
+
 test('performance requires current membership and manager permission before reading metrics', async t => {
   let reads = 0;
   const metrics = { getSnapshot() { reads++; return { version: 1, latest: { hostCpuBusyPct: 12 } }; } };

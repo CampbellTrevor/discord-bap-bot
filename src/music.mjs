@@ -3,11 +3,13 @@ import { randomInt, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import { MediaError, isPermanentMediaError } from './media.mjs';
+import { MediaError, isPermanentMediaError, radioTrackKeys } from './media.mjs';
 
 const SAFE_RUNTIME_CODES = new Set(['ENOENT', 'EPIPE', 'ECONNRESET', 'ETIMEDOUT', 'ABORT_ERR', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END', 'ERR_MODULE_NOT_FOUND', 'ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_OUT_OF_RANGE']);
 const SAFE_ERROR_TYPES = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError', 'TimeoutError', 'AudioPlayerError']);
 const DEFAULT_VOLUME_PERCENT = 50;
+const RADIO_BATCH_SIZE = 10;
+const RADIO_HISTORY_LIMIT = 300;
 const validVolumePercent = value => Number.isInteger(value) && value >= 0 && value <= 100;
 const SOURCE_METRIC_CODES = new Set(['AUDIO_SOURCE_FAILED', 'MEDIA_CANCELLED', 'MEDIA_BUSY', 'MEDIA_TIMEOUT', 'MEDIA_UNAVAILABLE', 'INVALID_MEDIA', 'UNSUPPORTED_MEDIA', 'TRACK_TOO_LONG', 'YOUTUBE_REQUEST_BLOCKED', 'YOUTUBE_RATE_LIMITED', 'YOUTUBE_RESTRICTED', 'YOUTUBE_FORMAT_UNAVAILABLE', 'YOUTUBE_UNAVAILABLE', 'EXTRACTOR_RUNTIME_UNAVAILABLE', 'EXTRACTOR_UNAVAILABLE']);
 SOURCE_METRIC_CODES.add('NO_PLAYBACK_MATCH');
@@ -38,13 +40,28 @@ export function musicError(message, status = 400) {
 
 export function publicTrack(track) {
   if (!track) return track;
-  const { playbackMapping, searchQuery, ...visible } = track;
+  const { playbackMapping, searchQuery, radioStudioOnly, ...visible } = track;
   return visible;
+}
+
+function radioDescriptor(track) {
+  if (!track || typeof track.title !== 'string' || typeof track.sourceUrl !== 'string') return null;
+  const result = { source: track.source, sourceUrl: track.sourceUrl, title: track.title, artist: typeof track.artist === 'string' ? track.artist : '' };
+  if (typeof track.playbackMapping?.videoId === 'string') {
+    result.playbackMapping = { videoId: track.playbackMapping.videoId,
+      title: track.playbackMapping.title, artist: track.playbackMapping.artist };
+  }
+  return result;
+}
+
+function newRadioState() {
+  return { active: false, seed: null, requestedBy: null, history: [], continuation: null,
+    generation: 0, loading: false, error: null, retryAt: 0, attempts: 0 };
 }
 
 /** Shared queue state. Voice and media adapters are injected so transitions can be tested offline. */
 export class MusicManager extends EventEmitter {
-  constructor({ media, dataDir, maxQueueSize = 2000, idleDisconnectMs = 300_000, logger = console, randomIndex = randomInt, preloadCount = 2, preloadLeadSec = 120, preloadTtlMs = 300_000, validationDelayMs = 1000, validationRetryMs = [30_000, 120_000, 600_000], validationCooldownMs = 30_000 }) {
+  constructor({ media, dataDir, maxQueueSize = 2000, idleDisconnectMs = 300_000, logger = console, randomIndex = randomInt, preloadCount = 2, preloadLeadSec = 120, preloadTtlMs = 300_000, validationDelayMs = 1000, validationRetryMs = [30_000, 120_000, 600_000], validationCooldownMs = 30_000, radioRetryMs = [30_000, 120_000] }) {
     super();
     this.media = media;
     this.file = path.join(dataDir, 'queues.json');
@@ -74,6 +91,12 @@ export class MusicManager extends EventEmitter {
     this.validationAttempts = new Map();
     this.validationLastGuild = null;
     this.preloadCooldownUntil = 0;
+    if (!Array.isArray(radioRetryMs) || !radioRetryMs.length || radioRetryMs.some(delay => !Number.isSafeInteger(delay) || delay < 1)) throw new Error('Radio retry timing values are invalid.');
+    this.radioRetryMs = radioRetryMs;
+    this.radioEntry = null;
+    this.radioTimer = null;
+    this.radioLastGuild = null;
+    this.radioDescriptorKeys = new WeakMap();
   }
 
   state(guildId) {
@@ -84,6 +107,7 @@ export class MusicManager extends EventEmitter {
         transport: null, generation: 0, opened: null, abort: null,
         paused: false, opening: false, lastError: null, idleTimer: null, volumePercent: DEFAULT_VOLUME_PERCENT,
         preloads: new Map(), preloadTimer: null, retryingTrackId: null, transitionStartedAt: null,
+        radio: newRadioState(),
       };
       this.states.set(guildId, state);
     }
@@ -114,6 +138,12 @@ export class MusicManager extends EventEmitter {
       state.tracks = restored;
       migrated = this.removeUnavailable(state) > 0 || migrated;
       state.tracks = state.tracks.map(track => this.initializeValidation(track));
+      if (value.radio?.seed && radioDescriptor(value.radio.seed) && value.radio.requestedBy?.id) {
+        state.radio = { ...newRadioState(), active: value.radio.active === true,
+          seed: structuredClone(value.radio.seed), requestedBy: structuredClone(value.radio.requestedBy),
+          history: Array.isArray(value.radio.history) ? value.radio.history.map(radioDescriptor).filter(Boolean).slice(-RADIO_HISTORY_LIMIT) : [],
+          continuation: radioDescriptor(value.radio.continuation) };
+      }
     }
     if (migrated) await this.persist();
     this.scheduleValidation();
@@ -127,6 +157,10 @@ export class MusicManager extends EventEmitter {
       paused: state.paused, volumePercent: state.volumePercent,
       playing: Boolean(state.nowPlaying && state.transport && !state.opening && !state.paused),
       lastError: state.lastError,
+      radio: { active: state.radio.active, seed: state.radio.seed ? {
+        title: state.radio.seed.title, artist: state.radio.seed.artist, source: state.radio.seed.source,
+        sourceUrl: state.radio.seed.sourceUrl, thumbnail: state.radio.seed.thumbnail,
+      } : null, loading: state.radio.loading, batchSize: RADIO_BATCH_SIZE, error: state.radio.error },
       elapsedSec: state.nowPlaying ? Math.max(0, state.transport?.elapsedSec?.() || 0) : 0,
     });
   }
@@ -150,8 +184,14 @@ export class MusicManager extends EventEmitter {
     this.assertCapacity(guildId, tracks.length);
     // The capacity check and full-batch append happen before any await. Concurrent
     // requests therefore either reserve every accepted track or add nothing.
-    const added = tracks.map(track => this.initializeValidation({ ...structuredClone(track), id: randomUUID(), requestedBy: { ...requestedBy } }));
-    state.tracks.push(...added);
+    const added = tracks.map(track => {
+      const manual = { ...structuredClone(track), id: randomUUID(), requestedBy: { ...requestedBy } };
+      delete manual.radio;
+      return this.initializeValidation(manual);
+    });
+    // Requests always play before pending radio picks, in request order.
+    const firstRadio = state.tracks.findIndex(track => track.radio === true);
+    state.tracks.splice(firstRadio < 0 ? state.tracks.length : firstRadio, 0, ...added);
     this.clearIdle(state);
     await this.persist();
     this.changed(state);
@@ -178,6 +218,7 @@ export class MusicManager extends EventEmitter {
   detach(guildId, preserve = true, error = null, expectedTransport = null) {
     const state = this.state(guildId);
     if (expectedTransport && state.transport !== expectedTransport) return;
+    this.cancelRadio(state);
     if (preserve && state.nowPlaying) state.tracks.unshift(state.nowPlaying);
     const transport = state.transport;
     this.cancelCurrent(state);
@@ -199,6 +240,7 @@ export class MusicManager extends EventEmitter {
       case 'pause':
         if (!state.nowPlaying) throw musicError('Nothing is playing.', 409);
         state.paused = true;
+        this.cancelRadio(state);
         state.transport?.pause();
         break;
       case 'resume':
@@ -215,20 +257,29 @@ export class MusicManager extends EventEmitter {
         if (!state.nowPlaying) throw musicError('Nothing is playing.', 409);
         this.cancelCurrent(state);
         break;
-      case 'shuffle':
+      case 'shuffle': {
         if (state.tracks.length < 2) throw musicError('At least two songs must be waiting in the queue to shuffle.', 409);
-        for (let index = state.tracks.length - 1; index > 0; --index) {
-          const other = this.randomIndex(index + 1);
-          [state.tracks[index], state.tracks[other]] = [state.tracks[other], state.tracks[index]];
+        const groups = [state.tracks.filter(track => track.radio !== true), state.tracks.filter(track => track.radio === true)];
+        for (const group of groups) {
+          for (let index = group.length - 1; index > 0; --index) {
+            const other = this.randomIndex(index + 1);
+            [group[index], group[other]] = [group[other], group[index]];
+          }
         }
+        state.tracks = groups.flat();
         break;
+      }
       case 'move-top': {
         const index = state.tracks.findIndex(track => track.id === trackId);
         if (index < 0) throw musicError('That song is no longer in the waiting queue.', 404);
+        if (state.tracks[index].radio === true) delete state.tracks[index].radio;
         if (index > 0) state.tracks.unshift(...state.tracks.splice(index, 1));
         break;
       }
       case 'stop':
+        this.cancelRadio(state);
+        state.radio.active = false;
+        state.radio.error = null;
         for (const track of state.tracks) this.validationAttempts.delete(track.id);
         state.tracks = [];
         this.cancelCurrent(state);
@@ -271,6 +322,155 @@ export class MusicManager extends EventEmitter {
     return this.snapshot(guildId);
   }
 
+  async startRadio(guildId, seed, requestedBy) {
+    if (this.shuttingDown) throw musicError('The bot is restarting. Please try again shortly.', 503);
+    if (typeof this.media.radio !== 'function') throw musicError('Radio is unavailable on this bot host.', 503);
+    if (!radioDescriptor(seed) || !seed.title.trim() || !['youtube', 'spotify'].includes(seed.source) || !requestedBy?.id) throw musicError('Choose a song to start radio.');
+    const state = this.state(guildId);
+    this.cancelRadio(state);
+    this.removePendingRadio(state);
+    Object.assign(state.radio, { active: true, seed: structuredClone(seed), requestedBy: { ...requestedBy },
+      continuation: null, loading: false, error: null, retryAt: 0, attempts: 0 });
+    this.rememberRadio(state, seed);
+    this.clearIdle(state);
+    this.syncPreloads();
+    await this.persist();
+    this.changed(state);
+    this.schedule(state);
+    return this.snapshot(guildId);
+  }
+
+  async stopRadio(guildId) {
+    if (this.shuttingDown) throw musicError('The bot is restarting. Please try again shortly.', 503);
+    const state = this.state(guildId);
+    this.cancelRadio(state);
+    state.radio.active = false;
+    state.radio.error = null;
+    state.radio.retryAt = 0;
+    this.removePendingRadio(state);
+    this.syncPreloads();
+    await this.persist();
+    this.changed(state);
+    this.schedule(state);
+    return this.snapshot(guildId);
+  }
+
+  removePendingRadio(state) {
+    for (const track of state.tracks) if (track.radio === true) this.validationAttempts.delete(track.id);
+    if (this.validationEntry?.state === state && this.validationEntry.track.radio === true) this.cancelValidation();
+    state.tracks = state.tracks.filter(track => track.radio !== true);
+  }
+
+  cancelRadio(state) {
+    ++state.radio.generation;
+    state.radio.loading = false;
+    if (this.radioEntry?.state === state) this.radioEntry.controller.abort();
+    // Keep the global slot until the aborted provider actually exits. Repeated
+    // station changes therefore cannot pile up extractor work.
+  }
+
+  rememberRadio(state, track) {
+    const descriptor = radioDescriptor(track);
+    if (!descriptor) return;
+    const keys = new Set(this.radioKeys(descriptor));
+    if (!keys.size) return;
+    state.radio.history = state.radio.history.filter(item => !this.radioKeys(item).some(key => keys.has(key)));
+    state.radio.history.push(descriptor);
+    if (state.radio.history.length > RADIO_HISTORY_LIMIT) state.radio.history.splice(0, state.radio.history.length - RADIO_HISTORY_LIMIT);
+  }
+
+  radioExclusions(state) {
+    return [...[state.radio.seed, state.nowPlaying, ...state.tracks].map(radioDescriptor).filter(Boolean), ...state.radio.history];
+  }
+
+  radioKeys(descriptor) {
+    // History descriptors are immutable. Cache their canonical identities so a
+    // refill does not repeatedly normalize the same 300 songs on the audio loop.
+    let keys = this.radioDescriptorKeys.get(descriptor);
+    if (!keys) { keys = radioTrackKeys(descriptor); this.radioDescriptorKeys.set(descriptor, keys); }
+    return keys;
+  }
+
+  radioEligible(state) {
+    return state.radio.active && state.transport && !state.paused && !state.opening
+      && state.tracks.filter(track => track.radio === true).length <= 2
+      && this.capacity(state.guildId) >= RADIO_BATCH_SIZE;
+  }
+
+  scheduleRadio() {
+    clearTimeout(this.radioTimer);
+    this.radioTimer = null;
+    if (this.shuttingDown || this.radioEntry || typeof this.media.radio !== 'function') return;
+    const eligible = [...this.states.values()].filter(state => this.radioEligible(state));
+    if (!eligible.length) return;
+    const due = Math.min(...eligible.map(state => state.radio.retryAt));
+    this.radioTimer = setTimeout(() => {
+      this.radioTimer = null;
+      this.startRadioBatch();
+    }, Math.max(0, due - Date.now()));
+    this.radioTimer.unref?.();
+  }
+
+  startRadioBatch() {
+    if (this.shuttingDown || this.radioEntry) return;
+    const states = [...this.states.values()];
+    const after = states.findIndex(state => state.guildId === this.radioLastGuild) + 1;
+    const state = [...states.slice(after), ...states.slice(0, after)].find(value => this.radioEligible(value) && value.radio.retryAt <= Date.now());
+    if (!state) { this.scheduleRadio(); return; }
+    const radio = state.radio;
+    const entry = { state, generation: radio.generation, transport: state.transport, controller: new AbortController(), promise: null };
+    this.radioEntry = entry;
+    this.radioLastGuild = state.guildId;
+    radio.loading = true;
+    radio.error = null;
+    this.changed(state);
+    const current = () => !this.shuttingDown && !entry.controller.signal.aborted && radio.active
+      && radio.generation === entry.generation && state.transport === entry.transport && !state.paused;
+    entry.promise = Promise.resolve().then(async () => {
+      entry.controller.signal.throwIfAborted();
+      const candidates = await this.media.radio(structuredClone(radio.seed), { signal: entry.controller.signal,
+        limit: RADIO_BATCH_SIZE, exclude: structuredClone(this.radioExclusions(state)), continuation: structuredClone(radio.continuation) });
+      if (!current()) return;
+      // Manual requests can arrive while discovery runs. Recheck against the
+      // current queue and reserve the whole batch synchronously before saving.
+      if (this.capacity(state.guildId) < RADIO_BATCH_SIZE) return;
+      const excluded = new Set(this.radioExclusions(state).flatMap(item => this.radioKeys(item)));
+      const batch = [];
+      for (const track of Array.isArray(candidates) ? candidates : []) {
+        if (!radioDescriptor(track) || !track.title.trim() || !['youtube', 'spotify'].includes(track.source)
+          || track.validation?.status === 'unavailable' || (track.durationSec != null && (!Number.isFinite(track.durationSec) || track.durationSec <= 0 || track.durationSec > 3600))) continue;
+        const keys = radioTrackKeys(track);
+        if (!keys.length || keys.some(key => excluded.has(key))) continue;
+        for (const key of keys) excluded.add(key);
+        batch.push(this.initializeValidation({ ...structuredClone(track), id: randomUUID(), requestedBy: { ...radio.requestedBy }, radio: true }));
+        if (batch.length === RADIO_BATCH_SIZE) break;
+      }
+      if (batch.length !== RADIO_BATCH_SIZE) throw new MediaError('Radio could not find 10 new songs yet. It will try again shortly.', 'RADIO_INCOMPLETE');
+      state.tracks.push(...batch);
+      for (const track of batch) this.rememberRadio(state, track);
+      radio.continuation = radioDescriptor(batch.at(-1));
+      radio.attempts = 0;
+      radio.retryAt = 0;
+      radio.error = null;
+      this.clearIdle(state);
+      await this.persist();
+      if (!current()) return;
+      this.changed(state);
+      this.schedule(state);
+    }).catch(error => {
+      if (!current()) return;
+      radio.attempts++;
+      radio.retryAt = Date.now() + this.radioRetryMs[Math.min(radio.attempts - 1, this.radioRetryMs.length - 1)];
+      radio.error = 'Radio could not add the next 10 songs. It will try again shortly.';
+      this.logFailure('radio-fill', error, 'RADIO_UNAVAILABLE');
+    }).finally(() => {
+      if (this.radioEntry === entry) this.radioEntry = null;
+      if (radio.generation === entry.generation) radio.loading = false;
+      this.changed(state);
+      this.scheduleRadio();
+    });
+  }
+
   clearIdle(state) {
     clearTimeout(state.idleTimer);
     state.idleTimer = null;
@@ -283,9 +483,10 @@ export class MusicManager extends EventEmitter {
       this.changed(state);
     }
     this.syncPreloads();
+    this.scheduleRadio();
     if (!state.transport || state.nowPlaying) return;
     if (!state.tracks.length) {
-      if (!state.idleTimer && this.idleDisconnectMs > 0) {
+      if (!state.radio.active && !state.idleTimer && this.idleDisconnectMs > 0) {
         state.idleTimer = setTimeout(() => {
           state.idleTimer = null;
           if (!state.nowPlaying && !state.tracks.length) this.detach(state.guildId, true);
@@ -314,6 +515,7 @@ export class MusicManager extends EventEmitter {
     state.opening = true;
     state.paused = false;
     const track = state.nowPlaying;
+    this.rememberRadio(state, track);
     this.validationAttempts.delete(track.id);
     const cached = state.preloads.get(track.id);
     const usePreload = cached?.status === 'ready' && !cached.opened.stream.destroyed && cached.expiresAt > Date.now() && state.retryingTrackId !== track.id;
@@ -399,6 +601,7 @@ export class MusicManager extends EventEmitter {
         for (const key of ['title', 'artist', 'durationSec', 'thumbnail', 'needsValidation', 'playbackMapping', 'validation']) {
           if (Object.hasOwn(opened.track, key)) track[key] = opened.track[key];
         }
+        this.rememberRadio(state, track);
         this.persistBackground(state);
       }
       state.opened = opened;
@@ -810,12 +1013,15 @@ export class MusicManager extends EventEmitter {
 
   changed(state) {
     this.emit('change', state.guildId, this.snapshot(state.guildId));
+    this.scheduleRadio();
   }
 
   persist() {
     const guilds = {};
     for (const [id, state] of this.states) {
       guilds[id] = { tracks: state.tracks, nowPlaying: state.nowPlaying, volumePercent: state.volumePercent };
+      if (state.radio.seed) guilds[id].radio = { active: state.radio.active, seed: state.radio.seed,
+        requestedBy: state.radio.requestedBy, history: state.radio.history, continuation: state.radio.continuation };
     }
     // Capture now, then serialize writes: a delayed older write cannot overwrite a newer queue.
     const body = JSON.stringify({ version: 1, guilds }, null, 2);
@@ -842,6 +1048,9 @@ export class MusicManager extends EventEmitter {
     clearTimeout(this.validationTimer);
     this.validationTimer = null;
     this.cancelValidation();
+    clearTimeout(this.radioTimer);
+    this.radioTimer = null;
+    for (const state of this.states.values()) this.cancelRadio(state);
     this.syncPreloads();
     for (const state of this.states.values()) {
       if (state.nowPlaying) state.tracks.unshift(state.nowPlaying);

@@ -17,6 +17,8 @@ const commands = [
     .addStringOption(option => option.setName('query').setDescription('Song name, or a Spotify/YouTube track or playlist URL').setRequired(true).setMaxLength(500)),
   new SlashCommandBuilder().setName('volume').setDescription('Show or change the bot volume for this server')
     .addIntegerOption(option => option.setName('percent').setDescription('Volume from 0 (muted) to 100 (original level)').setMinValue(0).setMaxValue(100)),
+  new SlashCommandBuilder().setName('radio').setDescription('Keep adding similar songs in batches of 10')
+    .addStringOption(option => option.setName('query').setDescription('Seed song or link; leave blank to use the current song').setMaxLength(500)),
   ...[
     ['queue', 'Show the current song and waiting queue'],
     ['join', 'Join your voice channel and continue the queue'],
@@ -24,6 +26,7 @@ const commands = [
     ['shuffle', 'Shuffle waiting songs without interrupting the current track'],
     ['pause', 'Pause playback'],
     ['resume', 'Resume playback'],
+    ['radio-stop', 'Stop radio and remove its waiting songs, keeping manual requests'],
     ['stop', 'Stop playback and clear the queue'],
     ['leave', 'Leave voice and save the queue for later'],
     ['portal', 'Open the song request website'],
@@ -62,9 +65,15 @@ export function createBot({ config, media, metrics, logger = console }, dependen
   const client = dependencies.client ?? new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
   const music = dependencies.music ?? new MusicManager({ media, dataDir: config.dataDir, maxQueueSize: config.maxQueueSize, idleDisconnectMs: config.idleDisconnectMs, logger });
   const locks = new Map();
+  const radioRequests = new Map();
   let ready = false;
   let closing = false;
   let queuesRestored = false;
+
+  function cancelRadioRequest(guildId) {
+    const pending = radioRequests.get(guildId);
+    if (pending) { radioRequests.delete(guildId); pending.abort(musicError('Radio settings changed. Try again.', 409)); }
+  }
 
   function locked(guildId, operation) {
     const result = (locks.get(guildId) || Promise.resolve()).catch(() => {}).then(operation);
@@ -236,6 +245,7 @@ export function createBot({ config, media, metrics, logger = console }, dependen
     async shutdown() {
       closing = true;
       ready = false;
+      for (const guildId of radioRequests.keys()) cancelRadioRequest(guildId);
       try {
         // In-flight connections must finish their closing check before final persistence.
         await Promise.allSettled([...locks.values()]);
@@ -359,6 +369,52 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         };
       });
     },
+    async radio(guildId, userId, action, query, channelId, { signal } = {}) {
+      signal?.throwIfAborted();
+      if (!['start', 'stop'].includes(action)) throw musicError('Choose start or stop for radio.');
+      if (query !== undefined && (action !== 'start' || typeof query !== 'string' || !query.trim() || query.length > 500)) {
+        throw musicError('Choose one seed song or leave the song blank to use the current track.');
+      }
+      const authorize = identity => {
+        const snapshot = music.snapshot(guildId);
+        if (action === 'start' && !snapshot.channelId) {
+          authorizeJoin({ manager: identity.manager, voiceChannelId: identity.member.voice.channelId,
+            targetChannelId: channelId || identity.member.voice.channelId, snapshot });
+        } else authorizeControl({ manager: identity.manager, userId, voiceChannelId: identity.member.voice.channelId, snapshot, action: 'radio' });
+      };
+      const identity = await membership(guildId, userId);
+      signal?.throwIfAborted();
+      authorize(identity);
+      cancelRadioRequest(guildId);
+      const controller = new AbortController();
+      radioRequests.set(guildId, controller);
+      const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+      try {
+        let seed;
+        if (query !== undefined) {
+          const tracks = await media.resolve(query.trim(), { signal: requestSignal, maxTracks: 1 });
+          requestSignal.throwIfAborted();
+          if (tracks.import || tracks.length !== 1) throw musicError('Radio needs one seed song, not a playlist.');
+          seed = media.preflight ? await media.preflight(tracks[0], { signal: requestSignal }) : tracks[0];
+        }
+        return await locked(guildId, async () => {
+          requestSignal.throwIfAborted();
+          const currentIdentity = await membership(guildId, userId);
+          requestSignal.throwIfAborted();
+          authorize(currentIdentity);
+          if (action === 'stop') return music.stopRadio(guildId);
+          seed ??= music.snapshot(guildId).nowPlaying;
+          if (!seed) throw musicError('Play a song first, or provide a seed song for radio.', 409);
+          const snapshot = music.snapshot(guildId);
+          if (!snapshot.channelId || channelId && channelId !== snapshot.channelId) await joinAs(currentIdentity, channelId, { signal: requestSignal });
+          requestSignal.throwIfAborted();
+          // Station lifetime is independent of this HTTP request once committed.
+          return music.startRadio(guildId, seed, { id: userId, username: currentIdentity.member.displayName });
+        });
+      } finally {
+        if (radioRequests.get(guildId) === controller) radioRequests.delete(guildId);
+      }
+    },
     async setVolume(guildId, userId, volumePercent, { signal } = {}) {
       signal?.throwIfAborted();
       return locked(guildId, async () => {
@@ -378,6 +434,7 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         const { member, manager } = await membership(guildId, userId);
         const snapshot = music.snapshot(guildId);
         authorizeControl({ manager, userId, voiceChannelId: member.voice.channelId, snapshot, action, trackId });
+        if (['stop', 'leave'].includes(action)) cancelRadioRequest(guildId);
         return music.control(guildId, action, trackId);
       });
     },
@@ -421,6 +478,15 @@ export function createBot({ config, media, metrics, logger = console }, dependen
           content = `Volume${percent === null ? '' : ' set to'}: **${state.volumePercent}%**.`;
           break;
         }
+        case 'radio': {
+          const state = await api.radio(guildId, userId, 'start', interaction.options.getString('query') ?? undefined);
+          content = `Radio started from **${safeText(state.radio.seed.title)}**. Adds 10 similar songs at a time; manual requests play first. Use /radio-stop to stop adding songs and remove waiting radio picks.`;
+          break;
+        }
+        case 'radio-stop':
+          await api.radio(guildId, userId, 'stop');
+          content = 'Radio stopped. The current song and manual requests are kept.';
+          break;
         case 'portal':
           await api.context(guildId, userId);
           content = `Request songs and manage the queue: ${config.publicUrl}/?guild=${guildId}`;
