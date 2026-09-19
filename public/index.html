@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#eee7d8">
   <meta name="description" content="Request songs and playlists from Spotify or YouTube for your Discord voice channel.">
   <title>Turntable — Discord music queue</title>
-  <link rel="stylesheet" href="/styles.css?v=activity-1">
-  <script src="/app.js?v=activity-1" defer></script>
+  <link rel="stylesheet" href="/styles.css?v=view-tabs-1">
+  <script src="/app.js?v=view-tabs-1" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to player</a>
@@ -16,9 +16,13 @@
     <a class="brand" href="/" aria-label="Turntable home"><span class="brand-mark" aria-hidden="true">TT</span><span>Turntable</span></a>
     <div class="theme-controls"><span class="theme-label">PLAYER STYLE</span><div class="theme-switch" role="group" aria-label="Player appearance"><button type="button" data-theme-choice="cassette" aria-pressed="true">Cassette</button><button type="button" data-theme-choice="winamp" aria-pressed="false">Winamp</button></div><button id="cassette-mode-toggle" class="cassette-mode-toggle" type="button" aria-pressed="false">Dark mode</button></div>
   </header>
-  <div class="status-strip"><span class="connection"><i id="status-dot" class="status-dot" aria-hidden="true"></i><span id="connection-status">CONNECTING</span></span><span id="demo-badge" class="demo-badge" hidden>DEMO · NO AUDIO</span><button id="developer-button" class="text-button developer-button" type="button" aria-controls="developer-view" aria-expanded="false" hidden>Developer</button><a id="invite-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Add to server ↗</a></div>
+  <div class="status-strip"><span class="connection"><i id="status-dot" class="status-dot" aria-hidden="true"></i><span id="connection-status">CONNECTING</span></span><span id="demo-badge" class="demo-badge" hidden>DEMO · NO AUDIO</span><a id="invite-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Add to server ↗</a></div>
   <div class="notice" id="setup-notice" hidden><strong id="notice-title"></strong><p id="notice-description"></p></div>
   <div class="feedback" id="feedback" role="status" aria-live="polite" hidden></div>
+  <div class="view-tabs" id="view-tabs" role="tablist" aria-label="View" hidden>
+    <button id="player-tab" type="button" role="tab" aria-controls="main-content" aria-selected="true">Player</button>
+    <button id="developer-button" type="button" role="tab" aria-controls="developer-view" aria-selected="false" tabindex="-1" hidden>Developer</button>
+  </div>
 
   <main class="workspace" id="main-content" tabindex="-1">
     <section class="player-window window" aria-label="Current playback">
@@ -94,8 +98,8 @@
       </div>
     </details>
   </main>
-  <section class="developer-view window" id="developer-view" aria-labelledby="developer-heading" hidden>
-    <header class="developer-heading"><div><span class="developer-kicker">DEVELOPER</span><h2 id="developer-heading" tabindex="-1">Activity</h2></div><button class="small-button" id="developer-back" type="button">Back to player</button></header>
+  <section class="developer-view window" id="developer-view" role="tabpanel" aria-labelledby="developer-button" hidden>
+    <header class="developer-heading"><div><span class="developer-kicker">DEVELOPER</span><h2 id="developer-heading">Activity</h2></div></header>
     <div class="developer-body">
       <div class="activity-filters" role="group" aria-label="Activity filters">
         <label>Server<select id="activity-guild"><option value="">All servers</option></select></label>

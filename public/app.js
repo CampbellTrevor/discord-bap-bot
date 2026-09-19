@@ -293,9 +293,15 @@ function clearActivity() {
   $('activity-older').disabled = true;
   $('activity-refresh').disabled = false;
   $('developer-view').hidden = true;
+  $('view-tabs').hidden = true;
   $('developer-button').hidden = true;
-  $('developer-button').setAttribute('aria-expanded', 'false');
+  $('developer-button').setAttribute('aria-selected', 'false');
+  $('developer-button').tabIndex = -1;
+  $('player-tab').setAttribute('aria-selected', 'true');
+  $('player-tab').tabIndex = 0;
   $('main-content').hidden = false;
+  $('main-content').removeAttribute('role');
+  $('main-content').removeAttribute('aria-labelledby');
 }
 
 function syncActivity() {
@@ -304,10 +310,22 @@ function syncActivity() {
     clearActivity();
     state.activity.context = context;
   }
+  const developerSelected = Boolean(context && state.activity.open);
+  $('view-tabs').hidden = !context;
   $('developer-button').hidden = !context;
-  $('developer-button').setAttribute('aria-expanded', String(Boolean(context && state.activity.open)));
-  $('developer-view').hidden = !context || !state.activity.open;
-  $('main-content').hidden = Boolean(context && state.activity.open);
+  for (const [id, selected] of [['player-tab', !developerSelected], ['developer-button', developerSelected]]) {
+    $(id).setAttribute('aria-selected', String(selected));
+    $(id).tabIndex = selected ? 0 : -1;
+  }
+  $('developer-view').hidden = !developerSelected;
+  $('main-content').hidden = developerSelected;
+  if (context) {
+    $('main-content').setAttribute('role', 'tabpanel');
+    $('main-content').setAttribute('aria-labelledby', 'player-tab');
+  } else {
+    $('main-content').removeAttribute('role');
+    $('main-content').removeAttribute('aria-labelledby');
+  }
 }
 
 function activityOptions(id, entries, label) {
@@ -1190,18 +1208,25 @@ $('performance-panel').addEventListener('toggle', () => {
   if ($('performance-panel').open) void pollPerformance(true);
   else cancelPerformance();
 });
-$('developer-button').addEventListener('click', () => {
+function selectView(developer) {
   if (!developerContext()) return;
-  if (state.activity.open) { clearActivity(); syncActivity(); return; }
-  state.activity.open = true;
+  if (state.activity.open === developer) return;
+  cancelActivity();
+  state.activity.open = developer;
   syncActivity();
-  $('developer-heading').focus();
-  void loadActivity();
-});
-$('developer-back').addEventListener('click', () => {
-  clearActivity();
-  syncActivity();
-  $('developer-button').focus();
+  if (developer) void loadActivity();
+}
+$('player-tab').addEventListener('click', () => selectView(false));
+$('developer-button').addEventListener('click', () => selectView(true));
+$('view-tabs').addEventListener('keydown', event => {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key) || !developerContext()) return;
+  const tabs = [$('player-tab'), $('developer-button')];
+  const current = tabs.indexOf(event.target);
+  if (current < 0) return;
+  event.preventDefault();
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? 1 : 1 - current;
+  tabs[next].focus();
+  selectView(next === 1);
 });
 for (const id of ['activity-guild', 'activity-user', 'activity-source', 'activity-status']) {
   $(id).addEventListener('change', () => { void loadActivity(); });

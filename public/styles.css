@@ -109,8 +109,19 @@
 :root[data-theme=cassette][data-cassette-mode=dark] .radio-control{color:#f4e4cd}:root[data-theme=cassette][data-cassette-mode=dark] .radio-button{background:#252923;color:#f4e4cd;border-color:#aa764f}:root[data-theme=cassette][data-cassette-mode=dark] .radio-button:hover:not(:disabled){background:#363f31}:root[data-theme=cassette][data-cassette-mode=dark] .radio-button[aria-pressed=true]{background:#ecba83;color:#26291f;border-color:#ecba83}:root[data-theme=cassette][data-cassette-mode=dark] .radio-button[aria-pressed=true]:hover:not(:disabled){background:#f9cd9b}:root[data-theme=cassette][data-cassette-mode=dark] .queue-radio{color:#e1c296;border-color:#927d58}
 [data-theme=winamp] .radio-control{gap:9px;margin-top:8px;padding:0 2px;color:#24392d}[data-theme=winamp] .radio-copy{font-size:9px}[data-theme=winamp] .radio-detail{font-size:8px}[data-theme=winamp] .radio-button{padding:5px 8px;min-height:26px;font-size:9px;border:2px solid;border-color:#f7f8f2 #64706e #64706e #f7f8f2;background:#c2c8c1;color:#1c3434}[data-theme=winamp] .radio-button[aria-pressed=true]{border-color:#64706e #f7f8f2 #f7f8f2 #64706e;background:#aaba99;color:#183020}[data-theme=winamp] .radio-button:hover:not(:disabled){background:#d0d6cb;color:#1c3434}[data-theme=winamp] .queue-radio{margin-top:4px;color:#d4c390;border-color:#8e8058;font-size:8px;padding:1px 4px}
 @media(max-width:700px){.radio-control{gap:9px}.radio-copy{font-size:9px}.radio-detail{font-size:8px}.radio-button{min-height:32px}[data-theme=winamp] .radio-copy{font-size:8px}[data-theme=winamp] .radio-button{min-height:30px}}
-.status-strip .developer-button{margin-left:auto;font-size:9px;white-space:nowrap;min-height:30px}
-.status-strip .developer-button:not([hidden])+a{margin-left:0}
+.view-tabs{display:flex;align-items:flex-end;gap:5px;margin:8px 0 0;border-bottom:2px solid var(--ink)}
+.view-tabs [role=tab]{position:relative;margin-bottom:-2px;min-height:38px;padding:10px 22px;border:1px solid #b8ae99;border-bottom:2px solid var(--ink);border-radius:4px 4px 0 0;background:#ddd4c2;color:#70654f;font:bold 11px var(--mono)}
+.view-tabs [role=tab]:hover{background:#e8dfce;color:var(--ink)}
+.view-tabs [role=tab][aria-selected=true]{background:var(--paper);color:var(--ink);border:2px solid var(--ink);border-bottom-color:var(--paper);padding:9px 21px 10px}
+.view-tabs [role=tab]:focus-visible{outline-offset:-6px;z-index:1}
+:root[data-theme=cassette][data-cassette-mode=dark] .view-tabs [role=tab]{background:#292c25;color:#b9ad97;border-color:#6e644f;border-bottom-color:var(--ink)}
+:root[data-theme=cassette][data-cassette-mode=dark] .view-tabs [role=tab]:hover{background:#383c31;color:var(--ink)}
+:root[data-theme=cassette][data-cassette-mode=dark] .view-tabs [role=tab][aria-selected=true]{background:var(--paper);color:var(--ink);border-color:var(--ink);border-bottom-color:var(--paper)}
+[data-theme=winamp] .view-tabs{gap:3px;margin:7px 0 0;border-bottom-color:#edf0e7}
+[data-theme=winamp] .view-tabs [role=tab]{min-height:29px;padding:6px 16px;border:2px solid;border-color:#dce3d8 #586964 #edf0e7 #dce3d8;border-radius:0;background:#91a09a;color:#1c3434;font-size:10px}
+[data-theme=winamp] .view-tabs [role=tab]:hover{background:#c0cabe}
+[data-theme=winamp] .view-tabs [role=tab][aria-selected=true]{padding:8px 16px 6px;background:#bfc4c3;color:#152022;border-color:#f0f2e9 #64706e #bfc4c3 #f0f2e9}
+@media(max-width:700px){.view-tabs{margin-top:4px}.view-tabs [role=tab]{padding-left:17px;padding-right:17px}.view-tabs [role=tab][aria-selected=true]{padding-left:16px;padding-right:16px}}
 .developer-view{--activity-muted:#776b57;--activity-line:#c4baa6;--activity-surface:#eee7d8;--activity-success:#435d34;--activity-error:#993f29;background:var(--paper);border:1px solid #b8ae99;margin-top:12px;color:var(--ink);min-width:0}
 .developer-heading{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:22px 24px;border-bottom:1px solid var(--activity-line)}
 .developer-kicker{display:block;color:var(--activity-muted);font:bold 9px var(--mono);letter-spacing:1px;margin-bottom:6px}
