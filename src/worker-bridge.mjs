@@ -1,6 +1,8 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import { MediaError } from './media.mjs';
+import { validateActivityFilters } from './command-activity.mjs';
+import { runWebCommand } from './web-command.mjs';
 
 const VERSION = 1;
 const WORKER_PATH = '/internal/worker';
@@ -11,7 +13,7 @@ const REQUEST_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12
 const ACTIONS = new Set(['skip', 'pause', 'resume', 'stop', 'leave', 'remove', 'shuffle', 'move-top']);
 const SESSION_ID = /^[A-Za-z0-9_-]{32,128}$/;
 const SESSION_METHODS = new Set(['sessionGet', 'sessionSet', 'sessionTake', 'sessionDestroy']);
-const METHODS = new Set(['listGuilds', 'detail', 'performance', 'search', 'request', 'join', 'control', 'setVolume', 'radio', ...SESSION_METHODS]);
+const METHODS = new Set(['listGuilds', 'detail', 'performance', 'developerAccess', 'developerActivity', 'search', 'request', 'join', 'control', 'setVolume', 'radio', ...SESSION_METHODS]);
 const MUTATIONS = new Set(['request', 'join', 'control', 'setVolume', 'radio']);
 const STATUSES = new Set([400, 403, 404, 409, 429, 503]);
 const MEDIA_CODES = new Set([
@@ -56,6 +58,8 @@ const PUBLIC_MESSAGES = new Set([
   'Unknown playback action.',
   'Only a server manager or DJ can view host performance.',
   'Host performance is temporarily unavailable.',
+  'Developer access is required.',
+  'Command activity is temporarily unavailable.',
   'Volume must be a whole number from 0 to 100.',
   'Choose start or stop for radio.',
   'Choose one seed song or leave the song blank to use the current track.',
@@ -175,7 +179,11 @@ function validArguments(method, args) {
   if (!METHODS.has(method) || !Array.isArray(args)) return false;
   if (SESSION_METHODS.has(method)) return typeof args[0] === 'string' && SESSION_ID.test(args[0])
     && (method === 'sessionSet' ? args.length === 2 && validSessionRecord(args[1]) : args.length === 1);
-  if (method === 'listGuilds') return args.length === 1 && typeof args[0] === 'string' && ID.test(args[0]);
+  if (method === 'listGuilds' || method === 'developerAccess') return args.length === 1 && typeof args[0] === 'string' && ID.test(args[0]);
+  if (method === 'developerActivity') {
+    if (args.length !== 2 || typeof args[0] !== 'string' || !ID.test(args[0])) return false;
+    try { validateActivityFilters(args[1]); return true; } catch { return false; }
+  }
   if (args.length < 2 || !args.slice(0, 2).every(value => typeof value === 'string' && ID.test(value))) return false;
   const optionalId = value => value === null || value === undefined || typeof value === 'string' && ID.test(value);
   const query = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 500 && !/[\u0000-\u001f\u007f]/u.test(value);
@@ -356,6 +364,8 @@ export function createWorkerBridge({ secret, logger = console, trustProxy = fals
     listGuilds: (userId, options) => rpc('listGuilds', [userId], options),
     detail: (guildId, userId, options) => rpc('detail', [guildId, userId], options),
     performance: (guildId, userId, options) => rpc('performance', [guildId, userId], options),
+    developerAccess: (userId, options) => rpc('developerAccess', [userId], options),
+    developerActivity: (userId, filters = {}, options) => rpc('developerActivity', [userId, filters], options),
     search: (guildId, userId, query, source = 'youtube', options) => rpc('search', [guildId, userId, query, source], options),
     request: (guildId, userId, query, channelId, options) => rpc('request', [guildId, userId, query, channelId ?? null], options),
     join: (guildId, userId, channelId, options) => rpc('join', [guildId, userId, channelId ?? null], options),
@@ -496,23 +506,26 @@ export function connectWorker({ url, secret, bot, sessionStorage, spotifyEnabled
       }, ['request', 'radio'].includes(method) ? requestTimeout : readTimeout);
       timeout.unref?.();
       try {
-        let result;
-        // No caller-controlled property dispatch or deserialized cancellation object.
-        switch (method) {
-          case 'listGuilds': result = await bot.listGuilds(args[0]); break;
-          case 'detail': result = await bot.detail(args[0], args[1]); break;
-          case 'performance': result = await bot.performance(args[0], args[1]); break;
-          case 'search': result = await bot.search(args[0], args[1], args[2], args[3], { signal: controller.signal }); break;
-          case 'request': result = await bot.request(args[0], args[1], args[2], args[3] ?? undefined, { signal: controller.signal }); break;
-          case 'join': result = await bot.join(args[0], args[1], args[2] ?? undefined); break;
-          case 'control': result = await bot.control(args[0], args[1], args[2], args[3] ?? undefined); break;
-          case 'setVolume': result = await bot.setVolume(args[0], args[1], args[2], { signal: controller.signal }); break;
-          case 'radio': result = await bot.radio(args[0], args[1], args[2], args[3] ?? undefined, args[4] ?? undefined, { signal: controller.signal }); break;
-          case 'sessionGet': result = await sessionStorage.get(args[0]); break;
-          case 'sessionSet': result = await sessionStorage.set(args[0], args[1]); break;
-          case 'sessionTake': result = await sessionStorage.take(args[0]); break;
-          case 'sessionDestroy': result = await sessionStorage.destroy(args[0]); break;
-        }
+        const result = await runWebCommand(bot, method, args, async () => {
+          // No caller-controlled property dispatch or deserialized cancellation object.
+          switch (method) {
+            case 'listGuilds': return bot.listGuilds(args[0]);
+            case 'detail': return bot.detail(args[0], args[1]);
+            case 'performance': return bot.performance(args[0], args[1]);
+            case 'developerAccess': return bot.developerAccess(args[0]);
+            case 'developerActivity': return bot.developerActivity(args[0], args[1]);
+            case 'search': return bot.search(args[0], args[1], args[2], args[3], { signal: controller.signal });
+            case 'request': return bot.request(args[0], args[1], args[2], args[3] ?? undefined, { signal: controller.signal });
+            case 'join': return bot.join(args[0], args[1], args[2] ?? undefined);
+            case 'control': return bot.control(args[0], args[1], args[2], args[3] ?? undefined);
+            case 'setVolume': return bot.setVolume(args[0], args[1], args[2], { signal: controller.signal });
+            case 'radio': return bot.radio(args[0], args[1], args[2], args[3] ?? undefined, args[4] ?? undefined, { signal: controller.signal });
+            case 'sessionGet': return sessionStorage.get(args[0]);
+            case 'sessionSet': return sessionStorage.set(args[0], args[1]);
+            case 'sessionTake': return sessionStorage.take(args[0]);
+            case 'sessionDestroy': return sessionStorage.destroy(args[0]);
+          }
+        });
         if (sessionCall && !validSessionResult(method, result)) throw sessionUnavailable();
         if (!task.cancelled) reply(id, result);
       } catch (error) {

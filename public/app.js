@@ -18,6 +18,7 @@ const state = {
   feedbackTimer: null,
   search: { query: '', source: 'youtube', results: [], pending: false, revision: 0, controller: null, cache: new Map(), added: new Set(), context: '' },
   performance: { context: '', revision: 0, controller: null, pending: false, lastAttempt: 0, blockedContext: '', snapshot: null },
+  activity: { context: '', open: false, revision: 0, controller: null, pending: false, cursors: [''], page: 0, nextCursor: null, guilds: [], users: [] },
 };
 
 function directRequest(query) {
@@ -262,8 +263,172 @@ function appendText(parent, tag, className, value) {
   return node;
 }
 
+function developerContext() {
+  return state.session?.user?.id && state.session.developer === true && !state.session.demo && !state.offline
+    ? state.session.user.id : '';
+}
+
+function cancelActivity() {
+  state.activity.revision++;
+  state.activity.controller?.abort();
+  state.activity.controller = null;
+  state.activity.pending = false;
+  $('developer-view').setAttribute('aria-busy', 'false');
+}
+
+function clearActivity() {
+  cancelActivity();
+  Object.assign(state.activity, { open: false, cursors: [''], page: 0, nextCursor: null, guilds: [], users: [] });
+  $('activity-events').replaceChildren();
+  $('activity-guild').replaceChildren(new Option('All servers', ''));
+  $('activity-user').replaceChildren(new Option('All users', ''));
+  $('activity-source').value = '';
+  $('activity-status').value = '';
+  $('activity-summary').textContent = '';
+  $('activity-summary').classList.remove('error');
+  $('activity-empty').hidden = true;
+  $('activity-retention').textContent = '30 days · Recorded from this release';
+  $('activity-page').textContent = 'Page 1';
+  $('activity-newer').disabled = true;
+  $('activity-older').disabled = true;
+  $('activity-refresh').disabled = false;
+  $('developer-view').hidden = true;
+  $('developer-button').hidden = true;
+  $('developer-button').setAttribute('aria-expanded', 'false');
+  $('main-content').hidden = false;
+}
+
+function syncActivity() {
+  const context = developerContext();
+  if (state.activity.context !== context) {
+    clearActivity();
+    state.activity.context = context;
+  }
+  $('developer-button').hidden = !context;
+  $('developer-button').setAttribute('aria-expanded', String(Boolean(context && state.activity.open)));
+  $('developer-view').hidden = !context || !state.activity.open;
+  $('main-content').hidden = Boolean(context && state.activity.open);
+}
+
+function activityOptions(id, entries, label) {
+  const select = $(id), selected = select.value;
+  select.replaceChildren(new Option(label, ''));
+  for (const entry of entries) {
+    if (typeof entry?.id !== 'string') continue;
+    select.append(new Option(`${entry.name || entry.id} (${entry.id})`, entry.id));
+  }
+  // Keep an active filter even when its last matching event has expired.
+  if (selected && !entries.some(entry => entry.id === selected)) select.append(new Option(selected, selected));
+  select.value = selected;
+}
+
+function renderActivity(events) {
+  const body = $('activity-events');
+  body.replaceChildren();
+  for (const event of events) {
+    const row = document.createElement('tr');
+    const timestamp = new Date(event.timestamp);
+    const timeCell = appendText(row, 'td', 'activity-time', '');
+    const time = appendText(timeCell, 'time', '', Number.isFinite(timestamp.getTime()) ? timestamp.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Unknown');
+    if (Number.isFinite(timestamp.getTime())) { time.dateTime = timestamp.toISOString(); time.title = timestamp.toISOString(); }
+    const identity = appendText(row, 'td', 'activity-identity', '');
+    appendText(identity, 'strong', '', event.guildName || event.guildId || 'No server');
+    appendText(identity, 'small', '', event.guildId || '');
+    appendText(identity, 'span', 'activity-user-name', event.userName || event.userId || 'Unknown user');
+    appendText(identity, 'small', '', event.userId || '');
+    appendText(row, 'td', 'activity-source', event.source === 'discord' ? 'Discord' : event.source === 'web' ? 'Web app' : 'Unknown');
+    const action = appendText(row, 'td', 'activity-action', '');
+    appendText(action, 'strong', '', `${event.source === 'discord' ? '/' : ''}${event.command || 'Unknown'}`);
+    if (event.parameters && typeof event.parameters === 'object') {
+      const parameters = appendText(action, 'dl', 'activity-parameters', '');
+      for (const [name, value] of Object.entries(event.parameters)) {
+        appendText(parameters, 'dt', '', name);
+        appendText(parameters, 'dd', '', typeof value === 'string' ? value : JSON.stringify(value));
+      }
+    }
+    const result = appendText(row, 'td', 'activity-result', '');
+    const status = ['success', 'error', 'cancelled'].includes(event.status) ? event.status : 'unknown';
+    appendText(result, 'span', `activity-result-label activity-result-${status}`, status === 'success' ? 'Success' : status === 'error' ? 'Error' : status === 'cancelled' ? 'Cancelled' : 'Unknown');
+    if (typeof event.durationMs === 'number' && Number.isFinite(event.durationMs)) appendText(result, 'small', '', `${Math.round(Math.max(0, event.durationMs)).toLocaleString()} ms`);
+    if (event.errorCode) appendText(result, 'small', 'activity-error-code', event.errorCode);
+    body.append(row);
+  }
+  $('activity-empty').hidden = events.length > 0;
+  $('activity-empty').textContent = ['activity-guild', 'activity-user', 'activity-source', 'activity-status'].some(id => $(id).value)
+    ? 'No commands match these filters.' : 'No commands recorded yet.';
+}
+
+async function loadActivity({ page = 0, cursor = '' } = {}) {
+  syncActivity();
+  const activity = state.activity, context = developerContext();
+  if (!context || !activity.open) return;
+  cancelActivity();
+  const revision = activity.revision;
+  const controller = new AbortController();
+  activity.controller = controller;
+  activity.pending = true;
+  const current = () => revision === activity.revision && context === developerContext() && activity.open;
+  const query = new URLSearchParams({ limit: '50' });
+  if (page === 0) { activity.cursors = ['']; activity.page = 0; activity.nextCursor = null; }
+  for (const [field, id] of [['guildId', 'activity-guild'], ['userId', 'activity-user'], ['source', 'activity-source'], ['status', 'activity-status']]) {
+    if ($(id).value) query.set(field, $(id).value);
+  }
+  if (cursor) query.set('cursor', cursor);
+  $('developer-view').setAttribute('aria-busy', 'true');
+  $('activity-events').replaceChildren();
+  $('activity-empty').hidden = true;
+  $('activity-summary').textContent = 'Loading activity…';
+  $('activity-summary').classList.remove('error');
+  $('activity-refresh').disabled = true;
+  $('activity-newer').disabled = true;
+  $('activity-older').disabled = true;
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const payload = await api(`/api/developer/activity?${query}`, { signal: controller.signal });
+    if (!current()) return;
+    if (!Array.isArray(payload.events) || payload.events.length > 50 || !Array.isArray(payload.guilds) || !Array.isArray(payload.users)) throw new Error('Invalid activity response.');
+    activity.guilds = payload.guilds;
+    activity.users = payload.users;
+    activity.page = page;
+    activity.cursors = page === 0 ? [''] : activity.cursors.slice(0, page);
+    activity.cursors[page] = cursor;
+    activity.nextCursor = typeof payload.nextCursor === 'string' && payload.nextCursor ? payload.nextCursor : null;
+    activityOptions('activity-guild', payload.guilds, 'All servers');
+    activityOptions('activity-user', payload.users, 'All users');
+    renderActivity(payload.events);
+    const total = Number.isSafeInteger(payload.total) && payload.total >= 0 ? ` of ${payload.total.toLocaleString()}` : '';
+    const count = payload.events.length;
+    $('activity-summary').textContent = count ? `${(page * 50 + 1).toLocaleString()}–${(page * 50 + count).toLocaleString()}${total} commands · Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'No matching commands';
+    const days = Number.isSafeInteger(payload.retentionDays) && payload.retentionDays > 0 ? payload.retentionDays : 30;
+    $('activity-retention').textContent = `${days} days · Recorded from this release${payload.droppedEvents > 0 ? ` · ${Number(payload.droppedEvents).toLocaleString()} records dropped` : ''}`;
+    $('activity-page').textContent = `Page ${page + 1}`;
+    $('activity-table-wrap').scrollTop = 0;
+  } catch (error) {
+    if (!current()) return;
+    if (error.status === 401 || error.status === 403) {
+      state.session.developer = false;
+      syncActivity();
+      syncPerformance();
+      showFeedback(error.status === 401 ? 'Session expired. Sign in again.' : 'Developer access is unavailable for this account.', true);
+    } else {
+      $('activity-summary').textContent = 'Activity unavailable. Try refreshing.';
+      $('activity-summary').classList.add('error');
+    }
+  } finally {
+    clearTimeout(timeout);
+    if (revision === activity.revision) {
+      activity.pending = false;
+      activity.controller = null;
+      $('developer-view').setAttribute('aria-busy', 'false');
+      $('activity-refresh').disabled = false;
+      $('activity-newer').disabled = activity.page === 0;
+      $('activity-older').disabled = !activity.nextCursor;
+    }
+  }
+}
+
 function performanceContext() {
-  return state.session?.user && state.session.configured && !state.session.demo && state.guildId && state.detail?.member?.canManage === true
+  return state.session?.user && state.session.configured && !state.session.demo && state.guildId && (state.session.developer === true || state.detail?.member?.canManage === true || state.detail?.member?.canViewPerformance === true)
     ? JSON.stringify([state.session.user.id, state.guildId]) : '';
 }
 
@@ -527,6 +692,7 @@ function renderAuth() {
         try {
           await api('/auth/logout', { method: 'POST' });
           clearPerformance();
+          clearActivity();
           window.location.assign('/');
         } catch (error) {
           logout.disabled = false;
@@ -579,6 +745,7 @@ function renderSession() {
   renderPlayer();
   renderEnabled();
   syncPerformance();
+  syncActivity();
 }
 
 function renderGuildSelect() {
@@ -856,10 +1023,11 @@ async function initialize() {
   try {
     const session = await api('/api/session');
     const changedUser = state.session?.user?.id !== session.user?.id;
-    if (changedUser) { cancelSearch(); state.search.cache.clear(); state.detail = null; clearPerformance(); }
+    if (changedUser) { cancelSearch(); state.search.cache.clear(); state.detail = null; clearPerformance(); clearActivity(); }
     state.session = session;
     syncPerformance();
     state.offline = false;
+    syncActivity();
     renderAuth();
     if (session.user && session.botReady) {
       const payload = await api('/api/guilds');
@@ -1021,6 +1189,30 @@ $('volume-input').addEventListener('pointercancel', () => {
 $('performance-panel').addEventListener('toggle', () => {
   if ($('performance-panel').open) void pollPerformance(true);
   else cancelPerformance();
+});
+$('developer-button').addEventListener('click', () => {
+  if (!developerContext()) return;
+  if (state.activity.open) { clearActivity(); syncActivity(); return; }
+  state.activity.open = true;
+  syncActivity();
+  $('developer-heading').focus();
+  void loadActivity();
+});
+$('developer-back').addEventListener('click', () => {
+  clearActivity();
+  syncActivity();
+  $('developer-button').focus();
+});
+for (const id of ['activity-guild', 'activity-user', 'activity-source', 'activity-status']) {
+  $(id).addEventListener('change', () => { void loadActivity(); });
+}
+$('activity-refresh').addEventListener('click', () => { void loadActivity(); });
+$('activity-newer').addEventListener('click', () => {
+  const page = state.activity.page - 1;
+  if (page >= 0 && !state.activity.pending) void loadActivity({ page, cursor: state.activity.cursors[page] });
+});
+$('activity-older').addEventListener('click', () => {
+  if (state.activity.nextCursor && !state.activity.pending) void loadActivity({ page: state.activity.page + 1, cursor: state.activity.nextCursor });
 });
 $('now-art').referrerPolicy = 'no-referrer';
 $('now-art').addEventListener('error', () => {

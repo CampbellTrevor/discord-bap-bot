@@ -9,6 +9,24 @@ import { createDemoBot } from '../src/demo.mjs';
 import { BoundedSessionStore } from '../src/session-store.mjs';
 import { EncryptedSessionStore, FileSessionStorage } from '../src/persistent-session-store.mjs';
 
+test('combined web command audit uses session identity and records actions once without polling', async t => {
+  const bot = createDemoBot();
+  const events = [];
+  bot.auditCommand = async (event, operation) => { events.push(event); return operation(); };
+  const { request } = await fixture(t, { demo: true, bot });
+  const { csrfToken } = await (await request('/api/session')).json();
+  await request('/api/guilds');
+  await request('/api/guilds/demo-guild');
+  assert.equal(events.length, 0);
+  const response = await request('/api/guilds/demo-guild/control', {
+    method: 'POST', headers: { 'Content-Type':'application/json', 'X-CSRF-Token':csrfToken },
+    body: JSON.stringify({ action:'pause', userId:'forged', source:'discord' }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0], { source:'web', guildId:'demo-guild', userId:'demo-user', command:'pause', parameters:{trackId:undefined} });
+});
+
 test('radio API validates action/seed and uses authenticated identity, CSRF and cancellation', async t => {
   const calls = [];
   const { request, config } = await fixture(t, { demo: true, bot: { isReady: () => true,

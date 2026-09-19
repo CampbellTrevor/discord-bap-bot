@@ -5,6 +5,8 @@ import { rateLimit } from 'express-rate-limit';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { BoundedSessionStore } from './session-store.mjs';
+import { validateActivityFilters } from './command-activity.mjs';
+import { runWebCommand } from './web-command.mjs';
 
 const equal = (a, b) => {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -60,7 +62,13 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     req.session.csrfToken ||= randomBytes(32).toString('hex');
     if (config.demo) req.session.user ||= { id: 'demo-user', username: 'You', avatar: null };
     if (needsSave) await save(req);
+    let developer = false;
+    if (req.session.user && !config.setupMode && bot.isReady() && bot.developerAccess) {
+      try { developer = (await bot.developerAccess(req.session.user.id))?.allowed === true; }
+      catch { /* A disconnected worker must not expose or guess developer access. */ }
+    }
     res.json({ user: req.session.user || null, csrfToken: req.session.csrfToken, configured, botReady: !config.setupMode && bot.isReady(), demo: config.demo,
+      developer,
       spotifyEnabled: config.botRole === 'portal' ? Boolean(bot.isReady() && bot.capabilities?.().spotifyEnabled) : Boolean(config.spotifyClientId && config.spotifyClientSecret),
       inviteUrl: config.discordClientId ? `https://discord.com/oauth2/authorize?client_id=${config.discordClientId}&scope=bot%20applications.commands&permissions=36703232` : null });
   });
@@ -119,6 +127,11 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     next();
   });
   app.get('/api/guilds', async (req, res) => res.json({ guilds: await bot.listGuilds(req.session.user.id) }));
+  app.get('/api/developer/activity', limiter(30, 60000), async (req, res) => {
+    if (!bot.developerActivity) throw httpError('Developer access is required.', 403);
+    const filters = validateActivityFilters(req.query);
+    res.json(await bot.developerActivity(req.session.user.id, filters));
+  });
   app.param('guildId', (req, _res, next, id) => {
     if (!(config.demo && id === 'demo-guild') && !/^\d{17,20}$/.test(id)) return next(httpError('Invalid server.', 400));
     next();
@@ -137,27 +150,31 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
     const { query, source = 'youtube' } = req.body || {};
     if (typeof query !== 'string' || !query.trim() || query.length > 500) throw httpError('Enter a song or artist to search, up to 500 characters.', 400);
     if (!['youtube', 'spotify'].includes(source)) throw httpError('Choose YouTube or Spotify for search.', 400);
-    res.json(await withClientCancellation(req, res, signal => bot.search(req.params.guildId, req.session.user.id, query.trim(), source, { signal })));
+    const args = [req.params.guildId, req.session.user.id, query.trim(), source];
+    res.json(await runWebCommand(bot, 'search', args, () => withClientCancellation(req, res, signal => bot.search(...args, { signal }))));
   });
   const requestLimit = limiter(10, 60000);
   app.post('/api/guilds/:guildId/requests', csrf, requestLimit, async (req, res) => {
     const { query, channelId } = req.body || {};
     if (typeof query !== 'string' || !query.trim() || query.length > 500) throw httpError('Enter a song title or link, up to 500 characters.', 400);
     if (channelId !== undefined && typeof channelId !== 'string') throw httpError('Choose a voice channel.', 400);
-    const result = await withClientCancellation(req, res, signal => bot.request(req.params.guildId, req.session.user.id, query.trim(), channelId, { signal }));
+    const args = [req.params.guildId, req.session.user.id, query.trim(), channelId];
+    const result = await runWebCommand(bot, 'request', args, () => withClientCancellation(req, res, signal => bot.request(...args, { signal })));
     res.json(result.queue ? result : { queue: result });
   });
   app.post('/api/guilds/:guildId/join', csrf, requestLimit, async (req, res) => {
     const { channelId } = req.body || {};
     if (typeof channelId !== 'string' || !channelId) throw httpError('Choose a voice channel.', 400);
-    res.json({ queue: await bot.join(req.params.guildId, req.session.user.id, channelId) });
+    const args = [req.params.guildId, req.session.user.id, channelId];
+    res.json({ queue: await runWebCommand(bot, 'join', args, () => bot.join(...args)) });
   });
   app.post('/api/guilds/:guildId/volume', csrf, limiter(30, 60000), async (req, res) => {
     const { volumePercent } = req.body || {};
     if (!Number.isInteger(volumePercent) || volumePercent < 0 || volumePercent > 100) {
       throw httpError('Volume must be a whole number from 0 to 100.', 400);
     }
-    res.json({ queue: await withClientCancellation(req, res, signal => bot.setVolume(req.params.guildId, req.session.user.id, volumePercent, { signal })) });
+    const args = [req.params.guildId, req.session.user.id, volumePercent];
+    res.json({ queue: await runWebCommand(bot, 'setVolume', args, () => withClientCancellation(req, res, signal => bot.setVolume(...args, { signal }))) });
   });
   app.post('/api/guilds/:guildId/radio', csrf, limiter(15, 60000), async (req, res) => {
     const { action, query, channelId } = req.body || {};
@@ -166,14 +183,15 @@ export function createApp({ config, bot, fetchImpl = fetch, store = new BoundedS
       throw httpError('Choose one seed song or leave the song blank to use the current track.', 400);
     }
     if (channelId !== undefined && (typeof channelId !== 'string' || !channelId)) throw httpError('Choose a voice channel.', 400);
-    res.json({ queue: await withClientCancellation(req, res, signal => bot.radio(req.params.guildId, req.session.user.id,
-      action, query?.trim(), channelId, { signal })) });
+    const args = [req.params.guildId, req.session.user.id, action, query?.trim(), channelId];
+    res.json({ queue: await runWebCommand(bot, 'radio', args, () => withClientCancellation(req, res, signal => bot.radio(...args, { signal }))) });
   });
   app.post('/api/guilds/:guildId/control', csrf, limiter(30, 60000), async (req, res) => {
     const { action, trackId } = req.body || {};
     if (!['skip', 'pause', 'resume', 'stop', 'leave', 'remove', 'shuffle', 'move-top'].includes(action)) throw httpError('Unknown playback control.', 400);
     if (['remove', 'move-top'].includes(action) && (typeof trackId !== 'string' || !trackId || trackId.length > 100)) throw httpError('Choose a queued song.', 400);
-    res.json({ queue: await bot.control(req.params.guildId, req.session.user.id, action, trackId) });
+    const args = [req.params.guildId, req.session.user.id, action, trackId];
+    res.json({ queue: await runWebCommand(bot, 'control', args, () => bot.control(...args)) });
   });
   app.use('/api', (_req, _res, next) => next(httpError('API route not found.', 404)));
   app.use(express.static(fileURLToPath(new URL('../public', import.meta.url)), {

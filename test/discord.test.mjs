@@ -13,6 +13,129 @@ function deferred() {
 
 const track = { title: 'Song', artist: 'Artist', durationSec: 120, source: 'youtube', sourceUrl: 'https://www.youtube.com/watch?v=abcdefghijk' };
 
+test('shutdown drains command outcomes outside guild locks before returning to close the journal', async t => {
+  const events = [];
+  const { bot, media } = await fixture(t, { activity: { record(event) { events.push(event); } } });
+  const release = deferred(), mediaClosed = deferred();
+  media.close = async () => { mediaClosed.resolve(); };
+  const pending = bot.auditCommand({ source:'web', guildId:'guild', userId:'listener', command:'search' }, async () => {
+    await release.promise;
+    throw Object.assign(new Error('Cancelled during shutdown'), { code:'MEDIA_CANCELLED' });
+  });
+  const rejection = assert.rejects(pending, { code:'MEDIA_CANCELLED' });
+  let finished = false;
+  const shutdown = bot.shutdown().then(() => { finished = true; });
+  await mediaClosed.promise;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(finished, false);
+  release.resolve();
+  await rejection;
+  await shutdown;
+  assert.equal(events.length, 1);
+  assert.equal(events[0].status, 'cancelled');
+});
+
+test('developer activity requires the exact configured account before reading any storage or membership', async t => {
+  let reads = 0;
+  const activity = { async query(filters) { reads++; return { filters, events: [], users: [], guilds: [{ id: 'departed', name: 'Earlier server' }] }; } };
+  const { bot, member, calls, client } = await fixture(t, { activity, config: { developerDiscordUserId: 'owner' } });
+  member.permissions.has = () => true;
+  assert.deepEqual(bot.developerAccess('owner'), { allowed: true });
+  for (const user of ['Owner', 'owner ', 'manager', undefined, { toString: () => 'owner' }]) {
+    assert.deepEqual(bot.developerAccess(user), { allowed: false });
+    await assert.rejects(bot.developerActivity(user, { invalid: 'filter' }), { status: 403 });
+  }
+  assert.equal(reads, 0);
+  assert.equal(calls.memberships, 0);
+  client.guilds.cache.set('other', { id: 'other', name: 'Other server' });
+  const result = await bot.developerActivity('owner', { limit: '10' });
+  assert.deepEqual(result.guilds.map(value => value.id), ['departed', 'guild', 'other']);
+  assert.equal(result.filters.limit, 10);
+  assert.equal(calls.memberships, 0);
+  await assert.rejects(bot.developerActivity('owner', { limit: 101 }), { status: 400 });
+  assert.equal(reads, 1);
+  const disabled = await fixture(t, { activity });
+  assert.deepEqual(disabled.bot.developerAccess('owner'), { allowed: false });
+  await assert.rejects(disabled.bot.developerActivity('owner'), { status: 403 });
+});
+
+test('developer sees global host performance without membership while ordinary managers keep their server checks', async t => {
+  let reads = 0;
+  const metrics = { getSnapshot() { reads++; return { latest: { hostCpuBusyPct: 12 } }; } };
+  const { bot, calls } = await fixture(t, { metrics, config: { developerDiscordUserId: 'owner' } });
+  assert.equal((await bot.performance('server-owner-is-not-in', 'owner')).latest.hostCpuBusyPct, 12);
+  assert.equal(calls.memberships, 0);
+  assert.equal((await bot.context('guild', 'owner')).member.canViewPerformance, true);
+  assert.equal((await bot.context('guild', 'owner')).member.canManage, false);
+  assert.equal((await bot.context('guild', 'listener')).member.canViewPerformance, false);
+  await assert.rejects(bot.performance('server-owner-is-not-in', 'manager'), { status: 404 });
+  await assert.rejects(bot.performance('guild', 'listener'), { status: 403 });
+  assert.equal(reads, 1);
+});
+
+test('auditing records one outcome with cached names and safe parameters, preserving results and failures', async t => {
+  const events = [];
+  const { bot, guild, calls } = await fixture(t, { activity: { record(event) { events.push(event); } } });
+  guild.members.cache = new Map([['listener', { displayName: 'Cached Listener' }]]);
+  const input = { source: 'web', guildId: 'guild', userId: 'listener', command: 'play', parameters: { query: 'https://www.youtube.com/watch?v=abcdefghijk&token=secret', token: 'secret' } };
+  const expected = { queue: 'value' };
+  assert.equal(await bot.auditCommand(input, async () => expected), expected);
+  assert.equal(events[0].guildName, 'Listening room');
+  assert.equal(events[0].userName, 'Cached Listener');
+  assert.equal(events[0].status, 'success');
+  assert.equal(events[0].parameters.query, 'https://www.youtube.com/watch?v=abcdefghijk');
+  assert.equal(events[0].parameters.token, undefined);
+  const denied = Object.assign(new Error('private raw error'), { status: 403 });
+  await assert.rejects(bot.auditCommand(input, async () => { throw denied; }), error => error === denied);
+  assert.equal(events[1].status, 'error');
+  assert.equal(events[1].errorCode, 'HTTP_403');
+  assert.doesNotMatch(JSON.stringify(events), /private raw error|secret/);
+  const cancelled = Object.assign(new Error('cancelled'), { code: 'WORKER_CANCELLED' });
+  await assert.rejects(bot.auditCommand(input, async () => { throw cancelled; }), error => error === cancelled);
+  assert.equal(events[2].status, 'cancelled');
+  assert.equal(calls.memberships, 0);
+  assert.equal(events.length, 3);
+  const broken = await fixture(t, { activity: { record() { throw new Error('disk unavailable'); } } });
+  assert.equal(await broken.bot.auditCommand(input, async () => expected), expected);
+  await assert.rejects(broken.bot.auditCommand(input, async () => { throw denied; }), error => error === denied);
+});
+
+test('Discord read commands and denied controls are each audited once, without audit for noncommands', async t => {
+  const events = [];
+  const { client, member, music } = await fixture(t, { activity: { record(event) { events.push(event); } } });
+  const handler = client.listeners(Events.InteractionCreate)[0];
+  const invoke = commandName => handler({
+    isChatInputCommand: () => true, guildId: 'guild', user: { id: 'listener', username: 'Listener' }, commandName,
+    options: { getInteger: () => null }, deferred: true,
+    async deferReply() {}, async editReply() {},
+  });
+  await invoke('queue');
+  await invoke('portal');
+  await invoke('volume');
+  member.voice.channelId = 'elsewhere';
+  music.control = () => assert.fail('A denied control must not mutate playback');
+  await invoke('skip');
+  await handler({ isChatInputCommand: () => false });
+  assert.deepEqual(events.map(event => [event.source, event.command, event.status]), [
+    ['discord', 'queue', 'success'], ['discord', 'portal', 'success'], ['discord', 'volume', 'success'], ['discord', 'skip', 'error'],
+  ]);
+  assert.equal(events[3].errorCode, 'HTTP_403');
+});
+
+test('a Discord reply failure does not label a successfully committed command as failed', async t => {
+  const events = [];
+  const { client, music } = await fixture(t, { activity: { record(event) { events.push(event); } } });
+  let changes = 0;
+  music.control = async () => { changes++; };
+  await client.listeners(Events.InteractionCreate)[0]({
+    isChatInputCommand: () => true, guildId: 'guild', user: { id: 'listener' }, commandName: 'skip', deferred: true,
+    async deferReply() {}, async editReply() { throw new Error('Discord could not deliver reply'); },
+  });
+  assert.equal(changes, 1);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].status, 'success');
+});
+
 test('radio requires playback permission and uses the current song without requeueing it', async t => {
   const { bot, member, music, queue, calls, registered } = await fixture(t);
   queue.nowPlaying = { ...track, id: 'current', requestedBy: { id: 'listener', username: 'Listener' } };
@@ -110,7 +233,7 @@ test('move-top uses playback permissions even for a listener’s own request', a
   assert.deepEqual(calls, [['guild', 'move-top', 'queued'], ['guild', 'move-top', 'queued']]);
 });
 
-async function fixture(t, { fetchMember, metrics } = {}) {
+async function fixture(t, { fetchMember, metrics, activity, config = {} } = {}) {
   const calls = { memberships: 0, snapshots: 0, enqueues: 0, searches: 0, resolves: 0 };
   const member = { displayName: 'Listener', voice: { channelId: 'voice' }, permissions: { has: () => false }, roles: { cache: new Map() } };
   const channel = { id: 'voice', name: 'Lounge', type: ChannelType.GuildVoice, position: 0, permissionsFor: () => ({ has: () => true }) };
@@ -142,7 +265,7 @@ async function fixture(t, { fetchMember, metrics } = {}) {
     async resolve() { calls.resolves += 1; return [track]; },
   };
   const registered = [];
-  const bot = createBot({ config: { discordClientId: '123456789012345678', discordToken: 'unused-test-token' }, media, metrics, logger: { info() {}, warn() {}, error() {} } }, { client, music, rest: { async put(_route, { body }) { registered.push(...body); } } });
+  const bot = createBot({ config: { discordClientId: '123456789012345678', discordToken: 'unused-test-token', ...config }, media, metrics, activity, logger: { info() {}, warn() {}, error() {} } }, { client, music, rest: { async put(_route, { body }) { registered.push(...body); } } });
   await bot.start();
   t.after(() => bot.shutdown());
   return { bot, calls, member, guild, music, media, queue, client, registered };

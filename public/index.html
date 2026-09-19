@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#eee7d8">
   <meta name="description" content="Request songs and playlists from Spotify or YouTube for your Discord voice channel.">
   <title>Turntable — Discord music queue</title>
-  <link rel="stylesheet" href="/styles.css?v=radio-1">
-  <script src="/app.js?v=radio-1" defer></script>
+  <link rel="stylesheet" href="/styles.css?v=activity-1">
+  <script src="/app.js?v=activity-1" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to player</a>
@@ -16,7 +16,7 @@
     <a class="brand" href="/" aria-label="Turntable home"><span class="brand-mark" aria-hidden="true">TT</span><span>Turntable</span></a>
     <div class="theme-controls"><span class="theme-label">PLAYER STYLE</span><div class="theme-switch" role="group" aria-label="Player appearance"><button type="button" data-theme-choice="cassette" aria-pressed="true">Cassette</button><button type="button" data-theme-choice="winamp" aria-pressed="false">Winamp</button></div><button id="cassette-mode-toggle" class="cassette-mode-toggle" type="button" aria-pressed="false">Dark mode</button></div>
   </header>
-  <div class="status-strip"><span class="connection"><i id="status-dot" class="status-dot" aria-hidden="true"></i><span id="connection-status">CONNECTING</span></span><span id="demo-badge" class="demo-badge" hidden>DEMO · NO AUDIO</span><a id="invite-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Add to server ↗</a></div>
+  <div class="status-strip"><span class="connection"><i id="status-dot" class="status-dot" aria-hidden="true"></i><span id="connection-status">CONNECTING</span></span><span id="demo-badge" class="demo-badge" hidden>DEMO · NO AUDIO</span><button id="developer-button" class="text-button developer-button" type="button" aria-controls="developer-view" aria-expanded="false" hidden>Developer</button><a id="invite-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Add to server ↗</a></div>
   <div class="notice" id="setup-notice" hidden><strong id="notice-title"></strong><p id="notice-description"></p></div>
   <div class="feedback" id="feedback" role="status" aria-live="polite" hidden></div>
 
@@ -94,6 +94,24 @@
       </div>
     </details>
   </main>
+  <section class="developer-view window" id="developer-view" aria-labelledby="developer-heading" hidden>
+    <header class="developer-heading"><div><span class="developer-kicker">DEVELOPER</span><h2 id="developer-heading" tabindex="-1">Activity</h2></div><button class="small-button" id="developer-back" type="button">Back to player</button></header>
+    <div class="developer-body">
+      <div class="activity-filters" role="group" aria-label="Activity filters">
+        <label>Server<select id="activity-guild"><option value="">All servers</option></select></label>
+        <label>User<select id="activity-user"><option value="">All users</option></select></label>
+        <label>Source<select id="activity-source"><option value="">All sources</option><option value="discord">Discord</option><option value="web">Web app</option></select></label>
+        <label>Result<select id="activity-status"><option value="">All results</option><option value="success">Success</option><option value="error">Error</option><option value="cancelled">Cancelled</option></select></label>
+        <button class="small-button" id="activity-refresh" type="button">Refresh</button>
+      </div>
+      <div class="activity-meta"><p id="activity-summary" role="status" aria-live="polite">Loading activity…</p><span id="activity-retention">30 days · Recorded from this release</span></div>
+      <div class="activity-table-wrap" id="activity-table-wrap" role="region" aria-label="Command activity; scroll for more columns" tabindex="0">
+        <table class="activity-table"><caption class="activity-caption">Commands from Discord and the web app. Newest first. Times are local.</caption><thead><tr><th scope="col">Time</th><th scope="col">Server / User</th><th scope="col">Source</th><th scope="col">Command / Parameters</th><th scope="col">Result</th></tr></thead><tbody id="activity-events"></tbody></table>
+      </div>
+      <p class="activity-empty" id="activity-empty" hidden>No commands recorded.</p>
+      <footer class="activity-pagination"><button class="small-button" id="activity-newer" type="button" disabled>← Newer</button><span id="activity-page">Page 1</span><button class="small-button" id="activity-older" type="button" disabled>Older →</button></footer>
+    </div>
+  </section>
   <footer class="page-footer"><span>TURNTABLE / TT–01</span><span>IN DISCORD: <code>/play</code> OR <code>/shuffle</code></span></footer>
 </div>
 </body>

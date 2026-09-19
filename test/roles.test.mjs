@@ -18,6 +18,49 @@ const workerEnv = {
   DISCORD_TOKEN: 'test-worker-discord-token', DISCORD_CLIENT_ID: CLIENT_ID,
 };
 
+test('developer identity is one explicit Discord ID and is disabled by default', () => {
+  assert.equal(loadConfig({}).developerDiscordUserId, '');
+  assert.equal(loadConfig({ ...workerEnv, DEVELOPER_DISCORD_USER_ID: USER_ID }).developerDiscordUserId, USER_ID);
+  for (const value of ['Trevor', USER_ID + ',123456789012345681', ' ', 'demo-user']) {
+    assert.throws(() => loadConfig({ ...workerEnv, DEVELOPER_DISCORD_USER_ID: value }), /DEVELOPER_DISCORD_USER_ID/);
+  }
+});
+
+test('developer portal requires a signed-in identity and never trusts a requested owner ID', async t => {
+  let allowed = true;
+  const calls = [];
+  const bot = { isReady: () => true,
+    developerAccess: async user => { assert.equal(user, USER_ID); return { allowed }; },
+    developerActivity: async (user, filters) => {
+      calls.push([user, filters]);
+      if (!allowed) throw Object.assign(new Error('Developer access is required.'), { status: 403 });
+      return { events: [{ userId: USER_ID, command: 'pause' }], guilds: [], users: [], nextCursor: null };
+    },
+  };
+  const { request, signIn } = await portalFixture(t, { bot });
+  const endpoint = '/api/developer/activity';
+  assert.equal((await request(endpoint)).status, 401);
+  assert.equal((await (await request('/api/session')).json()).developer, false);
+  const session = await signIn();
+  assert.equal(session.developer, true);
+  const response = await request(endpoint + '?guildId=' + GUILD_ID + '&source=web&limit=25');
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal((await response.json()).events.length, 1);
+  assert.equal(calls[0][0], USER_ID);
+  assert.equal(calls[0][1].guildId, GUILD_ID);
+  assert.equal(calls[0][1].limit, 25);
+  for (const query of ['ownerId=' + USER_ID, 'limit=1000', 'source=arbitrary', 'guildId=bad', 'cursor=../private']) {
+    assert.equal((await request(endpoint + '?' + query)).status, 400);
+  }
+  allowed = false;
+  assert.equal((await (await request('/api/session')).json()).developer, false);
+  const denied = await request(endpoint + '?userId=' + USER_ID);
+  assert.equal(denied.status, 403);
+  assert.equal((await denied.json()).events, undefined);
+  assert.equal(calls.at(-1)[0], USER_ID);
+});
+
 test('queue defaults support 2,000 total songs and one-hour tracks across roles', () => {
   for (const env of [{}, workerEnv, portalEnv]) {
     const config = loadConfig(env);

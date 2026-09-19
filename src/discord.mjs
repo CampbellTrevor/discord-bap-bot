@@ -11,6 +11,7 @@ import { prepareAudio } from './audio-pipeline.mjs';
 import { createAudioHealth } from './audio-health.mjs';
 import { createVoiceNetworkHealth } from './voice-network-health.mjs';
 import { createVoiceDiagnosticLog } from './voice-diagnostic-log.mjs';
+import { sanitizeActivityParameters, validateActivityFilters } from './command-activity.mjs';
 
 const commands = [
   new SlashCommandBuilder().setName('play').setDescription('Request a song or playlist from Spotify or YouTube')
@@ -61,14 +62,16 @@ export function authorizeJoin({ manager, voiceChannelId, targetChannelId, snapsh
   }
 }
 
-export function createBot({ config, media, metrics, logger = console }, dependencies = {}) {
+export function createBot({ config, media, metrics, activity, logger = console }, dependencies = {}) {
   const client = dependencies.client ?? new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
   const music = dependencies.music ?? new MusicManager({ media, dataDir: config.dataDir, maxQueueSize: config.maxQueueSize, idleDisconnectMs: config.idleDisconnectMs, logger });
   const locks = new Map();
   const radioRequests = new Map();
+  const activeAudits = new Set();
   let ready = false;
   let closing = false;
   let queuesRestored = false;
+  const isDeveloper = userId => typeof userId === 'string' && Boolean(config.developerDiscordUserId) && userId === config.developerDiscordUserId;
 
   function cancelRadioRequest(guildId) {
     const pending = radioRequests.get(guildId);
@@ -212,6 +215,56 @@ export function createBot({ config, media, metrics, logger = console }, dependen
 
   const api = {
     music,
+    developerAccess: userId => ({ allowed: isDeveloper(userId) }),
+    async developerActivity(userId, input = {}) {
+      // Check the configured account before consulting guilds, storage or filters.
+      if (!isDeveloper(userId)) throw musicError('Developer access is required.', 403);
+      const filters = validateActivityFilters(input);
+      if (!activity) throw musicError('Command activity is temporarily unavailable.', 503);
+      const result = await activity.query(filters);
+      const guilds = new Map((result.guilds || []).map(guild => [guild.id, guild]));
+      for (const guild of client.guilds.cache.values()) guilds.set(guild.id, { id: guild.id, name: guild.name });
+      return { ...result, guilds: [...guilds.values()].sort((a, b) => a.name.localeCompare(b.name)) };
+    },
+    async auditCommand(event, operation) {
+      if (!activity) return operation();
+      let settled;
+      const completion = new Promise(resolve => { settled = resolve; });
+      activeAudits.add(completion);
+      const started = performance.now();
+      const timestamp = new Date().toISOString();
+      // All enrichment uses existing caches; auditing never starts a Discord
+      // request or delays an operation waiting for an account lookup.
+      const enrich = () => {
+        const guild = client.guilds.cache.get(event.guildId);
+        const member = guild?.members?.cache?.get(event.userId);
+        const user = client.users?.cache?.get(event.userId);
+        return {
+          source: event.source, guildId: event.guildId, userId: event.userId,
+          guildName: guild?.name, userName: event.userName || member?.displayName || user?.globalName || user?.username,
+          command: event.command, parameters: sanitizeActivityParameters(event.parameters),
+          timestamp, durationMs: performance.now() - started,
+        };
+      };
+      const record = outcome => {
+        try { activity.record({ ...enrich(), ...outcome }); }
+        catch { try { logger.warn?.('Could not record command activity.'); } catch { /* Logging cannot change the command outcome. */ } }
+      };
+      try {
+        const result = await operation();
+        record({ status: 'success' });
+        return result;
+      } catch (error) {
+        const cancelled = error?.name === 'AbortError' || ['ABORT_ERR', 'WORKER_CANCELLED', 'REQUEST_CANCELLED', 'MEDIA_CANCELLED'].includes(error?.code);
+        const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(error.code)
+          ? error.code : Number.isInteger(error?.status) ? `HTTP_${error.status}` : cancelled ? 'ABORTED' : 'COMMAND_FAILED';
+        record({ status: cancelled ? 'cancelled' : 'error', errorCode: code });
+        throw error;
+      } finally {
+        activeAudits.delete(completion);
+        settled();
+      }
+    },
     isReady: () => ready && client.isReady() && !closing,
     snapshot: guildId => music.snapshot(guildId),
     async start() {
@@ -253,7 +306,12 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         if (queuesRestored) await music.shutdown();
       } finally {
         try { await media.close?.(); }
-        finally { client.destroy(); }
+        finally {
+          // Provider work outside guild locks may finish its cancellation after
+          // media.close. Keep the journal open until those outcomes are recorded.
+          try { await Promise.allSettled([...activeAudits]); }
+          finally { client.destroy(); }
+        }
       }
     },
     async listGuilds(userId) {
@@ -283,6 +341,7 @@ export function createBot({ config, media, metrics, logger = console }, dependen
         member: {
           canControl: manager || Boolean(snapshot.channelId && member.voice.channelId === snapshot.channelId),
           canManage: manager,
+          canViewPerformance: manager || isDeveloper(userId),
           voiceChannelId: member.voice.channelId,
         },
         voiceChannels: visibleChannels(guild, member),
@@ -294,8 +353,10 @@ export function createBot({ config, media, metrics, logger = console }, dependen
       return { ...context, queue: music.snapshot(guildId) };
     },
     async performance(guildId, userId) {
-      const { manager } = await membership(guildId, userId);
-      if (!manager) throw musicError('Only a server manager or DJ can view host performance.', 403);
+      if (!isDeveloper(userId)) {
+        const { manager } = await membership(guildId, userId);
+        if (!manager) throw musicError('Only a server manager or DJ can view host performance.', 403);
+      }
       if (!metrics) throw musicError('Host performance is temporarily unavailable.', 503);
       return metrics.getSnapshot();
     },
@@ -443,6 +504,11 @@ export function createBot({ config, media, metrics, logger = console }, dependen
   client.on(Events.InteractionCreate, async interaction => {
     if (!interaction.isChatInputCommand()) return;
     try {
+      const content = await api.auditCommand({
+        source: 'discord', guildId: interaction.guildId, userId: interaction.user.id,
+        userName: interaction.member?.displayName || interaction.user.globalName || interaction.user.username,
+        command: interaction.commandName, parameters: slashParameters(interaction),
+      }, async () => {
       if (!interaction.guildId) throw musicError('Use this command inside a Discord server.');
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const guildId = interaction.guildId;
@@ -499,6 +565,8 @@ export function createBot({ config, media, metrics, logger = console }, dependen
             stop: 'Playback stopped and the queue cleared.', leave: 'Left voice. The queue is saved; /join continues it.',
           }[interaction.commandName] || 'Queue updated.';
       }
+      return content;
+      });
       await interaction.editReply({ content: content.slice(0, 2_000), allowedMentions: { parse: [] } });
     } catch (error) {
       if (!error.status) logger.error('Slash command failed:', error.message);
@@ -533,4 +601,12 @@ export function formatRequestReply({ added, import: details, warnings = [] }) {
 
 function safeText(value) {
   return String(value || '').replace(/[\\`*_~|<>@]/g, '').replace(/[\r\n]/g, ' ').slice(0, 130);
+}
+
+function slashParameters(interaction) {
+  try {
+    if (['play', 'radio'].includes(interaction.commandName)) return { query: interaction.options.getString('query') ?? undefined };
+    if (interaction.commandName === 'volume') return { volumePercent: interaction.options.getInteger('percent') ?? undefined };
+  } catch { /* Malformed options are handled and recorded by the command itself. */ }
+  return {};
 }

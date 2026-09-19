@@ -35,7 +35,7 @@ export function loadConfig(env = process.env, { demo = false } = {}) {
     throw new Error('PUBLIC_URL must be a plain http(s) origin without a path.');
   }
   if (production && parsed.protocol !== 'https:') throw new Error('PUBLIC_URL must use HTTPS in production.');
-  for (const key of ['DISCORD_CLIENT_ID', 'DISCORD_GUILD_ID', 'DJ_ROLE_ID']) {
+  for (const key of ['DISCORD_CLIENT_ID', 'DISCORD_GUILD_ID', 'DJ_ROLE_ID', 'DEVELOPER_DISCORD_USER_ID']) {
     if (env[key] && !/^\d{17,20}$/.test(env[key])) throw new Error(`${key} must be a Discord ID.`);
   }
   if (production && botRole !== 'worker') {
@@ -52,6 +52,7 @@ export function loadConfig(env = process.env, { demo = false } = {}) {
     production, demo, setupMode, botRole, workerUrl, workerSecret: env.WORKER_SECRET || '', port, publicUrl: parsed.origin, host: demo ? '127.0.0.1' : '0.0.0.0',
     discordToken: env.DISCORD_TOKEN || '', discordClientId: env.DISCORD_CLIENT_ID || '',
     discordClientSecret: env.DISCORD_CLIENT_SECRET || '', discordGuildId: env.DISCORD_GUILD_ID || '',
+    developerDiscordUserId: env.DEVELOPER_DISCORD_USER_ID || '',
     djRoleId: env.DJ_ROLE_ID || '', sessionSecret: env.SESSION_SECRET || randomBytes(32).toString('hex'),
     spotifyClientId: env.SPOTIFY_CLIENT_ID || '', spotifyClientSecret: env.SPOTIFY_CLIENT_SECRET || '',
     spotifyRefreshToken: env.SPOTIFY_REFRESH_TOKEN || '', spotifyMarket: env.SPOTIFY_MARKET || 'US',

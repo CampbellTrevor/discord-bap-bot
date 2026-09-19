@@ -15,6 +15,55 @@ const CHANNEL = '323456789012345678';
 const SID = 'test-session-identifier-with-32-characters';
 const silent = { warn() {} };
 
+test('developer RPC forwards the authenticated actor separately from filters and preserves denials', async t => {
+  const { bridge, connect } = await fixture(t);
+  const calls = [];
+  let allowed = true;
+  connect(fakeBot({
+    developerAccess: async user => ({ allowed: user === USER && allowed }),
+    developerActivity: async (user, filters) => {
+      calls.push([user, filters]);
+      if (!allowed) throw Object.assign(new Error('Developer access is required.'), { status: 403 });
+      return { events: [], guilds: [{ id: GUILD, name: 'Server' }], nextCursor: null };
+    },
+  }));
+  await until(() => bridge.bot.isReady());
+  assert.deepEqual(await bridge.bot.developerAccess(USER), { allowed: true });
+  assert.equal((await bridge.bot.developerActivity(USER, { guildId: GUILD, limit: 20 })).guilds[0].id, GUILD);
+  assert.deepEqual(calls, [[USER, { guildId: GUILD, limit: 20 }]]);
+  for (const filters of [{ ownerId: USER }, { limit: 101 }, { source: 'invalid' }, { userId: '../private' }, { cursor: 'a'.repeat(200) }]) {
+    await assert.rejects(bridge.bot.developerActivity(USER, filters), { code: 'WORKER_INVALID_REQUEST' });
+  }
+  assert.equal(calls.length, 1);
+  allowed = false;
+  await assert.rejects(bridge.bot.developerActivity(USER), { status: 403, message: 'Developer access is required.' });
+});
+
+test('web actions are audited once on worker with server identity and exclude polling', async t => {
+  const { bridge, connect } = await fixture(t);
+  const events = [];
+  connect(fakeBot({
+    auditCommand: async (event, operation) => {
+      try { const result = await operation(); events.push({ ...event, status: 'success' }); return result; }
+      catch (error) { events.push({ ...event, status: 'error' }); throw error; }
+    },
+    control: async (_guild, _user, action) => {
+      if (action === 'stop') throw Object.assign(new Error('Join the bot voice channel.'), { status: 403 });
+      return { tracks: [] };
+    },
+  }));
+  await until(() => bridge.bot.isReady());
+  await bridge.bot.listGuilds(USER);
+  await bridge.bot.detail(GUILD, USER);
+  assert.equal(events.length, 0);
+  await bridge.bot.control(GUILD, USER, 'pause');
+  await assert.rejects(bridge.bot.control(GUILD, USER, 'stop'), { status: 403 });
+  assert.equal(events.length, 2);
+  assert.deepEqual(events.map(e => [e.source,e.guildId,e.userId,e.command,e.status]), [
+    ['web',GUILD,USER,'pause','success'],['web',GUILD,USER,'stop','error'],
+  ]);
+});
+
 test('radio RPC validates seed/action, propagates cancellation and never replays mutations', async t => {
   const { bridge, connect } = await fixture(t);
   const calls = [], started = deferred(), cancelled = deferred();
