@@ -9,7 +9,7 @@ const MINUTE = 60000;
 const DAY = 24 * 60 * MINUTE;
 const MIB = 1024 * 1024;
 
-async function fixture(t, { missing = false, failWrites = false, monitorEventLoopDelay = () => null } = {}) {
+async function fixture(t, { missing = false, failWrites = false, monitorEventLoopDelay = () => null, yieldWork, transformWrite } = {}) {
   const dataDir = await fs.mkdtemp(path.join(tmpdir(), 'turntable-metrics-'));
   let clock = Math.floor(Date.now() / MINUTE) * MINUTE;
   let writes = 0, timerCallback, stopped = false;
@@ -31,12 +31,17 @@ async function fixture(t, { missing = false, failWrites = false, monitorEventLoo
       }
       return fs.readFile(file, ...args);
     },
-    async writeFile(...args) { writes++; if (failWrites) throw new Error('private path and secret'); return fs.writeFile(...args); },
+    async writeFile(...args) {
+      writes++;
+      if (failWrites) throw new Error('private path and secret');
+      if (transformWrite) args[1] = transformWrite(args[1], args[2]);
+      return fs.writeFile(...args);
+    },
     async statfs() { if (missing) throw new Error('unsupported'); return { bsize: 4096, blocks: 100000, bavail: 20000 }; },
   };
   const instances = [];
   const create = () => {
-    const metrics = createHostMetrics({ dataDir, now: () => clock, fs: io, monitorEventLoopDelay,
+    const metrics = createHostMetrics({ dataDir, now: () => clock, fs: io, monitorEventLoopDelay, yieldWork,
       os: { cpus: () => [{ times: { ...fallbackTimes } }], totalmem: () => 4 * 1024 * MIB, freemem: () => 2 * 1024 * MIB },
       setInterval(fn, interval) { assert.equal(interval, 5000); timerCallback = fn; return { unref() {} }; },
       clearInterval() { stopped = true; },
@@ -61,13 +66,29 @@ function pressure(files) {
   files.set('/sys/fs/cgroup/memory.events', 'oom 2\noom_kill 1\n');
 }
 
+async function seedHistory(fixture, minutes) {
+  await fixture.metrics.start();
+  fixture.metrics.recordPlayback({ outcome: 'ready', durationMs: 100, preloaded: true });
+  fixture.metrics.recordAudioHealth({ windowMs: 5000, packetsRead: 250, starvedReads: 0,
+    udpAudioPackets: 250, udpSendErrors: 0, udpKeepaliveSent: 1, udpKeepaliveConfirmed: 0 });
+  await fixture.advance(MINUTE);
+  await fixture.metrics.close();
+  const file = path.join(fixture.dataDir, '.host-metrics.json');
+  const saved = JSON.parse(await fs.readFile(file, 'utf8'));
+  const template = saved.buckets.find(entry => entry.audio.samples === 1);
+  saved.buckets = Array.from({ length: minutes }, (_, index) => ({ ...structuredClone(template),
+    at: fixture.now() - (minutes - index - 1) * MINUTE }));
+  await fs.writeFile(file, JSON.stringify(saved));
+  return file;
+}
+
 test('collects host pressure, container limits/counter changes, and disk availability', async t => {
   const { metrics, files, advance } = await fixture(t);
   await metrics.start();
-  assert.equal(metrics.getSnapshot().latest.hostCpuBusyPct, null, 'CPU utilization needs two samples.');
+  assert.equal((await metrics.getSnapshot()).latest.hostCpuBusyPct, null, 'CPU utilization needs two samples.');
   pressure(files);
   await advance(5000);
-  const { latest } = metrics.getSnapshot();
+  const { latest } = (await metrics.getSnapshot());
   assert.equal(latest.hostCpuBusyPct, 40);
   assert.equal(latest.hostCpuStealPct, 10);
   assert.equal(latest.hostCpuIowaitPct, 5);
@@ -100,7 +121,7 @@ test('counter resets and unlimited cgroups do not report fabricated negative uti
   files.set('/sys/fs/cgroup/cpu.max', 'max 100000\n');
   files.set('/proc/meminfo', 'MemTotal: 2097152 kB\nMemAvailable: 999999999999999999999999999 kB\nSwapTotal: 2097152 kB\n');
   await advance(5000);
-  const { latest } = metrics.getSnapshot();
+  const { latest } = (await metrics.getSnapshot());
   for (const field of ['hostCpuBusyPct', 'hostCpuStealPct', 'containerCpuUsagePct', 'containerCpuThrottledPct',
     'containerCpuThrottledMs', 'containerOomKillsDelta', 'containerMemoryLimitBytes', 'containerCpuLimitCores',
     'hostMemoryAvailableBytes', 'hostSwapUsedBytes']) assert.equal(latest[field], null, field);
@@ -112,7 +133,7 @@ test('Windows or unavailable Linux counters fall back without inventing steal, s
   fallbackTimes.user += 50;
   fallbackTimes.idle += 50;
   await advance(5000);
-  const { latest } = metrics.getSnapshot();
+  const { latest } = (await metrics.getSnapshot());
   assert.equal(latest.hostCpuBusyPct, 50);
   assert.equal(latest.hostMemoryTotalBytes, 4096 * MIB);
   assert.equal(latest.hostMemoryAvailableBytes, 2048 * MIB);
@@ -129,7 +150,7 @@ test('minute aggregates preserve short peaks and persist at most once per minute
   files.set('/proc/stat', 'cpu 130 0 60 945 15 0 0 50 0 0\ncpu0 130 0 60 945 15 0 0 50 0 0\n');
   await advance(5000);
   assert.equal(writes(), 1);
-  const history = metrics.getSnapshot().history;
+  const history = (await metrics.getSnapshot()).history;
   assert.equal(history[0].avg.hostCpuBusyPct, 20);
   assert.equal(history[0].max.hostCpuBusyPct, 40);
   assert.equal(history[0].min.hostCpuBusyPct, 0);
@@ -141,7 +162,7 @@ test('minute aggregates preserve short peaks and persist at most once per minute
   const restarted = create();
   await restarted.start();
   assert.equal(writes(), 2, 'Immediate restart does not add a write within the saved minute.');
-  assert.equal(Math.max(...restarted.getSnapshot().history.map(point => point.max.hostCpuBusyPct ?? 0)), 40);
+  assert.equal(Math.max(...(await restarted.getSnapshot()).history.map(point => point.max.hostCpuBusyPct ?? 0)), 40);
 });
 
 test('source startup aggregates and safe error codes survive restart without media metadata', async t => {
@@ -154,7 +175,7 @@ test('source startup aggregates and safe error codes survive restart without med
   metrics.recordPlayback({ outcome: 'ready', durationMs: NaN, preloaded: true });
   metrics.recordPlayback({ outcome: 'unknown', durationMs: 1, preloaded: false });
   await advance(MINUTE);
-  const before = metrics.getSnapshot().playback;
+  const before = (await metrics.getSnapshot()).playback;
   assert.equal(before.measurement, 'source-and-packet-preparation');
   assert.equal(before.legacySourceOnly, false);
   assert.equal(before.ready, 2);
@@ -171,7 +192,7 @@ test('source startup aggregates and safe error codes survive restart without med
   await metrics.close();
   const restarted = create();
   await restarted.start();
-  assert.deepEqual(restarted.getSnapshot().playback, before);
+  assert.deepEqual((await restarted.getSnapshot()).playback, before);
 });
 
 test('history expires after 24 hours and response history never exceeds 288 buckets', async t => {
@@ -179,7 +200,7 @@ test('history expires after 24 hours and response history never exceeds 288 buck
   await metrics.start();
   metrics.recordPlayback({ outcome: 'ready', durationMs: 100, preloaded: false });
   for (let i = 0; i < 290; i++) await advance(5 * MINUTE);
-  const snapshot = metrics.getSnapshot();
+  const snapshot = (await metrics.getSnapshot());
   assert.equal(snapshot.history.length, 288);
   assert.equal(snapshot.playback.ready, 0);
   assert.ok(snapshot.history.every(point => point.at >= snapshot.sampledAt - DAY));
@@ -191,29 +212,29 @@ test('damaged persistence and failed writes do not interrupt metrics or expose f
   await metrics.start();
   pressure(files);
   await advance(5000);
-  const snapshot = metrics.getSnapshot();
+  const snapshot = (await metrics.getSnapshot());
   assert.equal(snapshot.latest.hostCpuBusyPct, 40);
   assert.equal(snapshot.persistence.available, false);
   assert.equal(JSON.stringify(snapshot).includes('secret'), false);
   const second = await fixture(t);
   await fs.writeFile(path.join(second.dataDir, '.host-metrics.json'), '{broken');
   await second.metrics.start();
-  assert.ok(second.metrics.getSnapshot().latest);
-  assert.equal(second.metrics.getSnapshot().history.length, 1);
+  assert.ok((await second.metrics.getSnapshot()).latest);
+  assert.equal((await second.metrics.getSnapshot()).history.length, 1);
 });
 
 test('snapshot data is detached and repeated start/close are safe', async t => {
   const { metrics, writes } = await fixture(t);
   await Promise.all([metrics.start(), metrics.start()]);
   assert.equal(writes(), 1);
-  const snapshot = metrics.getSnapshot();
+  const snapshot = (await metrics.getSnapshot());
   snapshot.latest.hostMemoryTotalBytes = 1;
   snapshot.history[0].max.hostMemoryTotalBytes = 1;
-  assert.equal(metrics.getSnapshot().latest.hostMemoryTotalBytes, 2048 * MIB);
-  assert.equal(metrics.getSnapshot().history[0].max.hostMemoryTotalBytes, 2048 * MIB);
+  assert.equal((await metrics.getSnapshot()).latest.hostMemoryTotalBytes, 2048 * MIB);
+  assert.equal((await metrics.getSnapshot()).history[0].max.hostMemoryTotalBytes, 2048 * MIB);
   await Promise.all([metrics.close(), metrics.close()]);
   metrics.recordPlayback({ outcome: 'ready', durationMs: 10, preloaded: false });
-  assert.equal(metrics.getSnapshot().playback.ready, 0);
+  assert.equal((await metrics.getSnapshot()).playback.ready, 0);
 });
 
 test('preload lifecycle counts and natural transition timing persist independently from foreground preparation', async t => {
@@ -232,7 +253,7 @@ test('preload lifecycle counts and natural transition timing persist independent
   metrics.recordPreload({ outcome: 'ready', durationMs: NaN });
   metrics.recordPreload({ outcome: 'expired', durationMs: 3600001 });
   await advance(MINUTE);
-  const before = metrics.getSnapshot();
+  const before = (await metrics.getSnapshot());
   assert.equal(before.playback.ready, 0);
   assert.deepEqual(before.preload, { measurement: 'background-source-and-packet-preparation',
     ready: 2, error: 2, cancelled: 1, expired: 1, meanReadyMs: 1550, maxReadyMs: 3000,
@@ -246,12 +267,12 @@ test('preload lifecycle counts and natural transition timing persist independent
   await metrics.close();
   const restarted = create();
   await restarted.start();
-  assert.deepEqual(restarted.getSnapshot().preload, before.preload);
-  assert.deepEqual(restarted.getSnapshot().transition, before.transition);
+  assert.deepEqual((await restarted.getSnapshot()).preload, before.preload);
+  assert.deepEqual((await restarted.getSnapshot()).transition, before.transition);
   metrics.recordPreload({ outcome: 'ready', durationMs: 10 });
   metrics.recordTransition({ outcome: 'ready', durationMs: 10, preloaded: true });
-  assert.deepEqual(metrics.getSnapshot().preload, before.preload);
-  assert.deepEqual(metrics.getSnapshot().transition, before.transition);
+  assert.deepEqual((await metrics.getSnapshot()).preload, before.preload);
+  assert.deepEqual((await metrics.getSnapshot()).transition, before.transition);
 });
 
 test('existing version 1 history survives missing new fields and identifies legacy source-only timing', async t => {
@@ -271,7 +292,7 @@ test('existing version 1 history survives missing new fields and identifies lega
   await fs.writeFile(file, JSON.stringify(old));
   const restarted = create();
   await restarted.start();
-  const restored = restarted.getSnapshot();
+  const restored = (await restarted.getSnapshot());
   assert.equal(restored.persistence.available, true);
   assert.equal(restored.playback.ready, 1);
   assert.equal(restored.playback.meanReadyMs, 100);
@@ -282,8 +303,8 @@ test('existing version 1 history survives missing new fields and identifies lega
   restarted.recordPlayback({ outcome: 'ready', durationMs: 200, preloaded: true });
   restarted.recordPreload({ outcome: 'ready', durationMs: 300 });
   await advance(MINUTE);
-  assert.equal(restarted.getSnapshot().playback.meanReadyMs, 150);
-  assert.equal(restarted.getSnapshot().playback.legacySourceOnly, true);
+  assert.equal((await restarted.getSnapshot()).playback.meanReadyMs, 150);
+  assert.equal((await restarted.getSnapshot()).playback.legacySourceOnly, true);
   const migrated = JSON.parse(await fs.readFile(file, 'utf8'));
   assert.equal(migrated.version, 1);
   assert.equal(migrated.buckets.reduce((sum, entry) => sum + entry.playback.ready, 0), 2);
@@ -305,7 +326,7 @@ test('malformed additive metrics are ignored without discarding valid host histo
   await fs.writeFile(file, JSON.stringify(saved));
   const restarted = create();
   await restarted.start();
-  const snapshot = restarted.getSnapshot();
+  const snapshot = (await restarted.getSnapshot());
   assert.equal(snapshot.persistence.available, true);
   assert.equal(snapshot.playback.ready, 1);
   assert.equal(snapshot.preload.cancelled, 0);
@@ -321,7 +342,7 @@ test('new metric event rates and error vocabularies are bounded and expire with 
     metrics.recordPreload({ outcome: 'error', durationMs: 10, code: `PROVIDER_${index % 30}` });
     metrics.recordTransition({ outcome: 'ready', durationMs: index, preloaded: true });
   }
-  const snapshot = metrics.getSnapshot();
+  const snapshot = (await metrics.getSnapshot());
   assert.equal(snapshot.preload.error, 1000);
   assert.ok(snapshot.preload.errors.length <= 17);
   assert.equal(snapshot.preload.errors.reduce((sum, entry) => sum + entry.count, 0), 1000);
@@ -329,11 +350,11 @@ test('new metric event rates and error vocabularies are bounded and expire with 
   assert.equal(snapshot.transition.preloadedReady, 1000);
   snapshot.preload.errors[0].count = 999999;
   snapshot.history[0].transition.ready = 999999;
-  assert.equal(metrics.getSnapshot().preload.errors.reduce((sum, entry) => sum + entry.count, 0), 1000);
-  assert.equal(metrics.getSnapshot().transition.ready, 1000);
+  assert.equal((await metrics.getSnapshot()).preload.errors.reduce((sum, entry) => sum + entry.count, 0), 1000);
+  assert.equal((await metrics.getSnapshot()).transition.ready, 1000);
   await advance(DAY + MINUTE);
-  assert.equal(metrics.getSnapshot().preload.error, 0);
-  assert.equal(metrics.getSnapshot().transition.ready, 0);
+  assert.equal((await metrics.getSnapshot()).preload.error, 0);
+  assert.equal((await metrics.getSnapshot()).transition.ready, 0);
 });
 
 test('audio intervals retain packet shortages, cadence peaks and duration counters without payload data', async t => {
@@ -347,7 +368,7 @@ test('audio intervals retain packet shortages, cadence peaks and duration counte
   metrics.recordAudioHealth({ ...first, readAttempts: 250, packetsRead: 250, emptyReads: 0, starvedReads: 0,
     minBufferedPackets: 148, maxReadGapMs: 21, maxPacketBytes: 700, opus20Ms: 250, opus40Ms: 0,
     opusMismatch: 0, voiceWsPingMs: null });
-  const before = metrics.getSnapshot().audio;
+  const before = (await metrics.getSnapshot()).audio;
   assert.equal(before.samples, 2);
   assert.equal(before.totals.readAttempts, 500);
   assert.equal(before.totals.starvedReads, 1);
@@ -360,19 +381,19 @@ test('audio intervals retain packet shortages, cadence peaks and duration counte
   assert.equal(before.max.voiceUdpPingMs, null);
   assert.equal(before.totals.opus2_5Ms, null, 'Unavailable duration counters are not fabricated as zero.');
   before.latest.maxReadGapMs = 999999;
-  assert.equal(metrics.getSnapshot().audio.latest.maxReadGapMs, 21);
+  assert.equal((await metrics.getSnapshot()).audio.latest.maxReadGapMs, 21);
   await advance(MINUTE);
-  assert.equal(metrics.getSnapshot().audio.latest, null, 'Old voice intervals are not presented as current playback.');
+  assert.equal((await metrics.getSnapshot()).audio.latest, null, 'Old voice intervals are not presented as current playback.');
   const stored = await fs.readFile(path.join(dataDir, '.host-metrics.json'), 'utf8');
   assert.doesNotMatch(stored, /private\.example|private audio|private-user/);
   await metrics.close();
   const restarted = create();
   await restarted.start();
-  const audio = restarted.getSnapshot().audio;
+  const audio = (await restarted.getSnapshot()).audio;
   assert.equal(audio.latest, null);
   assert.equal(audio.totals.starvedReads, 1);
   assert.equal(audio.max.maxReadGapMs, 145);
-  assert.equal(restarted.getSnapshot().history.reduce((sum, point) => sum + (point.audio.totals.packetsRead || 0), 0), 498);
+  assert.equal((await restarted.getSnapshot()).history.reduce((sum, point) => sum + (point.audio.totals.packetsRead || 0), 0), 498);
 });
 
 test('event loop delay converts nanoseconds, resets each interval and disables exactly once', async t => {
@@ -388,14 +409,14 @@ test('event loop delay converts nanoseconds, resets each interval and disables e
   await Promise.all([metrics.start(), metrics.start()]);
   assert.equal(factories, 1);
   assert.equal(enabled, 1);
-  assert.equal(metrics.getSnapshot().latest.eventLoopMaxMs, null);
+  assert.equal((await metrics.getSnapshot()).latest.eventLoopMaxMs, null);
   histogram.count = 200; histogram.max = 180_000_000; histogram.p99 = 21_500_000;
   await advance(5000);
-  assert.equal(metrics.getSnapshot().latest.eventLoopMaxMs, 180);
-  assert.equal(metrics.getSnapshot().latest.eventLoopP99Ms, 21.5);
+  assert.equal((await metrics.getSnapshot()).latest.eventLoopMaxMs, 180);
+  assert.equal((await metrics.getSnapshot()).latest.eventLoopP99Ms, 21.5);
   histogram.count = 200; histogram.max = 22_000_000; histogram.p99 = 20_100_000;
   await advance(5000);
-  const snapshot = metrics.getSnapshot();
+  const snapshot = (await metrics.getSnapshot());
   assert.equal(snapshot.latest.eventLoopMaxMs, 22);
   assert.equal(snapshot.eventLoop.max.eventLoopMaxMs, 180);
   assert.equal(snapshot.history[0].max.eventLoopMaxMs, 180);
@@ -421,7 +442,7 @@ test('older history without audio or loop fields stays intact and malformed addi
   await fs.writeFile(file, JSON.stringify(saved));
   const restored = create();
   await restored.start();
-  let snapshot = restored.getSnapshot();
+  let snapshot = (await restored.getSnapshot());
   assert.equal(snapshot.playback.ready, 1);
   assert.equal(snapshot.audio.samples, 0);
   assert.equal(snapshot.eventLoop.max.eventLoopMaxMs, null);
@@ -431,7 +452,7 @@ test('older history without audio or loop fields stays intact and malformed addi
   await fs.writeFile(file, JSON.stringify(saved));
   const repaired = create();
   await repaired.start();
-  snapshot = repaired.getSnapshot();
+  snapshot = (await repaired.getSnapshot());
   assert.equal(snapshot.playback.ready, 1);
   assert.equal(snapshot.audio.samples, 0);
   assert.equal(snapshot.eventLoop.max.eventLoopMaxMs, null);
@@ -442,10 +463,10 @@ test('audio telemetry rejects unbounded values and unavailable loop monitoring d
   const { metrics, advance } = await fixture(t, { monitorEventLoopDelay() { throw new Error('unsupported'); } });
   await metrics.start();
   metrics.recordAudioHealth({ windowMs: Infinity, packetsRead: 1 });
-  assert.equal(metrics.getSnapshot().audio.samples, 0);
+  assert.equal((await metrics.getSnapshot()).audio.samples, 0);
   for (let index = 0; index < 800; index++) metrics.recordAudioHealth({ windowMs: 5000,
     packetsRead: 250, emptyReads: -1, starvedReads: 0.5, maxReadGapMs: Infinity, maxPacketBytes: 1e12 });
-  const snapshot = metrics.getSnapshot();
+  const snapshot = (await metrics.getSnapshot());
   assert.equal(snapshot.audio.samples, 720);
   assert.equal(snapshot.audio.totals.packetsRead, 720 * 250);
   assert.equal(snapshot.audio.totals.emptyReads, null);
@@ -454,10 +475,10 @@ test('audio telemetry rejects unbounded values and unavailable loop monitoring d
   assert.equal(snapshot.latest.eventLoopMaxMs, null);
   assert.equal(snapshot.latest.hostMemoryTotalBytes, 2048 * MIB);
   await advance(DAY + MINUTE);
-  assert.equal(metrics.getSnapshot().audio.samples, 0);
+  assert.equal((await metrics.getSnapshot()).audio.samples, 0);
   await metrics.close();
   metrics.recordAudioHealth({ windowMs: 5000, packetsRead: 1 });
-  assert.equal(metrics.getSnapshot().audio.samples, 0);
+  assert.equal((await metrics.getSnapshot()).audio.samples, 0);
 });
 
 test('network intervals preserve numeric counters, unknown readings and peaks across restart', async t => {
@@ -472,7 +493,7 @@ test('network intervals preserve numeric counters, unknown readings and peaks ac
     udpKeepaliveSent: 1, udpKeepaliveReplies: 1, udpKeepaliveTimeouts: 1, udpKeepalivePending: 1,
     udpRttMaxMs: 45, udpRttJitterMs: 20, udpAudioPackets: 249, udpMaxSendGapMs: 130,
     udpSendErrors: 1, udpSendQueueBytes: null, voiceWsHeartbeatAgeMs: null, udpKeepaliveConfirmed: 1 });
-  const before = metrics.getSnapshot().network;
+  const before = (await metrics.getSnapshot()).network;
   assert.equal(before.measurement, 'voice-udp-keepalive-and-local-send');
   assert.equal(before.samples, 2);
   assert.deepEqual(before.totals, { udpKeepaliveSent: 2, udpKeepaliveReplies: 2, udpKeepaliveTimeouts: 1,
@@ -487,11 +508,11 @@ test('network intervals preserve numeric counters, unknown readings and peaks ac
   assert.equal(before.latest.udpSendQueueBytes, null);
   assert.equal(before.latest.voiceWsHeartbeatAgeMs, null);
   assert.equal(before.latest.udpKeepaliveUntracked, null);
-  assert.equal(metrics.getSnapshot().audio.avg.voiceUdpPingMs, 35, 'The original audio ping field remains populated.');
+  assert.equal((await metrics.getSnapshot()).audio.avg.voiceUdpPingMs, 35, 'The original audio ping field remains populated.');
   before.latest.voiceUdpPingMs = 999;
-  assert.equal(metrics.getSnapshot().network.latest.voiceUdpPingMs, 45);
+  assert.equal((await metrics.getSnapshot()).network.latest.voiceUdpPingMs, 45);
   await advance(MINUTE);
-  const persisted = metrics.getSnapshot().network;
+  const persisted = (await metrics.getSnapshot()).network;
   assert.equal(persisted.latest, null);
   const stored = await fs.readFile(path.join(dataDir, '.host-metrics.json'), 'utf8');
   assert.doesNotMatch(stored, /private-voice|private-token|private-payload|endpoint|packet"/);
@@ -503,9 +524,9 @@ test('network intervals preserve numeric counters, unknown readings and peaks ac
   await metrics.close();
   const restarted = create();
   await restarted.start();
-  assert.deepEqual(restarted.getSnapshot().network, persisted);
-  assert.equal(restarted.getSnapshot().audio.totals.packetsRead, 500);
-  assert.equal(restarted.getSnapshot().history.reduce((sum, point) => sum + (point.network.totals.udpAudioPackets || 0), 0), 499);
+  assert.deepEqual((await restarted.getSnapshot()).network, persisted);
+  assert.equal((await restarted.getSnapshot()).audio.totals.packetsRead, 500);
+  assert.equal((await restarted.getSnapshot()).history.reduce((sum, point) => sum + (point.network.totals.udpAudioPackets || 0), 0), 499);
 });
 
 test('history from before network instrumentation retains audio and host readings with unknown network values', async t => {
@@ -521,7 +542,7 @@ test('history from before network instrumentation retains audio and host reading
   await fs.writeFile(file, JSON.stringify(saved));
   const restarted = create();
   await restarted.start();
-  const snapshot = restarted.getSnapshot();
+  const snapshot = (await restarted.getSnapshot());
   assert.equal(snapshot.persistence.available, true);
   assert.equal(snapshot.audio.totals.packetsRead, 249);
   assert.equal(snapshot.playback.ready, 1);
@@ -532,7 +553,7 @@ test('history from before network instrumentation retains audio and host reading
   assert.ok(snapshot.history.every(point => point.network.samples === 0));
   assert.ok(snapshot.history.some(point => point.max.hostMemoryTotalBytes === 2048 * MIB));
   restarted.recordAudioHealth({ windowMs: 5000 });
-  const unknown = restarted.getSnapshot().network;
+  const unknown = (await restarted.getSnapshot()).network;
   assert.ok(Object.values(unknown.totals).every(value => value === null));
   assert.ok(Object.values(unknown.latest).slice(1).every(value => value === null));
 });
@@ -558,7 +579,7 @@ test('malformed network persistence is isolated without dropping audio or accept
     await fs.writeFile(file, JSON.stringify(saved));
     const restarted = create();
     await restarted.start();
-    const snapshot = restarted.getSnapshot();
+    const snapshot = (await restarted.getSnapshot());
     assert.equal(snapshot.persistence.available, true);
     assert.equal(snapshot.network.samples, 0);
     assert.equal(snapshot.audio.totals.packetsRead, 250);
@@ -570,21 +591,21 @@ test('malformed network persistence is isolated without dropping audio or accept
   await fs.writeFile(file, JSON.stringify(original));
   const restored = create();
   await restored.start();
-  assert.equal(restored.getSnapshot().network.totals.udpKeepaliveSent, 1);
-  assert.doesNotMatch(JSON.stringify(restored.getSnapshot()), /private-server-address|endpoint/);
+  assert.equal((await restored.getSnapshot()).network.totals.udpKeepaliveSent, 1);
+  assert.doesNotMatch(JSON.stringify((await restored.getSnapshot())), /private-server-address|endpoint/);
 });
 
 test('network telemetry bounds values and event rates, expires history and ignores closed collectors', async t => {
   const { metrics, advance } = await fixture(t);
   await metrics.start();
   metrics.recordAudioHealth({ windowMs: Infinity, udpKeepaliveSent: 1 });
-  assert.equal(metrics.getSnapshot().network.samples, 0);
+  assert.equal((await metrics.getSnapshot()).network.samples, 0);
   for (let index = 0; index < 800; index++) metrics.recordAudioHealth({ windowMs: 5000,
     udpKeepaliveSent: 1, udpKeepaliveReplies: -1, udpKeepaliveTimeouts: 0.5, udpKeepalivePending: null,
     voiceUdpPingMs: Infinity, udpRttMaxMs: 1e12, udpRttJitterMs: '34', udpAudioPackets: 250,
     udpSendQueueBytes: NaN, udpMaxSendGapMs: 1e9, voiceWsHeartbeatAgeMs: -1,
     udpKeepaliveConfirmed: 0.5, udpKeepaliveUntracked: Number.MAX_SAFE_INTEGER });
-  const snapshot = metrics.getSnapshot();
+  const snapshot = (await metrics.getSnapshot());
   assert.equal(snapshot.network.samples, 720);
   assert.equal(snapshot.network.totals.udpKeepaliveSent, 720);
   assert.equal(snapshot.network.totals.udpAudioPackets, 720 * 250);
@@ -593,11 +614,124 @@ test('network telemetry bounds values and event rates, expires history and ignor
   for (const field of ['voiceUdpPingMs', 'udpKeepalivePending', 'udpRttMaxMs', 'udpRttJitterMs', 'udpSendQueueBytes',
     'voiceWsHeartbeatAgeMs', 'udpKeepaliveConfirmed']) assert.equal(snapshot.network.max[field], null);
   snapshot.history[0].network.totals.udpAudioPackets = 999;
-  assert.equal(metrics.getSnapshot().history[0].network.totals.udpAudioPackets, 720 * 250);
+  assert.equal((await metrics.getSnapshot()).history[0].network.totals.udpAudioPackets, 720 * 250);
   await advance(DAY + MINUTE);
-  assert.equal(metrics.getSnapshot().network.samples, 0);
-  assert.equal(metrics.getSnapshot().network.latest, null);
+  assert.equal((await metrics.getSnapshot()).network.samples, 0);
+  assert.equal((await metrics.getSnapshot()).network.latest, null);
   await metrics.close();
   metrics.recordAudioHealth({ windowMs: 5000, udpKeepaliveSent: 1 });
-  assert.equal(metrics.getSnapshot().network.samples, 0);
+  assert.equal((await metrics.getSnapshot()).network.samples, 0);
+});
+
+test('yielding snapshots retain a consistent point in time while new audio and playback records arrive', async t => {
+  let duringYield;
+  const f = await fixture(t, { yieldWork: () => new Promise(resolve => setImmediate(() => {
+    duringYield?.(); resolve();
+  })) });
+  await seedHistory(f, 40);
+  const restarted = f.create();
+  await restarted.start();
+  duringYield = () => {
+    duringYield = null;
+    restarted.recordPlayback({ outcome: 'ready', durationMs: 200, preloaded: false });
+    restarted.recordAudioHealth({ windowMs: 5000, packetsRead: 251, udpAudioPackets: 251 });
+  };
+  const before = await restarted.getSnapshot();
+  assert.equal(before.playback.ready, 40);
+  assert.equal(before.audio.totals.packetsRead, 40 * 250);
+  assert.equal(before.network.totals.udpAudioPackets, 40 * 250);
+  assert.equal(before.audio.latest, null);
+  const after = await restarted.getSnapshot();
+  assert.equal(after.playback.ready, 41);
+  assert.equal(after.audio.totals.packetsRead, 40 * 250 + 251);
+  assert.equal(after.audio.latest.packetsRead, 251);
+  assert.equal(after.network.latest.udpAudioPackets, 251);
+  before.history.at(-1).audio.totals.packetsRead = 0;
+  assert.equal((await restarted.getSnapshot()).audio.totals.packetsRead, 40 * 250 + 251);
+});
+
+test('full retained history gives other event-loop work frequent turns while producing a detached snapshot', async t => {
+  const f = await fixture(t);
+  await seedHistory(f, 1440);
+  const restarted = f.create();
+  await restarted.start();
+  let ticks = 0, running = true;
+  const heartbeat = () => { if (running) { ticks++; setImmediate(heartbeat); } };
+  setImmediate(heartbeat);
+  let snapshot;
+  try { snapshot = await restarted.getSnapshot(); }
+  finally { running = false; }
+  assert.ok(ticks >= 200, `Expected small work slices across a full history, observed ${ticks} turns.`);
+  assert.equal(snapshot.playback.ready, 1440);
+  assert.equal(snapshot.audio.totals.packetsRead, 1440 * 250);
+  assert.equal(snapshot.history.length, 288);
+  assert.ok(Buffer.byteLength(JSON.stringify(snapshot)) < 4 * MIB);
+});
+
+test('streamed persistence keeps the old file atomic and excludes records arriving after its captured point', async t => {
+  let inspect = false, restarted, file, oldBody, chunkCount = 0, largestChunk = 0;
+  const f = await fixture(t, { transformWrite(data, options) {
+    if (!inspect) return data;
+    assert.deepEqual(options, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    assert.equal(typeof data[Symbol.asyncIterator], 'function');
+    return (async function* () {
+      for await (const chunk of data) {
+        chunkCount++;
+        largestChunk = Math.max(largestChunk, Buffer.byteLength(chunk));
+        if (chunkCount === 1) {
+          assert.equal(await fs.readFile(file, 'utf8'), oldBody, 'The prior save stays intact while the temporary file is being written.');
+          restarted.recordPlayback({ outcome: 'ready', durationMs: 200, preloaded: false });
+          restarted.recordAudioHealth({ windowMs: 5000, packetsRead: 251, udpAudioPackets: 251 });
+        }
+        yield chunk;
+      }
+    })();
+  } });
+  file = await seedHistory(f, 40);
+  oldBody = await fs.readFile(file, 'utf8');
+  restarted = f.create();
+  await restarted.start();
+  inspect = true;
+  await f.advance(MINUTE);
+  assert.ok(chunkCount >= 5);
+  assert.ok(largestChunk < 64 * 1024, 'No full-history string is passed to filesystem encoding.');
+  let saved = JSON.parse(await fs.readFile(file, 'utf8'));
+  assert.equal(saved.buckets.reduce((sum, entry) => sum + entry.playback.ready, 0), 40);
+  assert.equal(saved.buckets.reduce((sum, entry) => sum + entry.audio.metrics[2][1], 0), 40 * 250);
+  assert.equal((await restarted.getSnapshot()).playback.ready, 41);
+  inspect = false;
+  await f.advance(MINUTE);
+  saved = JSON.parse(await fs.readFile(file, 'utf8'));
+  assert.equal(saved.buckets.reduce((sum, entry) => sum + entry.playback.ready, 0), 41, 'The later save includes post-capture records, including changes to cached minutes.');
+  assert.equal(saved.buckets.reduce((sum, entry) => sum + entry.audio.metrics[2][1], 0), 40 * 250 + 251);
+  assert.equal(saved.version, 1);
+});
+
+test('a midstream save failure preserves prior history, removes its temporary file and can recover', async t => {
+  let fail = false;
+  const f = await fixture(t, { transformWrite(data) {
+    if (!fail) return data;
+    return (async function* () {
+      let chunks = 0;
+      for await (const chunk of data) {
+        if (++chunks === 3) throw new Error('simulated write interruption');
+        yield chunk;
+      }
+    })();
+  } });
+  const file = await seedHistory(f, 40);
+  const oldBody = await fs.readFile(file, 'utf8');
+  const restarted = f.create();
+  await restarted.start();
+  restarted.recordPlayback({ outcome: 'ready', durationMs: 200, preloaded: false });
+  fail = true;
+  await f.advance(MINUTE);
+  assert.equal((await restarted.getSnapshot()).persistence.available, false);
+  assert.equal(await fs.readFile(file, 'utf8'), oldBody);
+  assert.deepEqual(await fs.readdir(f.dataDir), ['.host-metrics.json']);
+  fail = false;
+  await f.advance(MINUTE);
+  assert.equal((await restarted.getSnapshot()).persistence.available, true);
+  const saved = JSON.parse(await fs.readFile(file, 'utf8'));
+  assert.equal(saved.buckets.reduce((sum, entry) => sum + entry.playback.ready, 0), 41);
 });

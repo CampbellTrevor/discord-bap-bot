@@ -3,6 +3,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { MediaError } from './media.mjs';
 import { validateActivityFilters } from './command-activity.mjs';
 import { runWebCommand } from './web-command.mjs';
+import { encodePerformanceFrame } from './performance-frame.mjs';
 
 const VERSION = 1;
 const WORKER_PATH = '/internal/worker';
@@ -169,6 +170,15 @@ function sendFrame(socket, frame) {
   let data;
   try { data = JSON.stringify(frame); } catch { return false; }
   if (Buffer.byteLength(data) > MAX_PAYLOAD) return false;
+  try {
+    socket.send(data, error => { if (error) socket.terminate(); });
+    return true;
+  } catch { return false; }
+}
+
+function sendEncodedFrame(socket, data) {
+  if (socket.readyState !== WebSocket.OPEN || socket.bufferedAmount > MAX_PAYLOAD * 2
+      || typeof data !== 'string' || Buffer.byteLength(data) > MAX_PAYLOAD) return false;
   try {
     socket.send(data, error => { if (error) socket.terminate(); });
     return true;
@@ -480,6 +490,17 @@ export function connectWorker({ url, secret, bot, sessionStorage, spotifyEnabled
       }
     }
 
+    async function replyPerformance(id, result, task, signal) {
+      const frame = { v: VERSION, type: 'result', id, ok: true, result: result ?? null };
+      const encoded = await encodePerformanceFrame(frame, { maxBytes: MAX_PAYLOAD, signal });
+      // Encoding yields to timeout, disconnect and cancellation handlers. Never
+      // send a late success on the old connection after any of those fire.
+      if (task.cancelled || cleaned || closed || signal.aborted || connection.readyState !== WebSocket.OPEN) return;
+      if (encoded === null || !sendEncodedFrame(connection, encoded)) {
+        reply(id, null, new BridgeError('The worker response was too large to send. Please reduce the queue size.', 'WORKER_RESULT_TOO_LARGE'));
+      }
+    }
+
     async function dispatch(frame) {
       const { id, method, args } = frame;
       if (!validArguments(method, args)) return reply(id, null, new BridgeError('The worker request arguments are invalid.', 'WORKER_INVALID_REQUEST', 400));
@@ -527,7 +548,10 @@ export function connectWorker({ url, secret, bot, sessionStorage, spotifyEnabled
           }
         });
         if (sessionCall && !validSessionResult(method, result)) throw sessionUnavailable();
-        if (!task.cancelled) reply(id, result);
+        if (!task.cancelled) {
+          if (method === 'performance') await replyPerformance(id, result, task, controller.signal);
+          else reply(id, result);
+        }
       } catch (error) {
         if (!task.cancelled) {
           const safeError = sessionCall ? sessionUnavailable() : error;

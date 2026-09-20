@@ -2,7 +2,7 @@ import * as nodeFs from 'node:fs/promises';
 import * as nodeOs from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { monitorEventLoopDelay as nodeMonitorEventLoopDelay } from 'node:perf_hooks';
+import { monitorEventLoopDelay as nodeMonitorEventLoopDelay, performance } from 'node:perf_hooks';
 
 const MINUTE = 60000;
 const RETENTION = 24 * 60 * MINUTE;
@@ -28,6 +28,9 @@ const NETWORK_FIELDS = ['voiceUdpPingMs', 'udpKeepaliveSent', 'udpKeepaliveRepli
   'udpSendErrors', 'udpSendQueueBytes', 'voiceWsHeartbeatAgeMs', 'udpKeepaliveConfirmed', 'udpKeepaliveUntracked'];
 const MAX_AUDIO_SAMPLES = 720;
 const MAX_HEALTH_VALUE = 1e9;
+const WORK_SLICE_MS = 1;
+const WORK_SLICE_ITEMS = 8;
+const PLAYBACK_SUM_FIELDS = ['ready', 'error', 'preloadedReady', 'preloadedError', 'readyDurationSumMs'];
 const count = value => Number.isSafeInteger(value) && value >= 0;
 const numeric = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 const round = value => numeric(value) ? Math.round(value * 100) / 100 : null;
@@ -55,13 +58,14 @@ function addStats(target, fields, values) {
   });
 }
 function mergeStats(target, source) {
-  source.forEach(([n, sum, low, high], index) => {
-    if (!n) return;
+  for (let index = 0; index < source.length; index++) {
+    const [n, sum, low, high] = source[index];
+    if (!n) continue;
     const stat = target[index];
     stat[0] += n; stat[1] += sum;
     stat[2] = stat[2] === null ? low : Math.min(stat[2], low);
     stat[3] = stat[3] === null ? high : Math.max(stat[3], high);
-  });
+  }
 }
 function statsSummary(fields, values) {
   const avg = {}, min = {}, max = {};
@@ -125,9 +129,9 @@ function addError(errors, code, amount) {
   errors[key] = (errors[key] || 0) + amount;
 }
 function combinePlayback(target, source) {
-  for (const field of ['ready', 'error', 'preloadedReady', 'preloadedError', 'readyDurationSumMs']) target[field] += source[field];
+  for (const field of PLAYBACK_SUM_FIELDS) target[field] += source[field];
   target.readyDurationMaxMs = Math.max(target.readyDurationMaxMs, source.readyDurationMaxMs);
-  target.latencyBins = target.latencyBins.map((value, i) => value + source.latencyBins[i]);
+  for (let index = 0; index < target.latencyBins.length; index++) target.latencyBins[index] += source.latencyBins[index];
   for (const [code, amount] of Object.entries(source.errors)) addError(target.errors, code, amount);
 }
 function playbackSummary(value) {
@@ -196,21 +200,40 @@ function validBucket(bucket, now) {
 /** Records source/packet preparation and transport transitions, not audible voice gaps. */
 export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date.now, fs = nodeFs, os = nodeOs,
   monitorEventLoopDelay = nodeMonitorEventLoopDelay,
+  yieldWork = () => new Promise(resolve => setImmediate(resolve)),
   setInterval: schedule = globalThis.setInterval, clearInterval: unschedule = globalThis.clearInterval } = {}) {
   if (typeof dataDir !== 'string' || !dataDir || !Number.isSafeInteger(sampleIntervalMs) || sampleIntervalMs < 1000 || sampleIntervalMs > MINUTE) {
     throw new Error('Host metrics require a data directory and a sample interval between 1 and 60 seconds.');
   }
   const file = path.join(dataDir, '.host-metrics.json');
   const buckets = new Map();
+  const capturedBuckets = new WeakSet(), encodedBuckets = new WeakMap();
   let latest = null, previous = null, timer, starting, sampling, closed = false;
   let lastAudio = null, lastNetwork = null, loopMonitor;
   let persistent = null, lastSavedAt = null, lastWriteAttempt = -Infinity;
   const read = async location => { try { const text = await fs.readFile(location, 'utf8'); return text.length <= 128 * 1024 ? text : null; } catch { return null; } };
   const prune = at => { for (const timestamp of buckets.keys()) if (timestamp < at - RETENTION || timestamp > at) buckets.delete(timestamp); };
+  function captureBuckets(at) {
+    prune(at);
+    const captured = [...buckets.values()];
+    // Capture references in one turn. A later record copies only its small minute
+    // bucket, so yielding readers see one consistent point in time without a
+    // synchronous clone of the entire day's history.
+    for (const entry of captured) capturedBuckets.add(entry);
+    return captured;
+  }
+  function checkpoint() {
+    let items = 0, started = performance.now();
+    return () => {
+      if (++items < WORK_SLICE_ITEMS && performance.now() - started < WORK_SLICE_MS) return null;
+      return Promise.resolve(yieldWork()).then(() => { items = 0; started = performance.now(); });
+    };
+  }
   function bucket(at) {
     prune(at);
     const timestamp = Math.floor(at / MINUTE) * MINUTE;
     if (!buckets.has(timestamp)) buckets.set(timestamp, emptyBucket(timestamp));
+    else if (capturedBuckets.has(buckets.get(timestamp))) buckets.set(timestamp, structuredClone(buckets.get(timestamp)));
     return buckets.get(timestamp);
   }
   async function load() {
@@ -265,9 +288,33 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
     lastWriteAttempt = at;
     const temporary = `${file}.${randomBytes(8).toString('hex')}.tmp`;
     try {
-      const body = JSON.stringify({ version: 1, savedAt: at, buckets: [...buckets.values()] });
-      if (Buffer.byteLength(body) > MAX_FILE) throw new Error();
-      await fs.writeFile(temporary, body, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      const captured = captureBuckets(at);
+      // writeFile consumes this async iterable incrementally. Neither JSON
+      // encoding nor UTF-8 conversion ever receives the whole history at once.
+      async function* body() {
+        const pause = checkpoint();
+        let bytes = 0, parts = [], items = 0;
+        const append = text => {
+          bytes += Buffer.byteLength(text);
+          if (bytes > MAX_FILE) throw new Error('Metrics history exceeds its storage budget.');
+          parts.push(text);
+        };
+        append(`{"version":1,"savedAt":${JSON.stringify(at)},"buckets":[`);
+        for (const entry of captured) {
+          let text = encodedBuckets.get(entry);
+          if (text === undefined) { text = JSON.stringify(entry); encodedBuckets.set(entry, text); }
+          append(`${items++ ? ',' : ''}${text}`);
+          const waiting = pause();
+          if (waiting) {
+            yield parts.join('');
+            parts = [];
+            await waiting;
+          }
+        }
+        append(']}');
+        if (parts.length) yield parts.join('');
+      }
+      await fs.writeFile(temporary, body(), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
       await fs.rename(temporary, file);
       persistent = true;
       lastSavedAt = at;
@@ -465,13 +512,16 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
         lastNetwork = { at, ...network };
       }
     },
-    getSnapshot() {
+    async getSnapshot() {
       const at = now();
-      prune(at);
+      const captured = captureBuckets(at);
+      const capturedLatest = latest, capturedAudio = lastAudio, capturedNetwork = lastNetwork;
+      const capturedPersistence = { available: persistent, lastSavedAt };
+      const pause = checkpoint();
       const grouped = new Map(), playback = emptyPlayback(), preload = emptyPreload(), transition = emptyPlayback();
       const audio = emptyAudio(), network = emptyNetwork(), eventLoop = emptyStats(LOOP_FIELDS);
       let legacySourceOnly = false;
-      for (const source of buckets.values()) {
+      for (const source of captured) {
         const timestamp = Math.floor(source.at / (5 * MINUTE)) * 5 * MINUTE;
         if (!grouped.has(timestamp)) grouped.set(timestamp, emptyBucket(timestamp));
         const target = grouped.get(timestamp);
@@ -504,21 +554,28 @@ export function createHostMetrics({ dataDir, sampleIntervalMs = 5000, now = Date
         }
         mergeStats(target.eventLoop, source.eventLoop);
         mergeStats(eventLoop, source.eventLoop);
+        const waiting = pause();
+        if (waiting) await waiting;
       }
-      const history = [...grouped.values()].sort((a, b) => a.at - b.at).slice(-288).map(bucketView);
+      const history = [];
+      for (const entry of [...grouped.values()].sort((a, b) => a.at - b.at).slice(-288)) {
+        history.push(bucketView(entry));
+        const waiting = pause();
+        if (waiting) await waiting;
+      }
       return { version: 1, sampledAt: at, sampleIntervalMs, historyIntervalMs: 5 * MINUTE, retentionMs: RETENTION,
-        latest: latest && structuredClone(latest), history,
+        latest: capturedLatest && structuredClone(capturedLatest), history,
         playback: { measurement: 'source-and-packet-preparation', legacySourceOnly, ...playbackSummary(playback) },
         preload: { measurement: 'background-source-and-packet-preparation', ...preloadSummary(preload) },
         transition: { measurement: 'natural-end-to-transport-playing', ...transitionSummary(transition) },
-        audio: { measurement: 'transport-packet-reads', latest: lastAudio && at >= lastAudio.at && at - lastAudio.at <= 15000 ? structuredClone(lastAudio) : null,
+        audio: { measurement: 'transport-packet-reads', latest: capturedAudio && at >= capturedAudio.at && at - capturedAudio.at <= 15000 ? structuredClone(capturedAudio) : null,
           ...audioSummary(audio) },
         // These describe keepalive exchanges and local socket sends, not delivered audio or listener loss.
         network: { measurement: 'voice-udp-keepalive-and-local-send',
-          latest: lastNetwork && at >= lastNetwork.at && at - lastNetwork.at <= 15000 ? structuredClone(lastNetwork) : null,
+          latest: capturedNetwork && at >= capturedNetwork.at && at - capturedNetwork.at <= 15000 ? structuredClone(capturedNetwork) : null,
           ...networkSummary(network) },
         eventLoop: { resolutionMs: 20, ...statsSummary(LOOP_FIELDS, eventLoop) },
-        persistence: { available: persistent, lastSavedAt } };
+        persistence: capturedPersistence };
     },
   };
 }

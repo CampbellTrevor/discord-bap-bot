@@ -131,6 +131,69 @@ test('performance and move-top RPCs validate identities and retain track IDs', a
   assert.equal(calls.length, 2);
 });
 
+test('full performance history round-trips through the yielding encoder and oversized telemetry remains bounded', async t => {
+  const { bridge, connect } = await fixture(t);
+  let snapshot = { version: 1, latest: { cpu: 2.5 }, history: Array.from({ length: 288 }, (_, at) => ({ at, avg: { label: '音'.repeat(1800), value: at / 3 } })),
+    network: { errors: [], latest: null }, persistence: { available: true } };
+  connect(fakeBot({ performance: async () => snapshot }));
+  await until(() => bridge.bot.isReady());
+  assert.ok(Buffer.byteLength(JSON.stringify(snapshot)) > 1_500_000);
+  assert.deepEqual(await bridge.bot.performance(GUILD, USER), snapshot);
+  snapshot = { history: Array.from({ length: 288 }, () => ({ value: 'x'.repeat(32_000) })) };
+  await assert.rejects(bridge.bot.performance(GUILD, USER), { code: 'WORKER_RESULT_TOO_LARGE' });
+  assert.equal((await bridge.bot.listGuilds(USER))[0].id, GUILD);
+});
+
+test('a cancelled performance encoding stops early and frees the worker request slot', async t => {
+  const { bridge, connect } = await fixture(t);
+  const controller = new AbortController();
+  let encodedRows = 0;
+  const history = Array.from({ length: 1000 }, () => ({ toJSON() {
+    encodedRows++;
+    if (encodedRows === 1) controller.abort();
+    return { value: 'x'.repeat(5_000) };
+  } }));
+  connect(fakeBot({ performance: async () => ({ history }) }), { maxPending: 1 });
+  await until(() => bridge.bot.isReady());
+  await assert.rejects(bridge.bot.performance(GUILD, USER, { signal: controller.signal }), { code: 'WORKER_CANCELLED' });
+  // A second read is ordered after the cancellation frame on the same socket.
+  await until(() => encodedRows > 0);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.ok(encodedRows < history.length, 'cancelled work must not encode the remaining history');
+  assert.equal((await bridge.bot.listGuilds(USER))[0].id, GUILD);
+});
+
+test('performance encoding keeps the worker read deadline active until the reply is ready', async t => {
+  const { bridge, connect } = await fixture(t, { readTimeoutMs: 1000 });
+  let encodedRows = 0;
+  const history = Array.from({ length: 1000 }, () => ({ toJSON() {
+    encodedRows++;
+    return { value: 'x'.repeat(7_000) };
+  } }));
+  connect(fakeBot({ performance: async () => ({ history }) }), { readTimeoutMs: 1 });
+  await until(() => bridge.bot.isReady());
+  await assert.rejects(bridge.bot.performance(GUILD, USER), { code: 'WORKER_TIMEOUT' });
+  assert.ok(encodedRows < history.length, 'deadline must interrupt encoding before a success can be sent');
+  assert.equal((await bridge.bot.listGuilds(USER))[0].id, GUILD);
+});
+
+test('disconnect while encoding performance stops work and cannot send on a replacement connection', async t => {
+  const { bridge, connect } = await fixture(t);
+  let encodedRows = 0, connection;
+  const history = Array.from({ length: 1000 }, () => ({ toJSON() {
+    encodedRows++;
+    if (encodedRows === 1) setImmediate(() => connection.close());
+    return { value: 'x'.repeat(5_000) };
+  } }));
+  connection = connect(fakeBot({ performance: async () => ({ history }) }));
+  await until(() => bridge.bot.isReady());
+  await assert.rejects(bridge.bot.performance(GUILD, USER), { code: 'WORKER_UNAVAILABLE' });
+  assert.ok(encodedRows < history.length);
+  connect(fakeBot());
+  await until(() => bridge.bot.isReady());
+  assert.equal((await bridge.bot.listGuilds(USER))[0].id, GUILD);
+});
+
 test('volume RPC preserves zero, bounds, identities and worker cancellation', async t => {
   const { bridge, connect } = await fixture(t);
   const calls = [];
