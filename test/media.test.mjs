@@ -1121,14 +1121,75 @@ test('Spotify matching selects relevant studio audio instead of the first live, 
   opened.cleanup();
 });
 
+test('Lovers Again recovers with one title-artist search when official-audio search returns unrelated songs', async () => {
+  const track = { source: 'spotify', sourceUrl: 'https://open.spotify.com/track/5Md7yWibMKG15eYL8jiZZG', title: 'Lovers Again', artist: 'Jamie McIntyre', durationSec: 208 };
+  // Public metadata observed from the playback host on 2026-09-24.
+  const unrelated = [
+    { id: 'bflkeWVTNk0', title: 'Dolly Parton - Here You Come Again (Official Audio)', uploader: 'Dolly Parton', duration: 182 },
+    { id: 'YTRbArOKyrI', title: 'Over Galway Town', uploader: 'Jamie McIntyre - Topic', duration: 199 },
+    { id: 'qUHtwV8wkOU', title: 'Janet Jackson - Again (Official Music Video)', uploader: 'Janet Jackson', duration: 225 },
+  ];
+  const correct = { id: 'aCgWz33R1MM', title: 'Lovers Again', uploader: 'Jamie McIntyre - Topic', duration: 208 };
+  const fake = extractor([metadata({ entries: unrelated }), metadata({ entries: [correct] }),
+    metadata({ ...correct, artist: 'Jamie McIntyre', availability: 'public' }), child => child.stdout.write('audio')]);
+  const media = createMedia({}, fake);
+  const ready = await media.preflight(track);
+  assert.deepEqual(fake.calls.map(call => call.args.at(-1)), [
+    'ytsearch10:Lovers Again Jamie McIntyre official audio', 'ytsearch10:Lovers Again Jamie McIntyre', 'https://www.youtube.com/watch?v=aCgWz33R1MM',
+  ]);
+  assert.equal(ready.playbackMapping.videoId, correct.id);
+  const opened = await media.open(ready);
+  assert.equal(opened.stream.read().toString(), 'audio');
+  assert.equal(fake.calls.length, 4);
+  opened.cleanup();
+});
+
+test('Spotify fallback shares the two-validation budget and never starts a third candidate or repeats its query', async () => {
+  const track = { source: 'spotify', sourceUrl: `spotify:track:${TRACK}`, title: 'A song', artist: 'An artist', durationSec: 120 };
+  const candidates = [1, 2, 3].map(index => video(index, { title: 'A song', uploader: 'An artist - Topic' }));
+  const fake = extractor([metadata({ entries: [] }), metadata({ entries: candidates }),
+    metadata({ ...candidates[0], was_live: true }), metadata({ ...candidates[1], artist: 'A different artist' })]);
+  await assert.rejects(createMedia({}, fake).preflight(track), { code: 'NO_PLAYBACK_MATCH' });
+  assert.equal(fake.calls.length, 4);
+  assert.equal(fake.calls.filter(call => !call.args.at(-1).startsWith('ytsearch')).length, 2);
+  assert.ok(fake.calls.every(call => !call.args.at(-1).includes(candidates[2].id)));
+  const repeated = extractor([metadata({ entries: [] })]);
+  await assert.rejects(createMedia({}, repeated).preflight({ ...track, searchQuery: '  A SONG  An artist  ' }), { code: 'NO_PLAYBACK_MATCH' });
+  assert.equal(repeated.calls.length, 1, 'Normalized equivalent title/artist searches run only once.');
+});
+
+test('Spotify fallback keeps a rejected stale recording excluded and uses only the remaining validation', async () => {
+  const ready = await savedSpotifyMapping();
+  const next = video(2, { title: 'A song', uploader: 'An artist - Topic' });
+  const fake = extractor([child => { child.stderr.end('Video unavailable'); child.emit('close', 1); },
+    metadata({ entries: [youtube] }), metadata({ entries: [youtube, next] }), metadata(next)]);
+  const replacement = await createMedia({}, { ...fake, now: () => 601_001 }).preflight(ready);
+  assert.equal(replacement.playbackMapping.videoId, next.id);
+  const full = fake.calls.filter(call => !call.args.at(-1).startsWith('ytsearch'));
+  assert.equal(full.length, 2);
+  assert.deepEqual(full.map(call => call.args.at(-1)), [`https://www.youtube.com/watch?v=${VIDEO}`, `https://www.youtube.com/watch?v=${next.id}`]);
+});
+
+test('Spotify fallback preserves provider errors and cancellation instead of issuing extra searches', async () => {
+  const track = { source: 'spotify', sourceUrl: `spotify:track:${TRACK}`, title: 'A song', artist: 'An artist', durationSec: 120 };
+  const blocked = extractor([child => { child.stderr.end('Sign in to confirm you are not a bot'); child.emit('close', 1); }]);
+  await assert.rejects(createMedia({}, blocked).preflight(track), { code: 'YOUTUBE_REQUEST_BLOCKED' });
+  assert.equal(blocked.calls.length, 1);
+  const controller = new AbortController();
+  const cancelled = extractor([metadata({ entries: [] }), () => controller.abort(new Error('cancel fallback'))]);
+  await assert.rejects(createMedia({}, cancelled).preflight(track, { signal: controller.signal }), /cancel fallback/);
+  assert.equal(cancelled.calls.length, 2);
+  assert.equal(cancelled.stopped.length, 1);
+});
+
 test('Spotify matching rejects live-only and unrelated candidates without opening audio', async () => {
   for (const entries of [[video(1, { title: 'An artist - A song (Live)' })],
     [video(2, { title: 'An artist - Another song', duration: 120 })],
     [video(3, { title: 'Different band - A song', uploader: 'Different band' })]]) {
-    const fake = extractor([metadata({ entries })]);
+    const fake = extractor([metadata({ entries }), metadata({ entries })]);
     await assert.rejects(createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
       title: 'A song', artist: 'An artist', durationSec: 120 }), error => error.code === 'NO_PLAYBACK_MATCH' && /studio/.test(error.message));
-    assert.equal(fake.calls.length, 1);
+    assert.equal(fake.calls.length, 2);
   }
 });
 
@@ -1228,10 +1289,10 @@ test('matching folds Latin accents without conflating Japanese voiced characters
   opened.cleanup();
 
   const wrong = video(2, { title: '歌手 - カラス (Official Audio)', uploader: '歌手', duration: 240 });
-  const japanese = extractor([metadata({ entries: [wrong] })]);
+  const japanese = extractor([metadata({ entries: [wrong] }), metadata({ entries: [wrong] })]);
   await assert.rejects(createMedia({}, japanese).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
     title: 'ガラス', artist: '歌手', durationSec: 240 }), { code: 'NO_PLAYBACK_MATCH' });
-  assert.equal(japanese.calls.length, 1);
+  assert.equal(japanese.calls.length, 2);
 });
 
 test('verified provider heart spellings match Spotify artist names without dropping artist numbers', async () => {
@@ -1244,10 +1305,10 @@ test('verified provider heart spellings match Spotify artist names without dropp
   opened.cleanup();
 
   const otherArtist = video(1, { title: 'Artist 3 - A song', uploader: 'Artist 3' });
-  const mismatch = extractor([metadata({ entries: [otherArtist] })]);
+  const mismatch = extractor([metadata({ entries: [otherArtist] }), metadata({ entries: [otherArtist] })]);
   await assert.rejects(createMedia({}, mismatch).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
     title: 'A song', artist: 'Artist 4', durationSec: 120 }), { code: 'NO_PLAYBACK_MATCH' });
-  assert.equal(mismatch.calls.length, 1);
+  assert.equal(mismatch.calls.length, 2);
 });
 
 test('verified Falling Slowly official metadata matches the requested Vwillz recording', async () => {
@@ -1261,10 +1322,10 @@ test('verified Falling Slowly official metadata matches the requested Vwillz rec
 
 test('Japanese title translations cannot hide a First Take recording annotation', async () => {
   const recording = video(1, { title: '美波 - カワキヲアメク (THE FIRST TAKE)', uploader: '美波', duration: 252 });
-  const fake = extractor([metadata({ entries: [recording] })]);
+  const fake = extractor([metadata({ entries: [recording] }), metadata({ entries: [recording] })]);
   await assert.rejects(createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
     title: 'カワキヲアメク', artist: '美波', durationSec: 252 }), { code: 'NO_PLAYBACK_MATCH' });
-  assert.equal(fake.calls.length, 1);
+  assert.equal(fake.calls.length, 2);
 });
 
 test('matching rejects different tracks, different artists and alternate recordings despite shared title words', async () => {
@@ -1273,10 +1334,10 @@ test('matching rejects different tracks, different artists and alternate recordi
     'An artist - A song (THE FIRST TAKE Official Video)', 'An artist - A song [The First Take - Official Music Video]',
     'An artist - A song (カバー)', 'An artist - A song (歌ってみた)', 'An artist - A song (Official Remix)']) {
     const info = video(1, { title, uploader: title.startsWith('Another artist') ? 'Another artist' : 'An artist' });
-    const fake = extractor([metadata({ entries: [info] })]);
+    const fake = extractor([metadata({ entries: [info] }), metadata({ entries: [info] })]);
     await assert.rejects(createMedia({}, fake).open({ source: 'spotify', sourceUrl: `spotify:track:${TRACK}`,
       title: 'A song', artist: 'An artist', durationSec: 120 }), { code: 'NO_PLAYBACK_MATCH' });
-    assert.equal(fake.calls.length, 1, title);
+    assert.equal(fake.calls.length, 2, title);
   }
 });
 
@@ -1466,7 +1527,7 @@ test('per-track definitive errors stay separate from temporary provider, metadat
     assert.equal(isPermanentMediaError(new MediaError('Authored message', code)), false, code);
   }
   assert.equal(isPermanentMediaError({ code: 'NO_PLAYBACK_MATCH' }), false, 'Unclassified arbitrary exceptions are not permanent provider decisions.');
-  const empty = extractor([metadata({ entries: [] })]);
+  const empty = extractor([metadata({ entries: [] }), metadata({ entries: [] })]);
   await assert.rejects(createMedia({}, empty).preflight(queuedSpotify()), error => error.code === 'NO_PLAYBACK_MATCH' && isPermanentMediaError(error));
   const malformed = extractor([metadata({ entries: [youtube] }), metadata({})]);
   await assert.rejects(createMedia({}, malformed).preflight(queuedSpotify()), error => error.code === 'INVALID_MEDIA' && !isPermanentMediaError(error));

@@ -139,6 +139,52 @@ test('Spotify radio uses the validated YouTube recording, not Spotify recommenda
   assert.equal(fake.calls[2].args.at(-1), `${seed.sourceUrl}&list=RD${seedInfo.id}&start_radio=1`);
 });
 
+test('a validated Spotify radio anchor survives playback cache expiry without weakening playback matching', async () => {
+  let clock = 1_000_000;
+  const spotify = { ...seed, source: 'spotify', sourceUrl: 'https://open.spotify.com/track/1234567890abcdefghijkl' };
+  const wrong = { ...seedInfo, title: 'Unrelated song', artist: 'Another artist' };
+  const fake = fakeExtractor([{ entries: [seedInfo] }, seedInfo, { entries: entries() }, wrong, { entries: [] }, { entries: [] }]);
+  const media = createMedia({}, { ...fake, now: () => clock });
+  const validated = await media.preflight(spotify);
+  assert.equal(fake.calls.length, 2);
+  clock += 11 * 60_000;
+  const result = await media.radio(validated);
+  assert.equal(result.length, 10);
+  assert.equal(fake.calls.length, 3, 'Radio should read its existing seed Mix without revalidating or searching the original recording.');
+  assert.equal(fake.calls[2].args.at(-1), `${seed.sourceUrl}&list=RD${seedInfo.id}&start_radio=1`);
+  assert.deepEqual(result.radioSeed.playbackMapping, validated.playbackMapping);
+  await assert.rejects(media.preflight(validated), { code: 'NO_PLAYBACK_MATCH' });
+  assert.equal(fake.calls.length, 6, 'Playback still rechecks stale metadata and rejects an unrelated recording after both bounded searches.');
+});
+
+test('a legacy mappingless radio station returns a private seed mapping for later refills', async () => {
+  let clock = 1_000_000;
+  const spotify = { ...seed, source: 'spotify', sourceUrl: 'https://open.spotify.com/track/1234567890abcdefghijkl' };
+  const fake = fakeExtractor([{ entries: [seedInfo] }, seedInfo, { entries: entries() }, { entries: entries(20) }]);
+  const media = createMedia({}, { ...fake, now: () => clock });
+  const first = await media.radio(spotify);
+  assert.equal(first.radioSeed.sourceUrl, spotify.sourceUrl);
+  assert.equal(first.radioSeed.playbackMapping.videoId, seedInfo.id);
+  assert.equal(Object.keys(first).includes('radioSeed'), false);
+  assert.doesNotMatch(JSON.stringify(first), /playbackMapping|referenceHash|radioSeed/);
+  assert.equal(spotify.playbackMapping, undefined, 'The caller owns the original seed object.');
+  clock += 11 * 60_000;
+  const next = await media.radio(first.radioSeed);
+  assert.equal(next.length, 10);
+  assert.equal(fake.calls.length, 4, 'A retained mapping avoids repeating the Spotify-to-YouTube search.');
+});
+
+test('radio still matches an invalid or unrelated persisted seed mapping before using an anchor', async () => {
+  const spotify = { ...seed, source: 'spotify', sourceUrl: 'https://open.spotify.com/track/1234567890abcdefghijkl',
+    playbackMapping: { videoId: info(999).id, title: 'Other song', artist: 'Other artist', durationSec: 202, checkedAt: 1, referenceHash: 'invalid' } };
+  const fake = fakeExtractor([{ entries: [seedInfo] }, seedInfo, { entries: entries() }]);
+  const result = await createMedia({}, fake).radio(spotify);
+  assert.equal(result.radioSeed.playbackMapping.videoId, seedInfo.id);
+  assert.equal(fake.calls[0].args.at(-1), 'ytsearch10:Lovesick Girls BLACKPINK official audio');
+  assert.equal(fake.calls[2].args.at(-1), `${seed.sourceUrl}&list=RD${seedInfo.id}&start_radio=1`);
+  assert.ok(fake.calls.every(call => !call.args.at(-1).includes(info(999).id)));
+});
+
 test('late full metadata revealing a live recording is rejected during radio preflight', async () => {
   const fake = fakeExtractor([{ ...info(1), title: 'Song 1 (Live at Wembley)' }]);
   const media = createMedia({}, fake);

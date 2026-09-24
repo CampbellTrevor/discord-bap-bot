@@ -327,6 +327,12 @@ export class MusicManager extends EventEmitter {
     if (typeof this.media.radio !== 'function') throw musicError('Radio is unavailable on this bot host.', 503);
     if (!radioDescriptor(seed) || !seed.title.trim() || !['youtube', 'spotify'].includes(seed.source) || !requestedBy?.id) throw musicError('Choose a song to start radio.');
     const state = this.state(guildId);
+    // The portal/current-song command supplies a public snapshot, which omits
+    // playbackMapping. Recover only this exact playing request's private match;
+    // a different song or explicit preflighted seed keeps its own identity.
+    if (!seed.playbackMapping && seed.id && seed.id === state.nowPlaying?.id
+        && seed.source === state.nowPlaying.source && seed.sourceUrl === state.nowPlaying.sourceUrl
+        && state.nowPlaying.playbackMapping) seed = state.nowPlaying;
     this.cancelRadio(state);
     this.removePendingRadio(state);
     Object.assign(state.radio, { active: true, seed: structuredClone(seed), requestedBy: { ...requestedBy },
@@ -431,6 +437,17 @@ export class MusicManager extends EventEmitter {
       const candidates = await this.media.radio(structuredClone(radio.seed), { signal: entry.controller.signal,
         limit: RADIO_BATCH_SIZE, exclude: structuredClone(this.radioExclusions(state)), continuation: structuredClone(radio.continuation) });
       if (!current()) return;
+      // Older saved stations may have no mapping. Retain the provider's first
+      // validated seed even if this discovery pass cannot fill a whole batch.
+      // The array annotation is internal and never enters a public snapshot.
+      const resolvedSeed = candidates?.radioSeed;
+      if (resolvedSeed?.playbackMapping && resolvedSeed.source === radio.seed.source && resolvedSeed.sourceUrl === radio.seed.sourceUrl
+          && (resolvedSeed.playbackMapping.videoId !== radio.seed.playbackMapping?.videoId
+            || resolvedSeed.playbackMapping.referenceHash !== radio.seed.playbackMapping?.referenceHash
+            || resolvedSeed.playbackMapping.checkedAt !== radio.seed.playbackMapping?.checkedAt)) {
+        radio.seed = structuredClone(resolvedSeed);
+        this.persistBackground(state);
+      }
       // Manual requests can arrive while discovery runs. Recheck against the
       // current queue and reserve the whole batch synchronously before saving.
       if (this.capacity(state.guildId) < RADIO_BATCH_SIZE) return;

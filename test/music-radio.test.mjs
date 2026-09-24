@@ -73,6 +73,66 @@ test('radio waits for a voice connection, adds batches of ten, and refills at tw
   assert.equal(calls.length, 2, 'The station does not keep growing after a batch is committed.');
 });
 
+test('current-song radio preserves the private playback match while every public snapshot omits it', async t => {
+  const { manager, calls, dataDir } = await fixture(t, () => batch());
+  const mapping = { videoId: 'matched0001', title: 'Song 9000', artist: 'Artist 0', durationSec: 180, checkedAt: 12345, referenceHash: 'validated-original-song' };
+  const current = { ...track(9000), source: 'spotify', sourceUrl: 'https://open.spotify.com/track/1234567890abcdefghijkl', playbackMapping: mapping };
+  await manager.enqueue('guild', [current], requester);
+  manager.attach('guild', voice(), channel);
+  await until(() => manager.snapshot('guild').nowPlaying && !manager.state('guild').opening);
+  const publicSeed = manager.snapshot('guild').nowPlaying;
+  assert.equal(publicSeed.playbackMapping, undefined);
+  await manager.startRadio('guild', publicSeed, requester);
+  await until(() => calls.length === 1 && !manager.radioEntry);
+  assert.deepEqual(calls[0].seed.playbackMapping, mapping);
+  assert.doesNotMatch(JSON.stringify(manager.snapshot('guild')), /playbackMapping|referenceHash/);
+  await manager.persist();
+  const saved = JSON.parse(await readFile(path.join(dataDir, 'queues.json'), 'utf8')).guilds.guild;
+  assert.deepEqual(saved.radio.seed.playbackMapping, mapping);
+  assert.equal(publicSeed.playbackMapping, undefined, 'Starting the station must not enrich the public object in place.');
+  const explicit = { ...current, playbackMapping: { ...mapping, videoId: 'explicit001', checkedAt: 12346 } };
+  await manager.startRadio('guild', explicit, requester);
+  assert.deepEqual(manager.state('guild').radio.seed.playbackMapping, explicit.playbackMapping, 'An explicit preflighted seed keeps its own selected mapping.');
+});
+
+test('a partial discovery retains a newly resolved legacy seed across retries and restart', async t => {
+  const original = { ...track(9000), source: 'spotify', sourceUrl: 'https://open.spotify.com/track/1234567890abcdefghijkl' };
+  const resolved = { ...original, playbackMapping: { videoId: 'matched0001', checkedAt: 12345, referenceHash: 'validated-original-song' } };
+  const { manager, media, calls, dataDir } = await fixture(t, (_seed, _options, count) => {
+    const tracks = batch(count * 100, count === 1 ? 3 : 10);
+    Object.defineProperty(tracks, 'radioSeed', { value: resolved });
+    return tracks;
+  }, { radioRetryMs: [100, 150] });
+  manager.attach('guild', voice(), channel);
+  await manager.startRadio('guild', original, requester);
+  await until(() => manager.snapshot('guild').radio.error);
+  assert.deepEqual(manager.state('guild').radio.seed.playbackMapping, resolved.playbackMapping);
+  assert.equal(manager.snapshot('guild').tracks.length, 0, 'Incomplete batches remain atomic.');
+  await manager.persist();
+  assert.deepEqual(JSON.parse(await readFile(path.join(dataDir, 'queues.json'), 'utf8')).guilds.guild.radio.seed.playbackMapping, resolved.playbackMapping);
+  await until(() => calls.length === 2 && !manager.radioEntry);
+  assert.deepEqual(calls[1].seed.playbackMapping, resolved.playbackMapping);
+  await manager.shutdown();
+  const restored = new MusicManager({ media, dataDir, logger: { warn() {}, error() {} }, idleDisconnectMs: 0, preloadCount: 0 });
+  await restored.restore();
+  assert.deepEqual(restored.state('guild').radio.seed.playbackMapping, resolved.playbackMapping);
+  assert.doesNotMatch(JSON.stringify(restored.snapshot('guild')), /playbackMapping|referenceHash/);
+  await restored.shutdown();
+});
+
+test('an unrelated discovery annotation cannot change the selected radio seed', async t => {
+  const original = track(9000);
+  const { manager } = await fixture(t, () => {
+    const tracks = batch();
+    Object.defineProperty(tracks, 'radioSeed', { value: { ...track(9001), playbackMapping: { videoId: 'unrelated01' } } });
+    return tracks;
+  });
+  manager.attach('guild', voice(), channel);
+  await manager.startRadio('guild', original, requester);
+  await until(() => !manager.radioEntry && manager.snapshot('guild').nowPlaying);
+  assert.deepEqual(manager.state('guild').radio.seed, original);
+});
+
 test('manual requests lead radio, shuffle preserves that priority, and promoted picks survive radio stop', async t => {
   const { manager } = await fixture(t, () => batch(), { randomIndex: () => 0 });
   const transport = voice();

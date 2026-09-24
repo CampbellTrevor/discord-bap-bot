@@ -477,14 +477,22 @@ export function createMedia(config = {}, dependencies = {}) {
     });
   }
 
-  async function resolveYoutubeSearch(query, signal, reference, { background = false, maxValidations = 2, excludedVideoId } = {}) {
+  async function resolveYoutubeSearch(query, signal, reference, { background = false, maxValidations = 2, excludedVideoId, fallbackQuery } = {}) {
     const allowLive = reference?.recordingKind === 'live' || liveAnnotation(reference?.title || query);
-    const candidates = (await youtubeCandidates(query, signal, { background })).map(info => ({ info,
+    const ranked = entries => entries.map(info => ({ info,
       score: info.id === excludedVideoId ? null : reference ? spotifyMatchScore(info, reference, allowLive, { catalog: true })
         : !allowLive && liveRecording(info) ? null : overlap(query, `${info.title} ${info.uploader || info.channel || ''}`) * 50 + studioScore(info),
     })).filter(candidate => candidate.score !== null).sort((a, b) => b.score - a.score);
-    // At most two full validations after one bounded catalog query. Never
-    // silently fall back to a known live or mismatched recording.
+    let candidates = ranked(await youtubeCandidates(query, signal, { background }));
+    const normalizedQuery = value => value.trim().replace(/\s+/gu, ' ').normalize('NFKC').toLowerCase();
+    if (!candidates.length && reference && fallbackQuery && normalizedQuery(fallbackQuery) !== normalizedQuery(query)) {
+      // YouTube sometimes lets "official audio" dominate a narrow song query.
+      // One plain title/artist query may recover the exact recording; it passes
+      // the same strict scoring and shares the original full-validation budget.
+      candidates = ranked(await youtubeCandidates(fallbackQuery, signal, { background }));
+    }
+    // At most two full validations, even when a second flat query was needed.
+    // Never silently fall back to a known live or mismatched recording.
     for (const { info } of candidates.slice(0, maxValidations)) {
       let full;
       try { full = await extractMetadata(youtubeUrl(info.id), signal, { background }); }
@@ -816,7 +824,12 @@ export function createMedia(config = {}, dependencies = {}) {
     try {
       return await withDeadline(signal, resolveTimeoutMs, async deadline => {
         const blocked = new Set([seed, ...exclude].flatMap(radioTrackKeys));
-        const resolved = await resolvePlayback(seed, deadline, { background: true, verifyMissing: true });
+        // A radio anchor is a previously matched public video ID, not a stream
+        // URL. Expiring the playback metadata cache must not force the station
+        // to rematch its seed before it can discover the next songs.
+        const anchor = readMapping(seed);
+        const resolved = anchor ? { playable: anchor.playable, track: seed }
+          : await resolvePlayback(seed, deadline, { background: true, verifyMissing: true });
         for (const key of radioTrackKeys(resolved.playable)) blocked.add(key);
         const seedId = new URL(resolved.playable.playbackUrl).searchParams.get('v');
         let continuationId = null;
@@ -885,7 +898,11 @@ export function createMedia(config = {}, dependencies = {}) {
           artistCounts.set(artist, count + 1);
           chosen.push(track);
         }
-        return [...chosen, ...deferred].slice(0, limit);
+        const tracks = [...chosen, ...deferred].slice(0, limit);
+        // Let the queue retain a mapping discovered for an older station. Keep
+        // this annotation out of JSON/track enumeration and public responses.
+        Object.defineProperty(tracks, 'radioSeed', { value: resolved.track });
+        return tracks;
       });
     } finally { activeResolutions--; }
   }
@@ -1103,7 +1120,8 @@ export function createMedia(config = {}, dependencies = {}) {
     }
     if (!playable) {
       const query = safeText(track.searchQuery) || `${safeText(track.title)} ${safeText(track.artist)} ${track.recordingKind === 'live' || liveAnnotation(track.title) ? 'live' : 'official audio'}`;
-      playable = await resolveYoutubeSearch(query, signal, track, { background, maxValidations, excludedVideoId });
+      const fallbackQuery = `${safeText(track.title)} ${safeText(track.artist)}${track.recordingKind === 'live' || liveAnnotation(track.title) ? ' live' : ''}`;
+      playable = await resolveYoutubeSearch(query, signal, track, { background, maxValidations, excludedVideoId, fallbackQuery });
       checkedAt = now();
     }
     rememberMatch(key, { track: playable, checkedAt, expires: checkedAt + MATCH_CACHE_TTL_MS });
