@@ -197,9 +197,12 @@ test('changing station cancels old work without overlapping or committing its st
   assert.equal(calls[0].signal.aborted, true);
   await sleep(20);
   assert.equal(pending.length, 1, 'Aborted work keeps its slot until it settles.');
-  pending[0].resolve(batch(1));
+  const staleTracks = batch(1);
+  Object.defineProperty(staleTracks, 'radioSeed', { value: { ...track(9000), playbackMapping: { videoId: 'stale000001', checkedAt: 12345 } } });
+  pending[0].resolve(staleTracks);
   await until(() => pending.length === 2);
   assert.equal(calls[1].seed.sourceUrl, track(9001).sourceUrl);
+  assert.deepEqual(manager.state('guild').radio.seed, track(9001), 'A canceled station cannot replace the current private seed.');
   assert.equal(manager.snapshot('guild').tracks.length, 0);
   pending[1].resolve(batch(101));
   await until(() => !manager.radioEntry && manager.snapshot('guild').nowPlaying);
@@ -326,8 +329,11 @@ test('stop disables radio and shutdown cannot commit a late batch or restart dis
   await until(() => calls.length === 2);
   await manager.shutdown();
   assert.equal(calls[1].signal.aborted, true);
-  pending[1].resolve(batch());
+  const lateTracks = batch();
+  Object.defineProperty(lateTracks, 'radioSeed', { value: { ...track(9000), playbackMapping: { videoId: 'late0000001', checkedAt: 12345 } } });
+  pending[1].resolve(lateTracks);
   await until(() => !manager.radioEntry);
+  assert.deepEqual(manager.state('guild').radio.seed, track(9000), 'Shutdown cannot commit a newly resolved seed mapping.');
   assert.equal(manager.snapshot('guild').radio.active, true, 'Shutdown preserves the station setting.');
   assert.equal(manager.snapshot('guild').tracks.length, 0);
   assert.equal(manager.radioTimer, null);
